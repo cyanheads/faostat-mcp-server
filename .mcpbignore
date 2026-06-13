@@ -1,5 +1,6 @@
 .env*
 .mcpregistry_*
+/.faostat-mirror/
 /.claude/
 /.agents/
 /skills/
