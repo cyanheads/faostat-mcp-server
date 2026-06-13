@@ -1,0 +1,44 @@
+{
+  "name": "faostat-mcp-server",
+  "version": "0.1.0",
+  "description": "Global food & agriculture statistics from the UN FAOSTAT bulk-download corpus, served from a local SQLite mirror with a DataCanvas SQL surface, over MCP. STDIO & Streamable HTTP.",
+  "author": {
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
+  },
+  "homepage": "https://github.com/cyanheads/faostat-mcp-server",
+  "repository": "https://github.com/cyanheads/faostat-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "faostat",
+    "fao",
+    "agriculture",
+    "food-security",
+    "agricultural-statistics",
+    "crop-production",
+    "agricultural-trade",
+    "food-balances",
+    "duckdb",
+    "sqlite",
+    "dataframe"
+  ],
+  "mcpServers": "./.codex-plugin/mcp.json",
+  "interface": {
+    "displayName": "faostat-mcp-server",
+    "shortDescription": "Global food & agriculture statistics from the UN FAOSTAT bulk-download corpus, served from a local SQLite mirror with a DataCanvas SQL surface, over MCP. STDIO & Streamable HTTP.",
+    "longDescription": "Query the UN FAO's FAOSTAT corpus — crop and livestock production, agricultural trade, food balances, food security, land use, and agri-emissions for 245+ countries from 1961 to present. Served from a local SQLite mirror of the keyless bulk-download service (the REST API is auth-gated), with FTS5 code resolution, country-vs-aggregate classification, and a DataCanvas SQL surface for cross-country and time-series analysis.",
+    "developerName": "cyanheads",
+    "category": "data",
+    "capabilities": ["Read"],
+    "websiteURL": "https://github.com/cyanheads/faostat-mcp-server",
+    "defaultPrompt": []
+  }
+}

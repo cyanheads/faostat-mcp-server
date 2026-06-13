@@ -1,0 +1,20 @@
+{
+  "name": "faostat-mcp-server",
+  "version": "0.1.0",
+  "description": "Global food & agriculture statistics from the UN FAOSTAT bulk-download corpus, served from a local SQLite mirror with a DataCanvas SQL surface, over MCP. STDIO & Streamable HTTP.",
+  "author": {
+    "name": "cyanheads"
+  },
+  "homepage": "https://github.com/cyanheads/faostat-mcp-server",
+  "repository": "https://github.com/cyanheads/faostat-mcp-server",
+  "license": "Apache-2.0",
+  "mcpServers": {
+    "faostat-mcp-server": {
+      "command": "npx",
+      "args": ["-y", "@cyanheads/faostat-mcp-server"],
+      "env": {
+        "MCP_TRANSPORT_TYPE": "stdio"
+      }
+    }
+  }
+}
