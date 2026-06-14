@@ -1,6 +1,6 @@
 # faostat-mcp-server - Directory Structure
 
-Generated on: 2026-06-13 16:43:03
+Generated on: 2026-06-14 10:37:39
 
 ```text
 faostat-mcp-server/
@@ -23,9 +23,7 @@ faostat-mcp-server/
 │   ├── 0.1.x/
 │   └── template.md
 ├── docs/
-│   ├── data-source-verification.md
-│   ├── design.md
-│   └── idea.md
+│   └── design.md
 ├── scripts/
 │   ├── _mirror-context.ts
 │   ├── build-changelog.ts
