@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/faostat-mcp-server",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Global food & agriculture statistics from the UN FAOSTAT bulk-download corpus, served from a local SQLite mirror with a DataCanvas SQL surface, over MCP. STDIO & Streamable HTTP.",
   "mcpName": "io.github.cyanheads/faostat-mcp-server",
   "type": "module",
@@ -102,6 +102,6 @@
     "ignore": "^7.0.5",
     "tsc-alias": "^1.8.17",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.8"
+    "vitest": "^4.1.9"
   }
 }
