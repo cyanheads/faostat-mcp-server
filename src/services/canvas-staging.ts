@@ -192,12 +192,24 @@ export async function describeStaged(ctx: Context, tableName?: string): Promise<
 
 /**
  * SQL-gate reasons that mean "the SQL is not a valid single read-only SELECT"
- * (bad statement type, multi-statement, denied function/operator, bad table or
- * column identifier). The tool contract collapses all of them to one stable,
+ * (non-SELECT statement type, multi-statement, denied function/operator, bad
+ * identifier). The tool contract collapses all of them to one stable,
  * server-owned `invalid_sql` reason so a framework rename of any gate reason
  * can't silently change `faostat_dataframe_query`'s advertised `errors[]`.
- * `missing_table` and `system_catalog_access` are deliberately excluded — they
- * have their own declared contract reasons with distinct recovery guidance.
+ *
+ * Three gate reasons are deliberately excluded:
+ * - `missing_table` and `system_catalog_access` — declared contract reasons in
+ *   their own right, with distinct recovery guidance.
+ * - `invalid_sql` (`SQL_GATE_REASONS.invalidSql`) — since mcp-ts-core 0.10.8,
+ *   a SELECT-shaped statement that parses but fails to prepare for a non-table
+ *   reason (mistyped column, unknown function, invalid expression) is thrown
+ *   NATIVELY as `invalid_sql` with a DuckDB `data.binderMessage`. That already
+ *   matches this tool's declared contract, so it must pass through untouched —
+ *   re-wrapping it here would strip the binder detail that names the offending
+ *   column. The native classification covers the bad-column SELECT case this
+ *   remap previously handled (those used to fall through to
+ *   `non_select_statement`); the remap is retained only for the genuinely
+ *   non-SELECT / denied / malformed-identifier reasons the gate still emits.
  */
 const INVALID_SQL_GATE_REASONS = new Set<string>([
   SQL_GATE_REASONS.nonSelectStatement,
@@ -214,8 +226,9 @@ const INVALID_SQL_GATE_REASONS = new Set<string>([
  * Run a read-only SELECT against the tenant's shared canvas. System catalogs are
  * denied so a caller can't enumerate every staged handle. Normalizes the SQL
  * gate's rejections to this tool's declared contract: `missing_table` (with
- * FAOSTAT-facing recovery), `system_catalog_access` (passed through), and a
- * stable `invalid_sql` for every other malformed / non-read-only statement —
+ * FAOSTAT-facing recovery), `system_catalog_access` (passed through), the
+ * framework-native `invalid_sql` (passed through, preserving `data.binderMessage`),
+ * and a stable `invalid_sql` for every other malformed / non-read-only statement —
  * including the gate's own `non_select_statement` / `multi_statement` McpErrors,
  * which otherwise reach the client with an undeclared `data.reason`.
  */
@@ -265,6 +278,9 @@ export async function queryStaged(
           },
         });
       }
+      // Falls through here: the framework-native `invalid_sql` (mcp-ts-core ≥0.10.8,
+      // SELECT-shaped prepare failures — bad column / unknown function), which already
+      // matches the contract and carries `data.binderMessage`. Pass through unchanged.
       throw err;
     }
     const msg = err instanceof Error ? err.message : String(err);

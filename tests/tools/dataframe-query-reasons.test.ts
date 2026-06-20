@@ -3,9 +3,15 @@
  * gate (in `@cyanheads/mcp-ts-core`) rejects non-read-only or malformed SQL with
  * its own reason strings (`non_select_statement`, `multi_statement`, …). Those
  * used to bubble through undeclared while the tool advertised `invalid_sql`.
- * `queryStaged` now normalizes every SQL-validity gate reason to the stable
- * server-owned `invalid_sql`, while `missing_table` and `system_catalog_access`
- * keep their own declared reasons.
+ * `queryStaged` normalizes those genuinely non-SELECT / denied / malformed-identifier
+ * gate reasons to the stable server-owned `invalid_sql`, while `missing_table` and
+ * `system_catalog_access` keep their own declared reasons.
+ *
+ * Since mcp-ts-core 0.10.8, a SELECT-shaped statement that parses but fails to
+ * prepare for a non-table reason (a mistyped column) is classified NATIVELY by the
+ * framework as `invalid_sql` with a DuckDB `data.binderMessage`. That already matches
+ * the contract, so `queryStaged` passes it through untouched — the bad-column case
+ * below is framework-native, not remap-driven, and the binder detail must survive.
  *
  * Runs a real DuckDB canvas with one staged table, then drives the gate through
  * the handler and asserts the surfaced `data.reason` matches the declared
@@ -96,10 +102,17 @@ describe('faostat_dataframe_query error-contract reasons', () => {
     });
   });
 
-  it('surfaces invalid_sql for a SELECT with a bad column', async () => {
+  // A bad-column SELECT parses but fails to prepare; mcp-ts-core ≥0.10.8 classifies
+  // this natively as `invalid_sql` and carries the DuckDB binder detail (the offending
+  // column + candidate bindings) in `data.binderMessage`. queryStaged passes it through
+  // unchanged — assert both the contract reason and that the binder detail survives.
+  it('surfaces native invalid_sql (with binderMessage) for a SELECT with a bad column', async () => {
     await expect(run(`SELECT nonexistent_col FROM ${tableName}`)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
-      data: { reason: 'invalid_sql' },
+      data: {
+        reason: 'invalid_sql',
+        binderMessage: expect.stringContaining('nonexistent_col'),
+      },
     });
   });
 
