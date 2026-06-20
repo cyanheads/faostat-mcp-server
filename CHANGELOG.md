@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.4](changelog/0.1.x/0.1.4.md) — 2026-06-19
+
+Adopt @cyanheads/mcp-ts-core ^0.10.8 — malformed-column canvas SQL now surfaces invalid_sql with the DuckDB binder detail naming the bad column; the server's gate-reason remap is retained for non-SELECT / denied / malformed-identifier statements.
+
 ## [0.1.3](changelog/0.1.x/0.1.3.md) — 2026-06-19
 
 Close the 51–~600-row spill dead band (full set now returned inline) and align dataframe error-contract reasons with what the SQL gate emits.
