@@ -49,15 +49,9 @@ export const queryObservationsTool = tool('faostat_query_observations', {
 
   errors: [
     {
-      reason: 'unknown_domain',
-      code: JsonRpcErrorCode.InvalidParams,
-      when: 'The domain code is not in the FAOSTAT catalog selection.',
-      recovery: 'Call faostat_list_domains for valid codes.',
-    },
-    {
       reason: 'domain_not_indexed',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The domain is valid but not in the local mirror selection (FAOSTAT_DOMAINS).',
+      when: 'The domain is not in the local mirror selection (FAOSTAT_DOMAINS) — whether a valid FAOSTAT code or not.',
       recovery:
         'Pick an indexed domain (faostat_list_domains shows the indexed flag) or add it to FAOSTAT_DOMAINS and re-sync.',
     },
@@ -68,12 +62,6 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       retryable: true,
       recovery:
         'Wait for the initial sync to finish, or run the mirror init script, then retry shortly.',
-    },
-    {
-      reason: 'empty_result',
-      code: JsonRpcErrorCode.NotFound,
-      when: 'Filters are valid but no observation matched.',
-      recovery: 'Widen the year range, relax filters, or verify codes with faostat_resolve_codes.',
     },
     {
       reason: 'canvas_disabled',
@@ -237,25 +225,36 @@ export const queryObservationsTool = tool('faostat_query_observations', {
           ...(input.canvas_id ? { canvasId: input.canvas_id } : {}),
         },
       );
-      if (staged?.spilled) {
-        ctx.enrich.notice(
-          `Result of ${total} observations staged on canvas table ${staged.tableName}. Use faostat_dataframe_query (canvas_id ${staged.canvasId}) for GROUP BY, ranking, and time-series analysis over the full set.`,
-        );
-        return {
-          domain: code,
-          observations: staged.previewRows as ReturnType<typeof toObservation>[],
-          spilled: true,
-          canvas_id: staged.canvasId,
-          table_name: staged.tableName,
-        };
+      if (staged) {
+        // `previewRows` holds the preview slice when spilled, or — when the stream
+        // drained under the char budget — the COMPLETE set (the spill helper only
+        // stops short on an overflow row). Either way it's the rows to inline:
+        // returning the not-spilled full set here is what closes the 51–~600-row
+        // dead band where re-capping at `limit` silently dropped rows.
+        const observations = (staged.previewRows as unknown as ObservationRow[]).map(toObservation);
+        if (staged.spilled) {
+          ctx.enrich.notice(
+            `Result of ${total} observations staged on canvas table ${staged.tableName}. Use faostat_dataframe_query (canvas_id ${staged.canvasId}) for GROUP BY, ranking, and time-series analysis over the full set.`,
+          );
+          return {
+            domain: code,
+            observations,
+            spilled: true,
+            canvas_id: staged.canvasId,
+            table_name: staged.tableName,
+          };
+        }
+        return { domain: code, observations, spilled: false };
       }
-      // Staging failed or fit after all — fall through to inline what we have.
-      ctx.log.warning('Spill did not materialize a table; returning inline rows', { total });
+      // Canvas op failed outright (staged === undefined) — fall back to the inline
+      // page. canvasEnabled() was true above, so advise raising `limit`, not
+      // enabling a canvas that is already on.
+      ctx.log.warning('Canvas staging failed; returning inline page', { total });
     }
 
     if (total > rows.length) {
       ctx.enrich.notice(
-        `Showing ${rows.length} of ${total} observations. Enable DataCanvas (CANVAS_PROVIDER_TYPE=duckdb) to stage the full set, or narrow filters.`,
+        `Showing ${rows.length} of ${total} observations (inline page). Raise limit (max 1000) to return more rows, or narrow the filters.`,
       );
     }
     return {

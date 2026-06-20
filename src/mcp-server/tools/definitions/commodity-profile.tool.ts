@@ -293,6 +293,13 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
       ctx.enrich.notice(
         `Merged production + trade observations staged on canvas table ${tableName} (canvas_id ${canvasId}). Query it with faostat_dataframe_query for full time-series analysis.`,
       );
+    } else if (canvasEnabled()) {
+      // Canvas on, but the merged set fit under the inline char budget so no table
+      // was registered. The rankings and trend count above are complete — do NOT
+      // advise enabling a canvas that is already on (the dead-band notice bug).
+      ctx.enrich.notice(
+        `Merged set fit inline — the rankings and trend count above cover the full result, so no canvas table was needed.`,
+      );
     }
 
     return {
@@ -331,9 +338,13 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
       lines.push(
         `\nFull set staged (spilled) on canvas table **${result.table_name}** (canvas_id ${result.canvas_id}) — query with faostat_dataframe_query.`,
       );
+    } else if (result.canvas_id !== undefined) {
+      // Canvas is on; the merged set fit under the inline budget so no table was
+      // registered. The rankings above are the complete answer.
+      lines.push('\n_Merged set fit inline — the rankings above cover the full result._');
     } else {
       lines.push(
-        '\n_Merged set not spilled to a canvas table (enable CANVAS_PROVIDER_TYPE=duckdb to stage it)._',
+        '\n_Merged set not staged to a canvas table (enable CANVAS_PROVIDER_TYPE=duckdb for deeper SQL on large results)._',
       );
     }
     return [{ type: 'text', text: lines.join('\n').trimEnd() }];

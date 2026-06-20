@@ -15,6 +15,7 @@ import {
   type CanvasInstance,
   type ColumnSchema,
   type QueryResult,
+  SQL_GATE_REASONS,
   spillover,
 } from '@cyanheads/mcp-ts-core/canvas';
 import { McpError, notFound, validationError } from '@cyanheads/mcp-ts-core/errors';
@@ -190,9 +191,33 @@ export async function describeStaged(ctx: Context, tableName?: string): Promise<
 }
 
 /**
+ * SQL-gate reasons that mean "the SQL is not a valid single read-only SELECT"
+ * (bad statement type, multi-statement, denied function/operator, bad table or
+ * column identifier). The tool contract collapses all of them to one stable,
+ * server-owned `invalid_sql` reason so a framework rename of any gate reason
+ * can't silently change `faostat_dataframe_query`'s advertised `errors[]`.
+ * `missing_table` and `system_catalog_access` are deliberately excluded — they
+ * have their own declared contract reasons with distinct recovery guidance.
+ */
+const INVALID_SQL_GATE_REASONS = new Set<string>([
+  SQL_GATE_REASONS.nonSelectStatement,
+  SQL_GATE_REASONS.multiStatement,
+  SQL_GATE_REASONS.planOperatorNotAllowed,
+  SQL_GATE_REASONS.deniedFunction,
+  SQL_GATE_REASONS.deniedFunctionInPlan,
+  SQL_GATE_REASONS.identifierEmpty,
+  SQL_GATE_REASONS.identifierShape,
+  SQL_GATE_REASONS.identifierReserved,
+]);
+
+/**
  * Run a read-only SELECT against the tenant's shared canvas. System catalogs are
- * denied so a caller can't enumerate every staged handle. Rebuilds the
- * framework's `missing_table` rejection with FAOSTAT-facing recovery guidance.
+ * denied so a caller can't enumerate every staged handle. Normalizes the SQL
+ * gate's rejections to this tool's declared contract: `missing_table` (with
+ * FAOSTAT-facing recovery), `system_catalog_access` (passed through), and a
+ * stable `invalid_sql` for every other malformed / non-read-only statement —
+ * including the gate's own `non_select_statement` / `multi_statement` McpErrors,
+ * which otherwise reach the client with an undeclared `data.reason`.
  */
 export async function queryStaged(
   ctx: Context,
@@ -213,8 +238,11 @@ export async function queryStaged(
   } catch (err) {
     if (err instanceof McpError) {
       const data = err.data as Record<string, unknown> | undefined;
-      if (data?.reason === 'missing_table') {
-        const tableName = data.tableName;
+      const reason = typeof data?.reason === 'string' ? data.reason : undefined;
+      // `missing_table` originates in the DuckDB provider (not the SQL gate), as a
+      // string-literal reason — match it directly.
+      if (reason === 'missing_table') {
+        const tableName = data?.tableName;
         const subject =
           typeof tableName === 'string' ? `Canvas table "${tableName}"` : 'Canvas table';
         throw notFound(`${subject} does not exist — it may have expired or was never staged.`, {
@@ -222,6 +250,18 @@ export async function queryStaged(
           ...(tableName !== undefined && { tableName }),
           recovery: {
             hint: 'Call faostat_dataframe_describe to list staged tables, or re-run the query that staged the data.',
+          },
+        });
+      }
+      // system_catalog_access is a declared contract reason — let it through as-is.
+      if (reason === SQL_GATE_REASONS.systemCatalogAccess) throw err;
+      // Every other gate reason means the SQL is not a valid read-only SELECT.
+      // Remap to the stable contract reason, preserving the gate's message.
+      if (reason !== undefined && INVALID_SQL_GATE_REASONS.has(reason)) {
+        throw validationError(err.message, {
+          reason: 'invalid_sql',
+          recovery: {
+            hint: 'Use one read-only SELECT and verify table/column names against faostat_dataframe_describe.',
           },
         });
       }

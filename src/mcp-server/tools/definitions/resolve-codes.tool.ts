@@ -45,13 +45,6 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       recovery:
         'Wait for the initial sync to finish or run the mirror init script, then retry shortly.',
     },
-    {
-      reason: 'no_match',
-      code: JsonRpcErrorCode.NotFound,
-      when: 'No code matched the query/filter in this dimension.',
-      recovery:
-        'Broaden the query, check spelling, or omit query to list all codes in the dimension.',
-    },
   ],
 
   input: z.object({

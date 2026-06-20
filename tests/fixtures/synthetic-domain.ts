@@ -64,6 +64,62 @@ export function buildDomainZip(domain = FIXTURE_DOMAIN): Uint8Array {
   return zipSync(files);
 }
 
+/**
+ * Build a mid-size synthetic domain: `countryCount` distinct country rows (area
+ * codes 1..countryCount, all < 5000) plus `aggregateCount` aggregate-region rows
+ * (codes 5000+), for one item (Wheat=15) / element (Production=5510) / year
+ * (2020). Sized for the spillover dead-band test — a few hundred rows serialize
+ * well under the 100k-char inline budget yet exceed the inline-page `limit`, so
+ * they exercise the "fit under budget, return everything inline" path without
+ * registering a canvas table. Returns the ZIP plus the exact row counts.
+ */
+export function buildMidSizeDomainZip(opts: {
+  domain?: string;
+  countryCount: number;
+  aggregateCount?: number;
+}): { zip: Uint8Array; total: number; countryCount: number; aggregateCount: number } {
+  const domain = opts.domain ?? FIXTURE_DOMAIN;
+  const aggregateCount = opts.aggregateCount ?? 0;
+  const base = `Production_Crops_Livestock_${domain}`;
+
+  const dataRows: string[] = [];
+  const areaRows: string[] = ['Area Code,M49 Code,Area'];
+  for (let i = 1; i <= opts.countryCount; i++) {
+    const m49 = String(i).padStart(3, '0');
+    const name = `Country ${i}`;
+    const value = (1000 + i).toFixed(6);
+    const flag = i % 3 === 0 ? 'I' : i % 3 === 1 ? 'A' : 'E';
+    dataRows.push(
+      `${i},'${m49},${name},15,Wheat,5510,Production,2020,2020,t,${value},${flag},Synth`,
+    );
+    areaRows.push(`${i},'${m49},${name}`);
+  }
+  for (let a = 0; a < aggregateCount; a++) {
+    const code = 5000 + a;
+    const m49 = String(900 + a).padStart(3, '0');
+    const name = `Region ${a}`;
+    const value = (900000 + a).toFixed(6);
+    dataRows.push(
+      `${code},'${m49},${name},15,Wheat,5510,Production,2020,2020,t,${value},A,Aggregate`,
+    );
+    areaRows.push(`${code},'${m49},${name}`);
+  }
+
+  const files: Zippable = {
+    [`${base}_E_All_Data_(Normalized).csv`]: strToU8([DATA_HEADER, ...dataRows].join('\n')),
+    [`${base}_E_AreaCodes.csv`]: strToU8(areaRows.join('\n')),
+    [`${base}_E_ItemCodes.csv`]: strToU8(ITEM_CODES_CSV),
+    [`${base}_E_Elements.csv`]: strToU8(ELEMENTS_CSV),
+    [`${base}_E_Flags.csv`]: strToU8(FLAGS_CSV),
+  };
+  return {
+    zip: zipSync(files),
+    total: opts.countryCount + aggregateCount,
+    countryCount: opts.countryCount,
+    aggregateCount,
+  };
+}
+
 /** A manifest dataset entry pointing at the fixture ZIP. */
 export function fixtureDataset(domain = FIXTURE_DOMAIN): ManifestDataset {
   return {
