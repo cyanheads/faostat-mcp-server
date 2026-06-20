@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/faostat-mcp-server",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Global food & agriculture statistics from the UN FAOSTAT bulk-download corpus, served from a local SQLite mirror with a DataCanvas SQL surface, over MCP. STDIO & Streamable HTTP.",
   "mcpName": "io.github.cyanheads/faostat-mcp-server",
   "type": "module",
@@ -87,7 +87,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@cyanheads/mcp-ts-core": "^0.10.8",
+    "@cyanheads/mcp-ts-core": "^0.10.9",
     "@duckdb/node-api": "^1.5.4-r.1",
     "better-sqlite3": "^12.11.1",
     "fflate": "^0.8.3",
