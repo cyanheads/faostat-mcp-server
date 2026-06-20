@@ -1,6 +1,6 @@
 # faostat-mcp-server - Directory Structure
 
-Generated on: 2026-06-14 10:37:39
+Generated on: 2026-06-20 02:55:03
 
 ```text
 faostat-mcp-server/
@@ -169,7 +169,11 @@ faostat-mcp-server/
 │   │   ├── ingester-parse.test.ts
 │   │   └── manifest.test.ts
 │   └── tools/
-│       └── dataframe-canvas-id-optional.test.ts
+│       ├── commodity-profile-notice.test.ts
+│       ├── dataframe-canvas-id-optional.test.ts
+│       ├── dataframe-query-reasons.test.ts
+│       ├── error-contract.test.ts
+│       └── query-observations-spillover.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitignore

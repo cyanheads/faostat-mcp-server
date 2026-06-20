@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.3](changelog/0.1.x/0.1.3.md) — 2026-06-19
+
+Close the 51–~600-row spill dead band (full set now returned inline) and align dataframe error-contract reasons with what the SQL gate emits.
+
 ## [0.1.2](changelog/0.1.x/0.1.2.md) — 2026-06-15
 
 Public hosted endpoint at https://faostat.caseyjhand.com/mcp
