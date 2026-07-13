@@ -67,6 +67,7 @@ describe('error-contract conformance', () => {
         'canvas_disabled',
         'domain_not_indexed',
         'index_not_ready',
+        'invalid_year_range',
       ]);
     });
 

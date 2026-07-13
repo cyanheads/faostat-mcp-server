@@ -65,21 +65,26 @@ export function buildDomainZip(domain = FIXTURE_DOMAIN): Uint8Array {
 }
 
 /**
- * Build a mid-size synthetic domain: `countryCount` distinct country rows (area
- * codes 1..countryCount, all < 5000) plus `aggregateCount` aggregate-region rows
- * (codes 5000+), for one item (Wheat=15) / element (Production=5510) / year
- * (2020). Sized for the spillover dead-band test — a few hundred rows serialize
- * well under the 100k-char inline budget yet exceed the inline-page `limit`, so
- * they exercise the "fit under budget, return everything inline" path without
- * registering a canvas table. Returns the ZIP plus the exact row counts.
+ * Build a mid-size synthetic domain: `countryCount` distinct country codes (area
+ * codes 1..countryCount, all < 5000) plus `aggregateCount` aggregate-region codes
+ * (codes 5000+), each emitted across `years` consecutive years starting 2020, for
+ * one item (Wheat=15) / element (Production=5510). Sized for the spillover
+ * dead-band test at `years: 1` — a few hundred rows serialize well under the
+ * 100k-char inline budget yet exceed the inline-page `limit`. Raise `years` to
+ * cross the 50,000-row staging cap using only country codes (< 5000), which the
+ * country-only production path in commodity_profile and the default
+ * aggregate-excluding query both require to reach truncation. Returns the ZIP plus
+ * the exact row counts (`total = (countryCount + aggregateCount) * years`).
  */
 export function buildMidSizeDomainZip(opts: {
   domain?: string;
   countryCount: number;
   aggregateCount?: number;
+  years?: number;
 }): { zip: Uint8Array; total: number; countryCount: number; aggregateCount: number } {
   const domain = opts.domain ?? FIXTURE_DOMAIN;
   const aggregateCount = opts.aggregateCount ?? 0;
+  const years = opts.years ?? 1;
   const base = `Production_Crops_Livestock_${domain}`;
 
   const dataRows: string[] = [];
@@ -89,9 +94,12 @@ export function buildMidSizeDomainZip(opts: {
     const name = `Country ${i}`;
     const value = (1000 + i).toFixed(6);
     const flag = i % 3 === 0 ? 'I' : i % 3 === 1 ? 'A' : 'E';
-    dataRows.push(
-      `${i},'${m49},${name},15,Wheat,5510,Production,2020,2020,t,${value},${flag},Synth`,
-    );
+    for (let y = 0; y < years; y++) {
+      const year = 2020 + y;
+      dataRows.push(
+        `${i},'${m49},${name},15,Wheat,5510,Production,${year},${year},t,${value},${flag},Synth`,
+      );
+    }
     areaRows.push(`${i},'${m49},${name}`);
   }
   for (let a = 0; a < aggregateCount; a++) {
@@ -99,9 +107,12 @@ export function buildMidSizeDomainZip(opts: {
     const m49 = String(900 + a).padStart(3, '0');
     const name = `Region ${a}`;
     const value = (900000 + a).toFixed(6);
-    dataRows.push(
-      `${code},'${m49},${name},15,Wheat,5510,Production,2020,2020,t,${value},A,Aggregate`,
-    );
+    for (let y = 0; y < years; y++) {
+      const year = 2020 + y;
+      dataRows.push(
+        `${code},'${m49},${name},15,Wheat,5510,Production,${year},${year},t,${value},A,Aggregate`,
+      );
+    }
     areaRows.push(`${code},'${m49},${name}`);
   }
 
@@ -114,7 +125,7 @@ export function buildMidSizeDomainZip(opts: {
   };
   return {
     zip: zipSync(files),
-    total: opts.countryCount + aggregateCount,
+    total: (opts.countryCount + aggregateCount) * years,
     countryCount: opts.countryCount,
     aggregateCount,
   };

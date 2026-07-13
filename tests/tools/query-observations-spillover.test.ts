@@ -24,6 +24,7 @@ import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryObservationsTool } from '@/mcp-server/tools/definitions/query-observations.tool.js';
 import { setCanvas } from '@/services/canvas-accessor.js';
+import { STAGE_MAX_ROWS } from '@/services/canvas-staging.js';
 import { type FaostatMirror, initFaostatMirror } from '@/services/faostat-mirror/index.js';
 import {
   buildMidSizeDomainZip,
@@ -56,8 +57,12 @@ describe('faostat_query_observations spillover dead band', () => {
   let mirror: FaostatMirror;
 
   /** Sync a synthetic domain of `country + aggregate` rows into a fresh mirror. */
-  async function syncDomain(countryCount: number, aggregateCount: number): Promise<number> {
-    const { zip, total } = buildMidSizeDomainZip({ countryCount, aggregateCount });
+  async function syncDomain(
+    countryCount: number,
+    aggregateCount: number,
+    years = 1,
+  ): Promise<number> {
+    const { zip, total } = buildMidSizeDomainZip({ countryCount, aggregateCount, years });
     vi.stubGlobal(
       'fetch',
       vi.fn(async () => chunkedResponse(zip, 256)),
@@ -192,4 +197,57 @@ describe('faostat_query_observations spillover dead band', () => {
     });
     expect(Number(counted.rows[0]?.n)).toBe(1200);
   });
+
+  it('discloses truncation honestly when the staged set hits the 50k cap (never "complete") (#9)', async () => {
+    // 260 countries × 200 years = 52,000 country rows (codes < 5000, so none are
+    // excluded as aggregates) — past STAGE_MAX_ROWS (50k). The spill helper caps the
+    // table at the limit and reports truncated; the tool must surface that, not
+    // claim a complete set.
+    const total = await syncDomain(260, 0, 200);
+    expect(total).toBe(52_000);
+    expect(total).toBeGreaterThan(STAGE_MAX_ROWS);
+
+    const ctx = createMockContext({
+      tenantId: 'spill-trunc',
+      errors: queryObservationsTool.errors,
+    });
+    const input = queryObservationsTool.input.parse({
+      domain: FIXTURE_DOMAIN,
+      item_codes: [15],
+      element_codes: [5510],
+    });
+
+    const result = await queryObservationsTool.handler(input, ctx);
+
+    // The staged table is a capped prefix — and the output says so.
+    expect(result.spilled).toBe(true);
+    expect(result.truncated).toBe(true);
+    expect(result.staged_row_count).toBe(STAGE_MAX_ROWS);
+    expect(result.canvas_id).toBeDefined();
+    expect(result.table_name).toBeDefined();
+
+    // structuredContent notice discloses the cap + actionable recovery, and never
+    // claims completeness.
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toMatch(/staging cap|only the first/i);
+    expect(notice).toMatch(/partition|year_start|narrower/i);
+    expect(notice).not.toMatch(/complete set/i);
+    expect(notice).not.toMatch(/over the full set/i);
+
+    // content[] twin agrees — INCOMPLETE, never "the complete set".
+    const text = queryObservationsTool
+      .format(result)
+      .map((c) => (c.type === 'text' ? c.text : ''))
+      .join('\n');
+    expect(text).toMatch(/INCOMPLETE|Partial result/i);
+    expect(text).not.toMatch(/query the table for the complete set/i);
+
+    // The staged table really is capped at STAGE_MAX_ROWS (not the full 52k match).
+    const instance = await canvas.acquire(result.canvas_id, ctx);
+    const counted = await instance.query(`SELECT COUNT(*) AS n FROM ${result.table_name}`, {
+      rowLimit: 1,
+      denySystemCatalogs: true,
+    });
+    expect(Number(counted.rows[0]?.n)).toBe(STAGE_MAX_ROWS);
+  }, 30_000);
 });

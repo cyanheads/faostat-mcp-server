@@ -70,6 +70,13 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       recovery:
         'Set CANVAS_PROVIDER_TYPE=duckdb to enable SQL on large result sets, or narrow the query.',
     },
+    {
+      reason: 'invalid_year_range',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'year_start is greater than year_end — a self-contradictory range that can never match.',
+      recovery:
+        'Pass year_start ≤ year_end, or omit one bound to leave that side of the range open.',
+    },
   ],
 
   input: z.object({
@@ -140,6 +147,11 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       )
       .describe('Inline observations (preview when the full set spilled to a canvas table).'),
     spilled: z.boolean().describe('True when the full result was staged on a DataCanvas table.'),
+    truncated: z
+      .boolean()
+      .describe(
+        'True when the staged table hit the 50,000-row staging cap — the staged set is a PREFIX of the match, not the complete result. Partition the query by year or code ranges to capture the rest.',
+      ),
     canvas_id: z
       .string()
       .optional()
@@ -150,6 +162,12 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       .string()
       .optional()
       .describe('Canvas table name holding the full result set (present when spilled).'),
+    staged_row_count: z
+      .number()
+      .optional()
+      .describe(
+        'Rows actually staged on the canvas table (present when spilled). Equals the full match count unless truncated, in which case it is the 50,000-row cap.',
+      ),
   }),
 
   async handler(input, ctx) {
@@ -170,6 +188,41 @@ export const queryObservationsTool = tool('faostat_query_observations', {
         `The ${code} mirror has not completed its initial sync.`,
         ctx.recoveryFor('index_not_ready'),
       );
+    }
+
+    // A reversed year range is a contradiction the mirror would silently treat as
+    // zero matches with generic no-match guidance — reject it with actionable detail.
+    if (
+      input.year_start !== undefined &&
+      input.year_end !== undefined &&
+      input.year_start > input.year_end
+    ) {
+      throw ctx.fail(
+        'invalid_year_range',
+        `year_start (${input.year_start}) is after year_end (${input.year_end}).`,
+        ctx.recoveryFor('invalid_year_range'),
+      );
+    }
+
+    // An explicitly-empty code array is a zero-match selection, NOT "match all". The
+    // mirror's own `.length` guard (in both queryObservations and streamObservations)
+    // would otherwise drop an empty array and broaden the query to the entire
+    // dimension, so short-circuit here — before any mirror call — the moment a code
+    // array is defined-and-empty. An omitted array still means "unfiltered".
+    const emptyDimension =
+      input.area_codes?.length === 0
+        ? 'area_codes'
+        : input.item_codes?.length === 0
+          ? 'item_codes'
+          : input.element_codes?.length === 0
+            ? 'element_codes'
+            : undefined;
+    if (emptyDimension) {
+      ctx.enrich.total(0);
+      ctx.enrich.notice(
+        `${emptyDimension} was an empty array — an explicit empty selection matches nothing. Omit ${emptyDimension} to query every code in that dimension, or pass codes from faostat_resolve_codes.`,
+      );
+      return { domain: code, observations: [], spilled: false, truncated: false };
     }
 
     const filters = {
@@ -194,7 +247,7 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       ctx.enrich.notice(
         `No observations matched in ${code}. Widen the year range, relax filters, or re-check codes with faostat_resolve_codes${input.include_aggregates ? '' : ' (aggregates are excluded by default — set include_aggregates=true for regional roll-ups)'}.`,
       );
-      return { domain: code, observations: [], spilled: false };
+      return { domain: code, observations: [], spilled: false, truncated: false };
     }
 
     // Spill when the full result exceeds the inline budget AND canvas is on.
@@ -233,18 +286,26 @@ export const queryObservationsTool = tool('faostat_query_observations', {
         // dead band where re-capping at `limit` silently dropped rows.
         const observations = (staged.previewRows as unknown as ObservationRow[]).map(toObservation);
         if (staged.spilled) {
-          ctx.enrich.notice(
-            `Result of ${total} observations staged on canvas table ${staged.tableName}. Use faostat_dataframe_query (canvas_id ${staged.canvasId}) for GROUP BY, ranking, and time-series analysis over the full set.`,
-          );
+          if (staged.truncated) {
+            ctx.enrich.notice(
+              `Matched ${total} observations but only the first ${staged.rowCount} were staged on canvas table ${staged.tableName} (staging cap ${STAGE_MAX_ROWS}) — the staged set is a PREFIX, not the complete result. To capture the rest, re-call faostat_query_observations partitioned by year (year_start/year_end) or with narrower area_codes/item_codes/element_codes so each partition stays under the cap, then query each with faostat_dataframe_query (canvas_id ${staged.canvasId}).`,
+            );
+          } else {
+            ctx.enrich.notice(
+              `Result of ${total} observations staged on canvas table ${staged.tableName}. Use faostat_dataframe_query (canvas_id ${staged.canvasId}) for GROUP BY, ranking, and time-series analysis over the full set.`,
+            );
+          }
           return {
             domain: code,
             observations,
             spilled: true,
+            truncated: staged.truncated,
             canvas_id: staged.canvasId,
             table_name: staged.tableName,
+            staged_row_count: staged.rowCount,
           };
         }
-        return { domain: code, observations, spilled: false };
+        return { domain: code, observations, spilled: false, truncated: false };
       }
       // Canvas op failed outright (staged === undefined) — fall back to the inline
       // page. canvasEnabled() was true above, so advise raising `limit`, not
@@ -261,12 +322,17 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       domain: code,
       observations: rows.map(toObservation),
       spilled: false,
+      truncated: false,
     };
   },
 
   format: (result) => {
     const lines: string[] = [];
-    if (result.spilled) {
+    if (result.spilled && result.truncated) {
+      lines.push(
+        `Result spilled to canvas table **${result.table_name}** (canvas_id ${result.canvas_id}) but was TRUNCATED at the staging cap — only the first ${result.staged_row_count} row(s) were staged, so the table is INCOMPLETE. Preview below; partition the query by year (year_start/year_end) or narrower codes and re-run to stage the rest.\n`,
+      );
+    } else if (result.spilled) {
       lines.push(
         `Full result spilled to canvas table **${result.table_name}** (canvas_id ${result.canvas_id}). Preview below — query the table for the complete set.\n`,
       );

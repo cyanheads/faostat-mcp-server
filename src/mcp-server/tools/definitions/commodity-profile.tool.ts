@@ -169,10 +169,17 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
       .describe('Top importers by import quantity (empty when trade is not indexed).'),
     trend_points: z
       .number()
-      .describe('Count of production trend observations staged for the resolved commodity.'),
+      .describe(
+        'Count of production trend observations analyzed for the resolved commodity. Capped at the 50,000-row staging limit — when truncated is true this is a floor, not the true count.',
+      ),
     spilled: z
       .boolean()
       .describe('True when the merged observation set was staged on a canvas table.'),
+    truncated: z
+      .boolean()
+      .describe(
+        'True when the producer ranking / trend and/or the staged canvas table were drawn from a set capped at the 50,000-row staging limit — treat the profile as a PARTIAL view and query faostat_query_observations directly (partitioned by year) for the complete series.',
+      ),
     canvas_id: z
       .string()
       .optional()
@@ -182,6 +189,12 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
       .optional()
       .describe(
         'Canvas table holding the merged production+trade observations (present when spilled).',
+      ),
+    staged_row_count: z
+      .number()
+      .optional()
+      .describe(
+        'Rows actually staged on the merged canvas table (present when spilled). Equals the 50,000-row cap when truncated.',
       ),
   }),
 
@@ -264,6 +277,8 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
 
     // 4. Stage the merged production + trade observations for deeper SQL.
     let spilled = false;
+    let stagedTruncated = false;
+    let stagedRowCount: number | undefined;
     let canvasId: string | undefined;
     let tableName: string | undefined;
     if (canvasEnabled()) {
@@ -278,6 +293,8 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
       );
       if (staged?.spilled) {
         spilled = true;
+        stagedTruncated = staged.truncated;
+        stagedRowCount = staged.rowCount;
         canvasId = staged.canvasId;
         tableName = staged.tableName;
       } else if (staged) {
@@ -285,22 +302,39 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
       }
     }
 
+    // The producer ranking + trend are drawn from `production`, capped at
+    // STAGE_MAX_ROWS. When the true match exceeds the cap both are a partial view —
+    // flag it via `truncated` and disclose it in the notice/format. (Ranking
+    // correctness under the cap is a separate concern, tracked in #5.)
+    const productionTruncated = production.total > production.rows.length;
+    const truncated = productionTruncated || stagedTruncated;
+
+    const noticeParts: string[] = [];
     if (tradeMissing) {
-      ctx.enrich.notice(
+      noticeParts.push(
         `Trade domain (TCL) is not indexed — returning production-only profile. Add TCL to FAOSTAT_DOMAINS and re-sync for import/export flows.`,
       );
+    }
+    if (truncated) {
+      const capMsg = productionTruncated
+        ? `Production matched ${production.total} rows but only the first ${production.rows.length} were analyzed — top_producers and trend_points are drawn from a capped ${STAGE_MAX_ROWS}-row slice and may be incomplete.`
+        : `The merged set exceeded the ${STAGE_MAX_ROWS}-row staging cap, so canvas table ${tableName} is INCOMPLETE.`;
+      noticeParts.push(
+        `${capMsg} For the complete series, call faostat_query_observations on QCL with item codes ${itemCodes.join(', ')} partitioned by year (year_start/year_end)${spilled ? `; the staged partition is queryable via faostat_dataframe_query (canvas_id ${canvasId})` : ''}.`,
+      );
     } else if (spilled) {
-      ctx.enrich.notice(
+      noticeParts.push(
         `Merged production + trade observations staged on canvas table ${tableName} (canvas_id ${canvasId}). Query it with faostat_dataframe_query for full time-series analysis.`,
       );
-    } else if (canvasEnabled()) {
-      // Canvas on, but the merged set fit under the inline char budget so no table
-      // was registered. The rankings and trend count above are complete — do NOT
-      // advise enabling a canvas that is already on (the dead-band notice bug).
-      ctx.enrich.notice(
+    } else if (canvasEnabled() && !tradeMissing) {
+      // Canvas on, merged set fit under the inline char budget so no table was
+      // registered. The rankings and trend count above are complete — do NOT advise
+      // enabling a canvas that is already on (the dead-band notice bug).
+      noticeParts.push(
         `Merged set fit inline — the rankings and trend count above cover the full result, so no canvas table was needed.`,
       );
     }
+    if (noticeParts.length > 0) ctx.enrich.notice(noticeParts.join(' '));
 
     return {
       item_query: input.item_query,
@@ -310,8 +344,10 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
       top_importers: importers,
       trend_points: production.rows.length,
       spilled,
+      truncated,
       ...(canvasId !== undefined ? { canvas_id: canvasId } : {}),
       ...(tableName !== undefined ? { table_name: tableName } : {}),
+      ...(stagedRowCount !== undefined ? { staged_row_count: stagedRowCount } : {}),
     };
   },
 
@@ -334,7 +370,11 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
     rankBlock('Top exporters', result.top_exporters);
     rankBlock('Top importers', result.top_importers);
     lines.push(`Production trend observations: ${result.trend_points}`);
-    if (result.spilled) {
+    if (result.truncated) {
+      lines.push(
+        `\nPartial profile — production/trend data hit the ${STAGE_MAX_ROWS}-row cap and was TRUNCATED, so the producer ranking and trend are drawn from an incomplete slice.${result.spilled ? ` The merged set spilled to canvas table **${result.table_name}** (canvas_id ${result.canvas_id}), capped at ${result.staged_row_count} rows.` : ''} Query faostat_query_observations directly (partitioned by year) for the complete series.`,
+      );
+    } else if (result.spilled) {
       lines.push(
         `\nFull set staged (spilled) on canvas table **${result.table_name}** (canvas_id ${result.canvas_id}) — query with faostat_dataframe_query.`,
       );
