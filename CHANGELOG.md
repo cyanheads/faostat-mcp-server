@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.6](changelog/0.1.x/0.1.6.md) — 2026-07-13
+
+faostat_dataframe_query discloses row_limit truncation; the dataframe tools honor canvas_id with a typed canvas_not_found; faostat_dataframe_describe gains query_params provenance parity and a typed missing_table on a name miss. Adopts @cyanheads/mcp-ts-core ^0.10.14; clears GHSA-h67p-54hq-rp68 in a transitive js-yaml.
+
 ## [0.1.5](changelog/0.1.x/0.1.5.md) — 2026-06-20
 
 Adopt @cyanheads/mcp-ts-core ^0.10.9 — devcheck gains a dependency-specifiers gate that rejects floating specifiers in package.json and bun.lock, and the packaging lint now validates plugin marketplace manifests.
