@@ -40,7 +40,11 @@ export const queryObservationsTool = tool('faostat_query_observations', {
   annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: false },
 
   enrichment: {
-    totalCount: z.number().describe('Total observations matched before any inline cap.'),
+    totalCount: z
+      .number()
+      .describe(
+        'Observations matched. Exact when the result was returned inline or fully staged; when the match set exceeded the 50,000-row staging cap this is that cap — a floor, not the exact count (truncated is then true).',
+      ),
     notice: z
       .string()
       .optional()
@@ -234,28 +238,31 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       includeAggregates: input.include_aggregates,
     };
 
-    // Cheap count first: decide inline vs spill without materializing everything.
-    const { rows, total } = await mirror.queryObservations(code, {
+    // Overflow probe (not a COUNT): fetch just past the inline budget so the spill
+    // decision never scans the whole cube. Widen the fetch to at least
+    // INLINE_PREVIEW_ROWS so the probe can always tell "exceeds the inline budget"
+    // even when a small input.limit was requested; the display slice caps at limit.
+    const { rows, total, totalIsExact } = await mirror.queryObservations(code, {
       ...filters,
-      limit: input.limit,
+      limit: Math.max(input.limit, INLINE_PREVIEW_ROWS),
       offset: 0,
     });
 
-    ctx.enrich.total(total);
-
     if (total === 0) {
+      ctx.enrich.total(0);
       ctx.enrich.notice(
         `No observations matched in ${code}. Widen the year range, relax filters, or re-check codes with faostat_resolve_codes${input.include_aggregates ? '' : ' (aggregates are excluded by default — set include_aggregates=true for regional roll-ups)'}.`,
       );
       return { domain: code, observations: [], spilled: false, truncated: false };
     }
 
-    // Spill when the full result exceeds the inline budget AND canvas is on.
-    const shouldSpill = total > INLINE_PREVIEW_ROWS;
+    // Spill when the match set exceeds the inline budget AND canvas is on. An
+    // inexact total means more rows matched than were probed (past the inline budget).
+    const shouldSpill = !totalIsExact || total > INLINE_PREVIEW_ROWS;
     if (shouldSpill && !canvasEnabled()) {
       throw ctx.fail(
         'canvas_disabled',
-        `Result has ${total} rows — too large to inline — but DataCanvas is disabled.`,
+        `Result exceeds the ${INLINE_PREVIEW_ROWS}-row inline budget but DataCanvas is disabled.`,
         ctx.recoveryFor('canvas_disabled'),
       );
     }
@@ -285,14 +292,18 @@ export const queryObservationsTool = tool('faostat_query_observations', {
         // returning the not-spilled full set here is what closes the 51–~600-row
         // dead band where re-capping at `limit` silently dropped rows.
         const observations = (staged.previewRows as unknown as ObservationRow[]).map(toObservation);
+        // The stream yields the exact match count when it drains under the staging
+        // cap, so staged.rowCount is the exact total when !truncated (and the exact
+        // size of an inline-fit set), or the cap (a floor) when truncated.
+        ctx.enrich.total(staged.rowCount);
         if (staged.spilled) {
           if (staged.truncated) {
             ctx.enrich.notice(
-              `Matched ${total} observations but only the first ${staged.rowCount} were staged on canvas table ${staged.tableName} (staging cap ${STAGE_MAX_ROWS}) — the staged set is a PREFIX, not the complete result. To capture the rest, re-call faostat_query_observations partitioned by year (year_start/year_end) or with narrower area_codes/item_codes/element_codes so each partition stays under the cap, then query each with faostat_dataframe_query (canvas_id ${staged.canvasId}).`,
+              `Matched more than ${STAGE_MAX_ROWS} observations — only the first ${staged.rowCount} were staged on canvas table ${staged.tableName} (staging cap ${STAGE_MAX_ROWS}) — the staged set is a PREFIX, not the complete result. To capture the rest, re-call faostat_query_observations partitioned by year (year_start/year_end) or with narrower area_codes/item_codes/element_codes so each partition stays under the cap, then query each with faostat_dataframe_query (canvas_id ${staged.canvasId}).`,
             );
           } else {
             ctx.enrich.notice(
-              `Result of ${total} observations staged on canvas table ${staged.tableName}. Use faostat_dataframe_query (canvas_id ${staged.canvasId}) for GROUP BY, ranking, and time-series analysis over the full set.`,
+              `Result of ${staged.rowCount} observations staged on canvas table ${staged.tableName}. Use faostat_dataframe_query (canvas_id ${staged.canvasId}) for GROUP BY, ranking, and time-series analysis over the full set.`,
             );
           }
           return {
@@ -313,14 +324,18 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       ctx.log.warning('Canvas staging failed; returning inline page', { total });
     }
 
-    if (total > rows.length) {
+    // Not spilling (the match set is within the inline budget, so total is exact),
+    // or a spill attempt fell back to the inline page. Show up to input.limit rows.
+    const inline = rows.slice(0, input.limit);
+    ctx.enrich.total(total);
+    if (total > inline.length) {
       ctx.enrich.notice(
-        `Showing ${rows.length} of ${total} observations (inline page). Raise limit (max 1000) to return more rows, or narrow the filters.`,
+        `Showing ${inline.length} of ${totalIsExact ? total : `more than ${total}`} observations (inline page). Raise limit (max 1000) to return more rows, or narrow the filters.`,
       );
     }
     return {
       domain: code,
-      observations: rows.map(toObservation),
+      observations: inline.map(toObservation),
       spilled: false,
       truncated: false,
     };

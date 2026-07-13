@@ -303,10 +303,11 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
     }
 
     // The producer ranking + trend are drawn from `production`, capped at
-    // STAGE_MAX_ROWS. When the true match exceeds the cap both are a partial view —
-    // flag it via `truncated` and disclose it in the notice/format. (Ranking
-    // correctness under the cap is a separate concern, tracked in #5.)
-    const productionTruncated = production.total > production.rows.length;
+    // STAGE_MAX_ROWS. The overflow probe reports totalIsExact=false exactly when the
+    // match exceeded that cap, so both are then a partial view — flag it via
+    // `truncated` and disclose it. (Ranking correctness under the cap is a separate
+    // concern, tracked in #5.)
+    const productionTruncated = !production.totalIsExact;
     const truncated = productionTruncated || stagedTruncated;
 
     const noticeParts: string[] = [];
@@ -317,7 +318,7 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
     }
     if (truncated) {
       const capMsg = productionTruncated
-        ? `Production matched ${production.total} rows but only the first ${production.rows.length} were analyzed — top_producers and trend_points are drawn from a capped ${STAGE_MAX_ROWS}-row slice and may be incomplete.`
+        ? `Production matched more than ${STAGE_MAX_ROWS} rows but only the first ${production.rows.length} were analyzed — top_producers and trend_points are drawn from a capped ${STAGE_MAX_ROWS}-row slice and may be incomplete.`
         : `The merged set exceeded the ${STAGE_MAX_ROWS}-row staging cap, so canvas table ${tableName} is INCOMPLETE.`;
       noticeParts.push(
         `${capMsg} For the complete series, call faostat_query_observations on QCL with item codes ${itemCodes.join(', ')} partitioned by year (year_start/year_end)${spilled ? `; the staged partition is queryable via faostat_dataframe_query (canvas_id ${canvasId})` : ''}.`,

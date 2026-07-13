@@ -85,6 +85,35 @@ describe('faostat_query_observations spillover dead band', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('keeps a result within the inline budget inline — the probe never spills at the boundary', async () => {
+    // Exactly INLINE_PREVIEW_ROWS (50) country rows: the LIMIT probe returns the
+    // exact count and the tool stays inline without staging to a canvas — the same
+    // decision the old COUNT(*) made, now without scanning the whole cube.
+    const total = await syncDomain(50, 0);
+    expect(total).toBe(50);
+
+    const ctx = createMockContext({
+      tenantId: 'spill-boundary',
+      errors: queryObservationsTool.errors,
+    });
+    const input = queryObservationsTool.input.parse({
+      domain: FIXTURE_DOMAIN,
+      item_codes: [15],
+      element_codes: [5510],
+      year_start: 2020,
+      year_end: 2020,
+    });
+
+    const result = await queryObservationsTool.handler(input, ctx);
+
+    expect(result.observations).toHaveLength(50);
+    expect(result.spilled).toBe(false);
+    expect(result.canvas_id).toBeUndefined();
+    expect(result.table_name).toBeUndefined();
+    // Exact total surfaced from the probe (not a floor) — the match fit the budget.
+    expect(getEnrichment(ctx).totalCount).toBe(50);
+  });
+
   it('returns ALL rows inline for a mid-size result (no dropped rows, no false canvas notice)', async () => {
     // 300 countries: well past the default inline page (limit 200) but only ~30k
     // serialized chars — squarely inside the old dead band.

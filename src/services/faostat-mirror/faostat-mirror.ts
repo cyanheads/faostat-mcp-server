@@ -13,7 +13,6 @@ import {
   defineMirror,
   type Mirror,
   type MirrorLogger,
-  type QueryFilter,
   type SyncGenerator,
   type SyncMode,
   type SyncProgress,
@@ -121,6 +120,13 @@ export class FaostatMirror {
           { columns: ['item_code'] },
           { columns: ['element_code'] },
           { columns: ['year'] },
+          // Composite indexes matching the common filter-column + `ORDER BY year`
+          // shapes, so a filtered range+sort seeks and reads in index order instead
+          // of materializing + sorting the whole matched set. `CREATE INDEX IF NOT
+          // EXISTS` runs on every open(), so these apply to already-synced .db files
+          // on the next startup — no re-sync. (issue #3)
+          { columns: ['element_code', 'year'] },
+          { columns: ['item_code', 'element_code', 'year'] },
         ],
       }),
       // Delegates to the per-domain ingester slot bound by runDomainSync. The
@@ -157,98 +163,47 @@ export class FaostatMirror {
 
   /**
    * Query observations from a domain's mirror with structured filters, year
-   * range, and aggregate exclusion. Returns rows + the true total before paging.
+   * range, and aggregate exclusion. Rather than a per-call unbounded `COUNT(*)`,
+   * it fetches one row past `limit` — an overflow probe — so the caller can decide
+   * inline-vs-spill without scanning the whole cube. `totalIsExact` is true when
+   * the probe drained under `limit` (then `total` is the exact match count) and
+   * false when it overflowed (then `total` is `limit`, a floor: more rows exist,
+   * and the caller either spills — where the stream yields the exact count when it
+   * drains under the staging cap — or discloses the figure as a lower bound).
    * Assumes the domain is selected and ready (callers gate first).
    */
   async queryObservations(
     code: string,
     q: ObservationQuery,
-  ): Promise<{ rows: ObservationRow[]; total: number }> {
+  ): Promise<{ rows: ObservationRow[]; total: number; totalIsExact: boolean }> {
     const mirror = this.getMirror(code);
-    if (!mirror) return { rows: [], total: 0 };
-
-    const filters: QueryFilter[] = [];
-    if (q.areaCodes?.length) filters.push({ column: 'area_code', op: 'in', value: q.areaCodes });
-    if (q.itemCodes?.length) filters.push({ column: 'item_code', op: 'in', value: q.itemCodes });
-    if (q.elementCodes?.length)
-      filters.push({ column: 'element_code', op: 'in', value: q.elementCodes });
-    if (q.yearStart !== undefined) filters.push({ column: 'year', op: 'gte', value: q.yearStart });
-    if (q.yearEnd !== undefined) filters.push({ column: 'year', op: 'lte', value: q.yearEnd });
-    // Aggregate exclusion: country codes are < 5000. The generic query can't
-    // express it alongside an `in` on the same column, so apply it via the raw
-    // handle when no explicit area filter is set; with an explicit area filter
-    // the agent already chose the codes, so honor them verbatim.
-    if (!q.includeAggregates && !q.areaCodes?.length) {
-      return this.queryWithAggregateExclusion(code, q, filters);
-    }
-
-    const result = await mirror.query({
-      filters,
-      limit: q.limit,
-      offset: q.offset,
-      sort: { column: 'year', direction: 'asc' },
-    });
-    return { rows: result.rows as unknown as ObservationRow[], total: result.total };
-  }
-
-  /**
-   * Aggregate-excluding query via the raw handle — adds `area_code < 5000` which
-   * the generic `query()` filter set can't combine with an `in` on `area_code`.
-   */
-  private async queryWithAggregateExclusion(
-    code: string,
-    q: ObservationQuery,
-    baseFilters: QueryFilter[],
-  ): Promise<{ rows: ObservationRow[]; total: number }> {
-    const mirror = this.getMirror(code);
-    if (!mirror) return { rows: [], total: 0 };
+    if (!mirror) return { rows: [], total: 0, totalIsExact: true };
     const handle = await mirror.raw();
     const table = `obs_${code.toUpperCase()}`;
-
-    const where: string[] = [`area_code < ${AGGREGATE_AREA_CODE_THRESHOLD}`];
-    const params: (string | number)[] = [];
-    for (const f of baseFilters) {
-      if (f.column === 'year' && f.op === 'gte') {
-        where.push('year >= ?');
-        params.push(f.value as number);
-      } else if (f.column === 'year' && f.op === 'lte') {
-        where.push('year <= ?');
-        params.push(f.value as number);
-      } else if (f.op === 'in' && Array.isArray(f.value)) {
-        where.push(`${f.column} IN (${f.value.map(() => '?').join(',')})`);
-        params.push(...(f.value as (string | number)[]));
-      }
-    }
-    const whereSql = `WHERE ${where.join(' AND ')}`;
-    const total =
-      handle.prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table} ${whereSql}`).get(...params)
-        ?.n ?? 0;
-    const rows = handle
+    const { whereSql, params } = this.buildObservationWhere(q);
+    // Fetch limit+1 to detect "more rows matched than were returned" without a
+    // COUNT(*). `ORDER BY year` is backed by the composite / `year` indexes, so the
+    // LIMIT bounds the scan instead of forcing a full sort of the matched set.
+    const probe = handle
       .prepare<ObservationRow>(
         `SELECT * FROM ${table} ${whereSql} ORDER BY year ASC LIMIT ? OFFSET ?`,
       )
-      .all(...params, q.limit, q.offset);
-    return { rows, total };
+      .all(...params, q.limit + 1, q.offset);
+    const totalIsExact = probe.length <= q.limit;
+    const rows = totalIsExact ? probe : probe.slice(0, q.limit);
+    return { rows, total: rows.length, totalIsExact };
   }
 
   /**
-   * Stream matching observation rows (no paging) for canvas spillover. Honors the
-   * same filters as {@link queryObservations}. Bounded by `limit` (a SQL `LIMIT`):
-   * the underlying SqliteHandle exposes no row iterator (its API is the
-   * `bun:sqlite` ∩ `better-sqlite3` intersection — `all`/`get`/`run` only), so an
-   * unbounded query would materialize the whole result set into one JS array.
-   * The caller passes the staging cap + 1 so the spillover helper still observes
-   * an overflow row and discloses truncation honestly.
+   * Build the `WHERE` clause + bound params shared by the observation query and
+   * stream paths. Aggregate exclusion (`area_code < THRESHOLD`) applies only when
+   * the caller neither opted into aggregates nor named explicit area codes — with
+   * explicit area codes the agent already chose them, so they are honored verbatim.
    */
-  async *streamObservations(
-    code: string,
-    q: Omit<ObservationQuery, 'limit' | 'offset'>,
-    limit: number,
-  ): AsyncGenerator<Record<string, unknown>> {
-    const mirror = this.getMirror(code);
-    if (!mirror) return;
-    const handle = await mirror.raw();
-    const table = `obs_${code.toUpperCase()}`;
+  private buildObservationWhere(q: Omit<ObservationQuery, 'limit' | 'offset'>): {
+    whereSql: string;
+    params: (string | number)[];
+  } {
     const where: string[] = [];
     const params: (string | number)[] = [];
     if (!q.includeAggregates && !q.areaCodes?.length) {
@@ -274,10 +229,33 @@ export class FaostatMirror {
       where.push('year <= ?');
       params.push(q.yearEnd);
     }
-    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    return { whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '', params };
+  }
+
+  /**
+   * Stream matching observation rows (no paging) for canvas spillover. Honors the
+   * same filters as {@link queryObservations}. Bounded by `limit` (a SQL `LIMIT`):
+   * the underlying SqliteHandle exposes no row iterator (its API is the
+   * `bun:sqlite` ∩ `better-sqlite3` intersection — `all`/`get`/`run` only), so an
+   * unbounded query would materialize the whole result set into one JS array.
+   * The caller passes the staging cap + 1 so the spillover helper still observes
+   * an overflow row and discloses truncation honestly. Sorts by `year` (not the
+   * TEXT label columns) so the composite / `year` indexes satisfy the `ORDER BY`
+   * and the LIMIT bounds the scan, rather than materializing + sorting every match.
+   */
+  async *streamObservations(
+    code: string,
+    q: Omit<ObservationQuery, 'limit' | 'offset'>,
+    limit: number,
+  ): AsyncGenerator<Record<string, unknown>> {
+    const mirror = this.getMirror(code);
+    if (!mirror) return;
+    const handle = await mirror.raw();
+    const table = `obs_${code.toUpperCase()}`;
+    const { whereSql, params } = this.buildObservationWhere(q);
     const rows = handle
       .prepare<Record<string, unknown>>(
-        `SELECT area_code, area, item_code, item, element_code, element, year, unit, value, flag FROM ${table} ${whereSql} ORDER BY area, item, element, year LIMIT ?`,
+        `SELECT area_code, area, item_code, item, element_code, element, year, unit, value, flag FROM ${table} ${whereSql} ORDER BY year ASC LIMIT ?`,
       )
       .all(...params, limit);
     for (const row of rows) yield row;

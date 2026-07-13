@@ -100,6 +100,31 @@ describe('FaostatMirror end-to-end', () => {
     expect(total).toBe(6);
   });
 
+  it('reports an exact total via the overflow probe when the match fits the limit', async () => {
+    // Guards the COUNT(*) → LIMIT-probe swap: for a result under the limit the
+    // probe-derived total equals what the old count returned, and is flagged exact.
+    const { total, totalIsExact } = await mirror.queryObservations(FIXTURE_DOMAIN, {
+      includeAggregates: false,
+      limit: 100,
+      offset: 0,
+    });
+    expect(total).toBe(4);
+    expect(totalIsExact).toBe(true);
+  });
+
+  it('marks the total a floor (not exact) when the match overflows the limit', async () => {
+    // 4 country rows, probe limit 2 → overflow: rows capped at the limit and the
+    // total is a floor, so callers spill / disclose rather than trust a fabricated count.
+    const { rows, total, totalIsExact } = await mirror.queryObservations(FIXTURE_DOMAIN, {
+      includeAggregates: false,
+      limit: 2,
+      offset: 0,
+    });
+    expect(rows).toHaveLength(2);
+    expect(total).toBe(2);
+    expect(totalIsExact).toBe(false);
+  });
+
   it('honors explicit area_codes verbatim (including an aggregate)', async () => {
     const { rows } = await mirror.queryObservations(FIXTURE_DOMAIN, {
       areaCodes: [5000],
