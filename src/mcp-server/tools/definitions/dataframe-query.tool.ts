@@ -33,6 +33,13 @@ export const dataframeQueryTool = tool('faostat_dataframe_query', {
         'Set CANVAS_PROVIDER_TYPE=duckdb in the server environment to enable SQL on staged results.',
     },
     {
+      reason: 'canvas_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'An explicit canvas_id does not resolve to a live canvas — unknown, expired, or owned by another tenant.',
+      recovery:
+        'Verify the canvas_id was returned by a prior faostat_query_observations / faostat_commodity_profile call, or omit canvas_id to fall back to the shared session canvas.',
+    },
+    {
       reason: 'missing_table',
       code: JsonRpcErrorCode.NotFound,
       when: 'The SQL references a faostat_<id> table that has expired or was never staged.',
@@ -80,16 +87,23 @@ export const dataframeQueryTool = tool('faostat_dataframe_query', {
     columns: z.array(z.string()).describe('Column names in projection order.'),
     row_count: z
       .number()
-      .describe('Total rows the query produced (may exceed rows.length when capped).'),
+      .describe(
+        'Rows returned in this response — the materialized count, equal to rows.length. When truncated is true this is NOT the full result total (this path computes no exact total); page or aggregate to reach the rest.',
+      ),
     rows: z
       .array(z.record(z.string(), z.unknown()))
       .describe('Materialized result rows, bounded by row_limit.'),
+    truncated: z
+      .boolean()
+      .describe(
+        'True when row_limit capped the result and more rows exist than were returned. To reach them: page with ORDER BY + SQL LIMIT/OFFSET, raise row_limit (max 10000), or aggregate with GROUP BY.',
+      ),
   }),
 
   async handler(input, ctx) {
-    // Queries run against the session's shared canvas (resolved from ctx.state by
-    // the staging layer). canvas_id is accepted for symmetry with the query/profile
-    // tools' token model but is optional — the common path omits it.
+    // canvas_id selects a specific canvas from a prior call; omitted, queries run
+    // against the session's shared canvas (resolved from ctx.state by the staging
+    // layer). An unknown/other-tenant canvas_id throws canvas_not_found.
     if (!canvasEnabled()) {
       throw ctx.fail(
         'canvas_disabled',
@@ -98,31 +112,39 @@ export const dataframeQueryTool = tool('faostat_dataframe_query', {
       );
     }
 
-    const { result } = await queryStaged(ctx, input.sql, { rowLimit: input.row_limit });
+    const { result } = await queryStaged(ctx, input.sql, {
+      rowLimit: input.row_limit,
+      ...(input.canvas_id ? { canvasId: input.canvas_id } : {}),
+    });
+    // Read the framework's truncation flag, not a rowCount>rows.length comparison:
+    // on this non-registerAs path rowCount always equals rows.length (both capped
+    // at row_limit), so the old comparison was dead and capped results looked
+    // complete. row_count is the materialized/returned count; truncated is the
+    // "there is more" signal (no exact total is computed here).
+    const truncated = result.truncated ?? false;
     ctx.log.info('Dataframe query executed', {
-      rowCount: result.rowCount,
-      returned: result.rows.length,
+      rowCount: result.rows.length,
+      truncated,
     });
 
-    if (result.rowCount === 0) {
+    if (result.rows.length === 0) {
       ctx.enrich.notice(
         'Query returned 0 rows. Verify table names with faostat_dataframe_describe and check the WHERE conditions.',
       );
-    } else if (result.rowCount > result.rows.length) {
+    } else if (truncated) {
       ctx.enrich.notice(
-        `Showing ${result.rows.length} of ${result.rowCount} rows (capped). Raise row_limit (max 10000) or add aggregation to the query.`,
+        `Returned ${result.rows.length} rows — capped at row_limit, more rows exist (no exact total on this path). To reach the rest: page deterministically with ORDER BY plus SQL LIMIT/OFFSET, raise row_limit (max 10000), or aggregate with GROUP BY.`,
       );
     }
 
-    return { columns: result.columns, row_count: result.rowCount, rows: result.rows };
+    return { columns: result.columns, row_count: result.rows.length, rows: result.rows, truncated };
   },
 
   format: (result) => {
-    const cappedNote =
-      result.row_count > result.rows.length
-        ? ` (showing ${result.rows.length} of ${result.row_count})`
-        : '';
-    const lines: string[] = [`**${result.row_count} rows**${cappedNote}\n`];
+    const header = result.truncated
+      ? `**${result.row_count} rows** (truncated — capped at row_limit, more rows exist)`
+      : `**${result.row_count} rows**`;
+    const lines: string[] = [`${header}\n`];
     if (result.rows.length === 0) {
       lines.push('_No rows._');
       return [{ type: 'text', text: lines.join('\n') }];
@@ -138,6 +160,11 @@ export const dataframeQueryTool = tool('faostat_dataframe_query', {
         return String(v);
       });
       lines.push(`| ${cells.join(' | ')} |`);
+    }
+    if (result.truncated) {
+      lines.push(
+        '\n_Result truncated — capped at row_limit, more rows exist. Page deterministically with ORDER BY plus SQL LIMIT/OFFSET, raise row_limit (max 10000), or aggregate with GROUP BY._',
+      );
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

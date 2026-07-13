@@ -24,6 +24,8 @@ import { getCanvas } from './canvas-accessor.js';
 
 /** Per-table provenance persisted in `ctx.state`, surfaced by dataframe_describe. */
 export interface StagedTableMeta {
+  /** Canvas that holds this table — scopes describe listings to the right canvas. */
+  canvasId: string;
   columnSchema: ColumnSchema[];
   createdAt: string;
   expiresAt: string;
@@ -130,9 +132,16 @@ export async function stageObservations<T extends Record<string, unknown>>(
     const expiresAt = new Date(now + TABLE_TTL_MS).toISOString();
     if (result.spilled) {
       const meta: StagedTableMeta = {
+        canvasId: instance.canvasId,
         tableName: result.handle.tableName,
         sourceTool: opts.sourceTool,
-        queryParams: opts.queryParams,
+        // Strip undefined-valued keys: structuredContent drops them on JSON
+        // serialization while content[] renders them as `key=undefined`, so
+        // persisting them makes the two surfaces diverge. Clean once at the
+        // write site — dataframe_describe's handler and format() both read this.
+        queryParams: Object.fromEntries(
+          Object.entries(opts.queryParams).filter(([, v]) => v !== undefined),
+        ),
         createdAt: new Date(now).toISOString(),
         expiresAt,
         rowCount: result.handle.rowCount,
@@ -170,12 +179,27 @@ export async function stageObservations<T extends Record<string, unknown>>(
   }
 }
 
-/** List staged table metadata for this tenant (newest first), sweeping expired entries. */
-export async function describeStaged(ctx: Context, tableName?: string): Promise<StagedTableMeta[]> {
+/**
+ * List staged table metadata for the resolved canvas (newest first), sweeping
+ * expired entries. An explicit `canvasId` resolves that canvas — throwing the
+ * framework's enriched `canvas_not_found` for an unknown/other-tenant id — and
+ * scopes the listing to it; omitted uses the session's shared canvas. Filtering
+ * on the resolved canvas is what stops a valid-but-different `canvas_id` from
+ * leaking another canvas's table metadata.
+ */
+export async function describeStaged(
+  ctx: Context,
+  opts: { tableName?: string; canvasId?: string } = {},
+): Promise<StagedTableMeta[]> {
+  const canvas = getCanvas();
+  if (!canvas) throw new Error('DataCanvas is not enabled. Set CANVAS_PROVIDER_TYPE=duckdb.');
   await sweepExpired(ctx);
-  if (tableName) {
-    const meta = await ctx.state.get<StagedTableMeta>(`${META_PREFIX}${tableName}`);
-    return meta ? [meta] : [];
+  const instance = opts.canvasId
+    ? await canvas.acquire(opts.canvasId, ctx)
+    : await acquireShared(ctx);
+  if (opts.tableName) {
+    const meta = await ctx.state.get<StagedTableMeta>(`${META_PREFIX}${opts.tableName}`);
+    return meta && meta.canvasId === instance.canvasId ? [meta] : [];
   }
   const entries: StagedTableMeta[] = [];
   let cursor: string | undefined;
@@ -184,7 +208,10 @@ export async function describeStaged(ctx: Context, tableName?: string): Promise<
       ...(cursor !== undefined && { cursor }),
       limit: 100,
     });
-    for (const item of page.items) if (item.value) entries.push(item.value as StagedTableMeta);
+    for (const item of page.items) {
+      const meta = item.value as StagedTableMeta | undefined;
+      if (meta && meta.canvasId === instance.canvasId) entries.push(meta);
+    }
     cursor = page.cursor;
   } while (cursor);
   return entries.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -235,12 +262,18 @@ const INVALID_SQL_GATE_REASONS = new Set<string>([
 export async function queryStaged(
   ctx: Context,
   sql: string,
-  opts: { rowLimit: number },
+  opts: { rowLimit: number; canvasId?: string },
 ): Promise<{ result: QueryResult }> {
   const canvas = getCanvas();
   if (!canvas) throw new Error('DataCanvas is not enabled. Set CANVAS_PROVIDER_TYPE=duckdb.');
   await sweepExpired(ctx);
-  const instance = await acquireShared(ctx);
+  // An explicit canvas_id resolves that canvas — an unknown/other-tenant id throws
+  // the framework's enriched `canvas_not_found` (NotFound), which is left to bubble
+  // (it fires here, outside the try below, so it is never remapped to invalid_sql).
+  // Omitted falls back to the session's shared canvas.
+  const instance = opts.canvasId
+    ? await canvas.acquire(opts.canvasId, ctx)
+    : await acquireShared(ctx);
   try {
     const result = await instance.query(sql, {
       rowLimit: opts.rowLimit,
@@ -293,7 +326,12 @@ export async function queryStaged(
   }
 }
 
-/** Drop staged tables whose TTL has elapsed. Best-effort. */
+/**
+ * Drop staged tables whose TTL has elapsed. Best-effort, and against the shared
+ * session canvas only: a table staged on a non-default canvas has its metadata
+ * cleared here but the table itself is reclaimed by that canvas's own TTL / cap.
+ * (Per-canvas sweeping is a lower-severity follow-up.)
+ */
 async function sweepExpired(ctx: Context): Promise<void> {
   const canvas = getCanvas();
   if (!canvas) return;

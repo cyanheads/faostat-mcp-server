@@ -24,6 +24,20 @@ export const dataframeDescribeTool = tool('faostat_dataframe_describe', {
       recovery:
         'Set CANVAS_PROVIDER_TYPE=duckdb in the server environment to enable staged tables.',
     },
+    {
+      reason: 'canvas_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'An explicit canvas_id does not resolve to a live canvas — unknown, expired, or owned by another tenant.',
+      recovery:
+        'Verify the canvas_id was returned by a prior faostat_query_observations / faostat_commodity_profile call, or omit canvas_id to fall back to the shared session canvas.',
+    },
+    {
+      reason: 'missing_table',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'A name filter was supplied but no staged table on the resolved canvas matches it.',
+      recovery:
+        'Call faostat_dataframe_describe without name to list all staged tables, or re-run the query that staged the data.',
+    },
   ],
 
   input: z.object({
@@ -85,7 +99,19 @@ export const dataframeDescribeTool = tool('faostat_dataframe_describe', {
         ctx.recoveryFor('canvas_disabled'),
       );
     }
-    const entries = await describeStaged(ctx, input.name);
+    const entries = await describeStaged(ctx, {
+      ...(input.name ? { tableName: input.name } : {}),
+      ...(input.canvas_id ? { canvasId: input.canvas_id } : {}),
+    });
+    // A name filter that matched nothing is a missing-table miss, not an empty
+    // canvas — surface it as a typed NotFound instead of "No active staged tables".
+    if (input.name && entries.length === 0) {
+      throw ctx.fail(
+        'missing_table',
+        `No staged table named "${input.name}" on this canvas.`,
+        ctx.recoveryFor('missing_table'),
+      );
+    }
     return {
       tables: entries.map((meta) => ({
         name: meta.tableName,
