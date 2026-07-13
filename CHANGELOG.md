@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.8](changelog/0.1.x/0.1.8.md) — 2026-07-13
+
+Replaces the per-call unbounded COUNT(*) in faostat_query_observations and faostat_commodity_profile — the event-loop-blocking scan behind #3 — with a LIMIT+1 overflow probe and two composite indexes; spilled and preview rows now order by year.
+
 ## [0.1.7](changelog/0.1.x/0.1.7.md) — 2026-07-13
 
 faostat_query_observations and faostat_commodity_profile disclose the 50,000-row staging cap (new truncated + staged_row_count fields) instead of presenting a capped result as complete (#9). query_observations rejects a reversed year range (invalid_year_range) and treats an empty code array as a zero-match, not a broadening (#12).

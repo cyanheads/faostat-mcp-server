@@ -1,6 +1,6 @@
 # faostat-mcp-server - Directory Structure
 
-Generated on: 2026-07-13 21:27:34
+Generated on: 2026-07-13 22:23:16
 
 ```text
 faostat-mcp-server/
@@ -167,6 +167,7 @@ faostat-mcp-server/
 │   ├── resources/
 │   ├── services/
 │   │   ├── csv.test.ts
+│   │   ├── faostat-mirror-index.test.ts
 │   │   ├── faostat-mirror.test.ts
 │   │   ├── http-headers.test.ts
 │   │   ├── ingester-parse.test.ts
