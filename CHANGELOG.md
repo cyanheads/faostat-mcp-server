@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.7](changelog/0.1.x/0.1.7.md) — 2026-07-13
+
+faostat_query_observations and faostat_commodity_profile disclose the 50,000-row staging cap (new truncated + staged_row_count fields) instead of presenting a capped result as complete (#9). query_observations rejects a reversed year range (invalid_year_range) and treats an empty code array as a zero-match, not a broadening (#12).
+
 ## [0.1.6](changelog/0.1.x/0.1.6.md) — 2026-07-13
 
 faostat_dataframe_query discloses row_limit truncation; the dataframe tools honor canvas_id with a typed canvas_not_found; faostat_dataframe_describe gains query_params provenance parity and a typed missing_table on a name miss. Adopts @cyanheads/mcp-ts-core ^0.10.14; clears GHSA-h67p-54hq-rp68 in a transitive js-yaml.
