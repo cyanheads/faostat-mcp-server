@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.10](changelog/0.1.x/0.1.10.md) — 2026-07-13
+
+Fixes sub-5000 roll-up areas like China (351) evading aggregate exclusion and being mislabeled as a country (#4), and widens the data-quality flag legend across tool descriptions to the full FAOSTAT set (#6).
+
 ## [0.1.9](changelog/0.1.x/0.1.9.md) — 2026-07-13
 
 Adds offset-based pagination to faostat_resolve_codes (#7) and fixes cross-domain item/element code leakage by scoping resolution to the requested domain's actual code membership (#8).
