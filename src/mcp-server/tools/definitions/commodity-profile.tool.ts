@@ -134,7 +134,12 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
             value: z.number().describe('Production value in the latest year present.'),
             unit: z.string().nullable().describe('Unit of measure; null when unspecified.'),
             year: z.number().describe('The latest year the ranking is drawn from.'),
-            flag: z.string().nullable().describe('Data-quality flag; null when unflagged.'),
+            flag: z
+              .string()
+              .nullable()
+              .describe(
+                'Data-quality flag — commonly A=Official, B=time-series break, E=Estimated, I=Imputed, M=Missing (value cannot exist), T=Unofficial, X=from an international organization, plus others FAOSTAT defines per domain; treat any unrecognized flag as informational, never assume official. Null when unflagged.',
+              ),
           })
           .describe('One top-producing country.'),
       )
@@ -148,7 +153,12 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
             value: z.number().describe('Export quantity in the latest year present.'),
             unit: z.string().nullable().describe('Unit of measure; null when unspecified.'),
             year: z.number().describe('The latest year the ranking is drawn from.'),
-            flag: z.string().nullable().describe('Data-quality flag; null when unflagged.'),
+            flag: z
+              .string()
+              .nullable()
+              .describe(
+                'Data-quality flag — commonly A=Official, B=time-series break, E=Estimated, I=Imputed, M=Missing (value cannot exist), T=Unofficial, X=from an international organization, plus others FAOSTAT defines per domain; treat any unrecognized flag as informational, never assume official. Null when unflagged.',
+              ),
           })
           .describe('One top-exporting country.'),
       )
@@ -162,7 +172,12 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
             value: z.number().describe('Import quantity in the latest year present.'),
             unit: z.string().nullable().describe('Unit of measure; null when unspecified.'),
             year: z.number().describe('The latest year the ranking is drawn from.'),
-            flag: z.string().nullable().describe('Data-quality flag; null when unflagged.'),
+            flag: z
+              .string()
+              .nullable()
+              .describe(
+                'Data-quality flag — commonly A=Official, B=time-series break, E=Estimated, I=Imputed, M=Missing (value cannot exist), T=Unofficial, X=from an international organization, plus others FAOSTAT defines per domain; treat any unrecognized flag as informational, never assume official. Null when unflagged.',
+              ),
           })
           .describe('One top-importing country.'),
       )

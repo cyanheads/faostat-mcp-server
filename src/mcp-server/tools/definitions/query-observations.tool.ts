@@ -36,7 +36,7 @@ function toObservation({
 export const queryObservationsTool = tool('faostat_query_observations', {
   title: 'faostat-mcp-server: query observations',
   description:
-    "Query a FAOSTAT domain's data cube by area(s), item(s), element(s), and year range, returning observations (area, item, element, year, value, unit, and the data-quality flag). Resolve codes first with faostat_resolve_codes — the cube is unqueryable without them. Aggregate regions (World, continents, economic groupings) are EXCLUDED by default so a naive SUM does not double-count a region with its member countries; set include_aggregates=true to get the regional roll-ups, or pass explicit area_codes to query exactly what you name. Small result sets return inline; large ones spill to a DataCanvas table (returned canvas_id + table_name) for GROUP BY / ranking / time-series analysis via faostat_dataframe_query. Every row carries its flag (A=Official, E=Estimated, I=Imputed, B=break, X=external) — honor it; never treat estimated/imputed values as official.",
+    "Query a FAOSTAT domain's data cube by area(s), item(s), element(s), and year range, returning observations (area, item, element, year, value, unit, and the data-quality flag). Resolve codes first with faostat_resolve_codes — the cube is unqueryable without them. Aggregate regions (World, continents, economic groupings) are EXCLUDED by default so a naive SUM does not double-count a region with its member countries; set include_aggregates=true to get the regional roll-ups, or pass explicit area_codes to query exactly what you name. Small result sets return inline; large ones spill to a DataCanvas table (returned canvas_id + table_name) for GROUP BY / ranking / time-series analysis via faostat_dataframe_query. Every row carries its flag — commonly A=Official, B=time-series break, E=Estimated, I=Imputed, M=Missing (value cannot exist), T=Unofficial, X=from an international organization, plus others FAOSTAT defines per domain — so honor it, treat any unrecognized flag as informational, and never assume an estimated, imputed, or unrecognized value is official.",
   annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: false },
 
   enrichment: {
@@ -108,7 +108,7 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       .boolean()
       .default(false)
       .describe(
-        'When false (default), exclude aggregate-region rows (codes ≥ 5000) so sums are not double-counted. Set true for World/continent/grouping roll-ups. Ignored when explicit area_codes are passed.',
+        'When false (default), exclude aggregate-region rows (codes ≥ 5000 plus a few curated sub-threshold roll-ups such as China=351) so sums are not double-counted. Set true for World/continent/grouping roll-ups. Ignored when explicit area_codes are passed.',
       ),
     limit: z
       .number()
@@ -144,7 +144,7 @@ export const queryObservationsTool = tool('faostat_query_observations', {
               .string()
               .nullable()
               .describe(
-                'Data-quality flag (A=Official, E=Estimated, I=Imputed, B=break, X=external); null when unflagged.',
+                'Data-quality flag — commonly A=Official, B=time-series break, E=Estimated, I=Imputed, M=Missing (value cannot exist), T=Unofficial, X=from an international organization, plus others FAOSTAT defines per domain; treat any unrecognized flag as informational, never assume official. Null when unflagged.',
               ),
           })
           .describe('One observation. The flag is load-bearing — never drop or ignore it.'),
