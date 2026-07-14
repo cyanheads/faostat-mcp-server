@@ -261,12 +261,50 @@ export class FaostatMirror {
     for (const row of rows) yield row;
   }
 
-  /** Resolve codes in a dimension (delegates to the shared store). */
-  resolve(
+  /**
+   * Resolve codes in a dimension. Item and element resolution is scoped to the
+   * codes actually present in `domain`'s observation cube (issue #8) — the shared
+   * dimension vocabulary is a union across every indexed domain, so an unscoped
+   * resolve can surface a code absent from the requested domain and then dead-loop
+   * against an empty faostat_query_observations. Areas are never scoped: country
+   * vocabularies legitimately overlap domains.
+   */
+  async resolve(
+    domain: string,
     dimension: DimensionKind,
-    opts: { code?: number; query?: string; nameContains?: string; limit: number },
+    opts: { code?: number; query?: string; nameContains?: string; limit: number; offset?: number },
   ): Promise<{ matches: ResolvedCode[]; total: number }> {
-    return this.dimensions.resolve(dimension, opts);
+    const domainCodes =
+      dimension === 'area' ? undefined : await this.domainDimensionCodes(domain, dimension);
+    return this.dimensions.resolve(dimension, {
+      ...opts,
+      ...(domainCodes ? { domainCodes } : {}),
+    });
+  }
+
+  /**
+   * The distinct item/element codes present in a domain's observation cube — the
+   * membership set that scopes {@link resolve} (issue #8). Index-backed: `SELECT
+   * DISTINCT item_code|element_code` reads the existing per-column covering index,
+   * so no schema change or re-sync is needed. `raw()` runs the store DDL on open,
+   * so the table exists even for a selected-but-unsynced domain — then the cube is
+   * empty, the set is `[]`, and resolve returns no matches (the honest answer for a
+   * domain you cannot yet query).
+   */
+  private async domainDimensionCodes(
+    domain: string,
+    dimension: Exclude<DimensionKind, 'area'>,
+  ): Promise<number[]> {
+    const mirror = this.getMirror(domain);
+    if (!mirror) return [];
+    const handle = await mirror.raw();
+    const table = `obs_${domain.toUpperCase()}`;
+    const column = dimension === 'item' ? 'item_code' : 'element_code';
+    return handle
+      .prepare<{ code: number }>(`SELECT DISTINCT ${column} AS code FROM ${table}`)
+      .all()
+      .map((r) => r.code)
+      .filter((c): c is number => c != null);
   }
 
   /**

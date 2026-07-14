@@ -217,8 +217,9 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
       );
     }
 
-    // 1. Resolve the commodity to item code(s).
-    const resolved = await mirror.resolve('item', { query: input.item_query, limit: 5 });
+    // 1. Resolve the commodity to item code(s), scoped to QCL — the profile's
+    // production backbone — so a resolved item is one QCL actually carries.
+    const resolved = await mirror.resolve(QCL, 'item', { query: input.item_query, limit: 5 });
     if (resolved.matches.length === 0) {
       throw ctx.fail(
         'no_match',

@@ -18,16 +18,29 @@ const MAX_MATCHES = 200;
 export const resolveCodesTool = tool('faostat_resolve_codes', {
   title: 'faostat-mcp-server: resolve codes',
   description:
-    'Resolve human terms to the opaque integer codes faostat_query_observations needs, within a dimension: areas (countries/regions), items (commodities), or elements (metrics like production, yield, import quantity). Pass `query` for fuzzy full-text matching ("maize" → item 56), `name_contains` for a substring filter, or `code` for an exact-code lookup; omit all three to list the whole dimension. Every area match is flagged `country` or `aggregate` — aggregates (World, continents, economic groupings; codes ≥ 5000) double-count if summed with their member countries, so resolve before querying and exclude aggregates unless you want the regional roll-up.',
+    'Resolve human terms to the opaque integer codes faostat_query_observations needs, within a dimension: areas (countries/regions), items (commodities), or elements (metrics like production, yield, import quantity). Pass `query` for fuzzy full-text matching ("maize" → item 56), `name_contains` for a substring filter, or `code` for an exact-code lookup; omit all three to list the whole dimension. Item and element results are scoped to the requested domain — only codes present in that domain\'s cube are returned, so a resolved code is always queryable there (areas are shared across domains). Page large listings with `offset` + `limit`: when the response reports `truncated`, pass the returned `nextOffset` to fetch the next page. Every area match is flagged `country` or `aggregate` — aggregates (World, continents, economic groupings; codes ≥ 5000) double-count if summed with their member countries, so resolve before querying and exclude aggregates unless you want the regional roll-up.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
 
   enrichment: {
-    totalMatches: z.number().describe('Total matches before the result cap.'),
-    truncated: z.boolean().describe('True when matches were capped at the limit.'),
+    totalMatches: z.number().describe('Total matches in this domain before the result cap.'),
+    truncated: z
+      .boolean()
+      .describe(
+        'True when more matches remain beyond the returned page — fetch them with nextOffset.',
+      ),
+    nextOffset: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        'Offset to pass on the next call to fetch the following page. Present only when truncated is true; absent on the last page and for exact-code lookups.',
+      ),
     notice: z
       .string()
       .optional()
-      .describe('Guidance when nothing matched or the dimension is not yet indexed.'),
+      .describe(
+        'Guidance when nothing matched, more pages remain, or the dimension is not yet indexed.',
+      ),
   },
 
   errors: [
@@ -52,7 +65,7 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       .string()
       .min(1)
       .describe(
-        'FAOSTAT domain code to verify the index is ready (e.g. "QCL"). Dimension code lists (areas, items, elements) are shared across all indexed domains.',
+        'FAOSTAT domain code (e.g. "QCL"). Item and element resolution is scoped to the codes present in this domain\'s data; area code lists are shared across all indexed domains.',
       ),
     dimension: z
       .enum(['area', 'item', 'element'])
@@ -83,6 +96,14 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       .max(MAX_MATCHES)
       .default(50)
       .describe('Maximum matches to return (max 200).'),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        'Zero-based pagination offset into the match set. When the response reports truncated, pass the returned nextOffset here to fetch the next page. Ignored for exact-code lookups (always single-page).',
+      ),
   }),
 
   output: z.object({
@@ -129,14 +150,21 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       );
     }
 
-    const { matches, total } = await mirror.resolve(input.dimension, {
+    const { matches, total } = await mirror.resolve(input.domain, input.dimension, {
       ...(input.code !== undefined ? { code: input.code } : {}),
       ...(input.query ? { query: input.query } : {}),
       ...(input.name_contains ? { nameContains: input.name_contains } : {}),
       limit: input.limit,
+      offset: input.offset,
     });
 
-    ctx.enrich({ totalMatches: total, truncated: total > matches.length });
+    // Pagination window: this page covers [offset, offset + matches.length). More
+    // remain when that end is short of the (domain-scoped) total — then nextOffset
+    // is where the caller resumes.
+    const nextOffset = input.offset + matches.length;
+    const truncated = nextOffset < total;
+    ctx.enrich({ totalMatches: total, truncated, ...(truncated ? { nextOffset } : {}) });
+
     if (matches.length === 0) {
       const criterion =
         input.code !== undefined
@@ -146,8 +174,15 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
             : input.name_contains
               ? `name containing "${input.name_contains}"`
               : 'the listing';
+      const domainUpper = input.domain.toUpperCase();
       ctx.enrich.notice(
-        `No ${input.dimension} matched ${criterion} in domain ${input.domain.toUpperCase()}. Broaden the term, check spelling, or omit query to list all ${input.dimension} codes.`,
+        total > 0
+          ? `Offset ${input.offset} is past the ${total} ${input.dimension} match(es) for ${criterion} in domain ${domainUpper}. Lower offset (0-based) to page back through the results.`
+          : `No ${input.dimension} matched ${criterion} in domain ${domainUpper}. Broaden the term, check spelling, or omit query to list all ${input.dimension} codes.`,
+      );
+    } else if (truncated) {
+      ctx.enrich.notice(
+        `Showing ${input.dimension} matches ${input.offset + 1}–${nextOffset} of ${total}. Call again with offset ${nextOffset} to fetch the next page.`,
       );
     }
 

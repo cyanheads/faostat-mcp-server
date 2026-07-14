@@ -229,33 +229,72 @@ export class DimensionsStore {
    * Resolve codes within a dimension. Precedence: an exact `code` lookup wins;
    * otherwise an FTS `query` match (relevance-ranked); otherwise a `name_contains`
    * substring filter; otherwise list the whole dimension. Returns up to `limit`
-   * rows plus the true total of matches (for truncation disclosure).
+   * rows starting at `offset` plus the true total of matches (for truncation
+   * disclosure and pagination).
+   *
+   * `domainCodes` scopes item/element resolution to the codes actually present in
+   * a domain's cube (issue #8): the dimension vocabulary is a union across every
+   * indexed domain, so an unscoped resolve can surface a code absent from the
+   * requested domain. When set, the scope is applied as a SQL predicate INSIDE
+   * each branch — before any LIMIT/offset windowing — so `total` and the paged
+   * slice reflect the domain-scoped set, not the global one (this composes with
+   * the `offset`/`limit` window layered on top; issue #7). Undefined means no
+   * scoping (areas, whose vocabularies legitimately overlap domains); an empty
+   * array is a real scope (the domain has no codes in this dimension) and matches
+   * nothing.
    */
   async resolve(
     dimension: DimensionKind,
-    opts: { code?: number; query?: string; nameContains?: string; limit: number },
+    opts: {
+      code?: number;
+      query?: string;
+      nameContains?: string;
+      limit: number;
+      offset?: number;
+      domainCodes?: number[];
+    },
   ): Promise<{ matches: ResolvedCode[]; total: number }> {
     const h = await this.open();
     const cfg = DIMENSION_CONFIG[dimension];
+    const offset = opts.offset ?? 0;
+    const { domainCodes } = opts;
 
-    // Exact code lookup.
+    // A domain scope of no codes matches nothing — short-circuit before emitting an
+    // invalid empty `IN ()` predicate.
+    if (domainCodes && domainCodes.length === 0) return { matches: [], total: 0 };
+
+    // The domain-membership predicate reused across the query/LIKE/list-all
+    // branches. In the external-content FTS table the code is `rowid`; the other
+    // branches filter on the code column. `domainParams` is empty (no-op spread)
+    // when unscoped.
+    const domainPlaceholders = domainCodes?.map(() => '?').join(', ');
+    const domainParams = domainCodes ?? [];
+
+    // Exact code lookup — single row, domain-scoped, never paged.
     if (opts.code !== undefined) {
-      const row = this.selectByCode(h, dimension, opts.code);
+      const inDomain = !domainCodes || domainCodes.includes(opts.code);
+      const row = inDomain ? this.selectByCode(h, dimension, opts.code) : undefined;
       return { matches: row ? [row] : [], total: row ? 1 : 0 };
     }
 
-    // FTS relevance match.
+    // FTS relevance match. Every matching (domain-scoped) rowid is fetched — no SQL
+    // LIMIT — so `total` is the exact scoped count and the offset/limit window is a
+    // JS slice. `ORDER BY rank, rowid`: rank alone has no tiebreaker, so rowid
+    // stabilizes the order across paged calls.
     const ftsMatch = opts.query ? toFtsMatch(opts.query) : undefined;
     if (ftsMatch) {
+      const where = domainPlaceholders
+        ? `${cfg.ftsTable} MATCH ? AND rowid IN (${domainPlaceholders})`
+        : `${cfg.ftsTable} MATCH ?`;
       const ids = h
         .prepare<{ rowid: number }>(
-          `SELECT rowid FROM ${cfg.ftsTable} WHERE ${cfg.ftsTable} MATCH ? ORDER BY rank`,
+          `SELECT rowid FROM ${cfg.ftsTable} WHERE ${where} ORDER BY rank, rowid`,
         )
-        .all(ftsMatch)
+        .all(ftsMatch, ...domainParams)
         .map((r) => r.rowid);
       const total = ids.length;
       const matches = ids
-        .slice(0, opts.limit)
+        .slice(offset, offset + opts.limit)
         .map((id) => this.selectByCode(h, dimension, id))
         .filter((r): r is ResolvedCode => r !== undefined);
       return { matches, total };
@@ -264,27 +303,34 @@ export class DimensionsStore {
     // Substring filter (LIKE).
     if (opts.nameContains) {
       const like = `%${opts.nameContains.replace(/[%_]/g, (c) => `\\${c}`)}%`;
+      const filter = `${cfg.labelColumn} LIKE ? ESCAPE '\\'${
+        domainPlaceholders ? ` AND ${cfg.codeColumn} IN (${domainPlaceholders})` : ''
+      }`;
       const total =
         h
-          .prepare<{ n: number }>(
-            `SELECT COUNT(*) AS n FROM ${cfg.table} WHERE ${cfg.labelColumn} LIKE ? ESCAPE '\\'`,
-          )
-          .get(like)?.n ?? 0;
+          .prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM ${cfg.table} WHERE ${filter}`)
+          .get(like, ...domainParams)?.n ?? 0;
       const rows = h
         .prepare<Record<string, unknown>>(
-          `SELECT * FROM ${cfg.table} WHERE ${cfg.labelColumn} LIKE ? ESCAPE '\\' ORDER BY ${cfg.codeColumn} LIMIT ?`,
+          `SELECT * FROM ${cfg.table} WHERE ${filter} ORDER BY ${cfg.codeColumn} LIMIT ? OFFSET ?`,
         )
-        .all(like, opts.limit);
+        .all(like, ...domainParams, opts.limit, offset);
       return { matches: rows.map((r) => this.toResolved(dimension, r)), total };
     }
 
     // List all.
-    const total = h.prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM ${cfg.table}`).get()?.n ?? 0;
+    const whereSql = domainPlaceholders
+      ? ` WHERE ${cfg.codeColumn} IN (${domainPlaceholders})`
+      : '';
+    const total =
+      h
+        .prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM ${cfg.table}${whereSql}`)
+        .get(...domainParams)?.n ?? 0;
     const rows = h
       .prepare<Record<string, unknown>>(
-        `SELECT * FROM ${cfg.table} ORDER BY ${cfg.codeColumn} LIMIT ?`,
+        `SELECT * FROM ${cfg.table}${whereSql} ORDER BY ${cfg.codeColumn} LIMIT ? OFFSET ?`,
       )
-      .all(opts.limit);
+      .all(...domainParams, opts.limit, offset);
     return { matches: rows.map((r) => this.toResolved(dimension, r)), total };
   }
 

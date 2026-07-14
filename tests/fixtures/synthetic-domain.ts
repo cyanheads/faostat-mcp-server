@@ -50,18 +50,78 @@ const FLAGS_CSV = [
 /** The synthetic domain code used across tests. */
 export const FIXTURE_DOMAIN = 'QCL';
 
-/** Build the synthetic domain ZIP as a Uint8Array (real fflate ZIP). */
-export function buildDomainZip(domain = FIXTURE_DOMAIN): Uint8Array {
+/**
+ * Per-domain item/element vocabulary override for {@link buildDomainZip}. The
+ * default fixture hardcodes one item (Wheat=15) / element (Production=5510) in
+ * both the code lists and the data rows, so two default domains share identical
+ * vocab and cannot reproduce a cross-domain leak. Pass a vocab to give a domain
+ * its own item/element codes: the code-list CSVs AND the observation rows are
+ * built from it, so `obs_<domain>` carries exactly these codes — the membership
+ * set domain-scoped resolution keys off (issue #8). Areas stay shared (the two
+ * standard countries), matching FAOSTAT's overlapping area vocabularies.
+ */
+export interface DomainVocab {
+  elements: { code: number; name: string }[];
+  items: { code: number; name: string; cpc?: string }[];
+}
+
+/** The two shared country areas used for vocab-driven observation rows. */
+const VOCAB_COUNTRIES = [
+  { code: 2, m49: '004', name: 'Afghanistan' },
+  { code: 351, m49: '156', name: 'China' },
+] as const;
+
+/**
+ * Build the synthetic domain ZIP as a Uint8Array (real fflate ZIP). With no
+ * `vocab`, emits the default single-commodity fixture byte-for-byte. With a
+ * `vocab`, emits that domain's own item/element code lists and observation rows.
+ */
+export function buildDomainZip(domain = FIXTURE_DOMAIN, vocab?: DomainVocab): Uint8Array {
   const base = `Production_Crops_Livestock_${domain}`;
+  const dataCsv = vocab
+    ? [DATA_HEADER, ...buildVocabDataRows(vocab)].join('\n')
+    : [DATA_HEADER, ...DATA_ROWS].join('\n');
   const files: Zippable = {
-    [`${base}_E_All_Data_(Normalized).csv`]: strToU8([DATA_HEADER, ...DATA_ROWS].join('\n')),
+    [`${base}_E_All_Data_(Normalized).csv`]: strToU8(dataCsv),
     [`${base}_E_AreaCodes.csv`]: strToU8(AREA_CODES_CSV),
-    [`${base}_E_ItemCodes.csv`]: strToU8(ITEM_CODES_CSV),
-    [`${base}_E_Elements.csv`]: strToU8(ELEMENTS_CSV),
+    [`${base}_E_ItemCodes.csv`]: strToU8(vocab ? buildItemCodesCsv(vocab.items) : ITEM_CODES_CSV),
+    [`${base}_E_Elements.csv`]: strToU8(vocab ? buildElementsCsv(vocab.elements) : ELEMENTS_CSV),
     [`${base}_E_Flags.csv`]: strToU8(FLAGS_CSV),
     'README.txt': strToU8('ignored non-cube entry'),
   };
   return zipSync(files);
+}
+
+/** Item code-list CSV from a vocab (apostrophe-prefixed CPC, matching FAOSTAT). */
+function buildItemCodesCsv(items: DomainVocab['items']): string {
+  return [
+    'Item Code,CPC Code,Item',
+    ...items.map((it) => `${it.code},'${it.cpc ?? '0000'},${it.name}`),
+  ].join('\n');
+}
+
+/** Element code-list CSV from a vocab. */
+function buildElementsCsv(elements: DomainVocab['elements']): string {
+  return ['Element Code,Element', ...elements.map((e) => `${e.code},${e.name}`)].join('\n');
+}
+
+/** Observation rows: countries × items × elements × two years, so obs carries every vocab code. */
+function buildVocabDataRows(vocab: DomainVocab): string[] {
+  const rows: string[] = [];
+  let seed = 1000;
+  for (const c of VOCAB_COUNTRIES) {
+    for (const it of vocab.items) {
+      for (const el of vocab.elements) {
+        for (const year of [2020, 2021]) {
+          seed += 1;
+          rows.push(
+            `${c.code},'${c.m49},${c.name},${it.code},${it.name},${el.code},${el.name},${year},${year},t,${seed}.000000,A,Synth`,
+          );
+        }
+      }
+    }
+  }
+  return rows;
 }
 
 /**

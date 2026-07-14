@@ -61,13 +61,13 @@ describe('FaostatMirror end-to-end', () => {
   });
 
   it('resolves an item by full-text query and exposes its CPC code', async () => {
-    const { matches } = await mirror.resolve('item', { query: 'wheat', limit: 10 });
+    const { matches } = await mirror.resolve(FIXTURE_DOMAIN, 'item', { query: 'wheat', limit: 10 });
     expect(matches).toHaveLength(1);
     expect(matches[0]).toMatchObject({ code: 15, name: 'Wheat', kind: null, cpc_code: '0111' });
   });
 
   it('classifies areas as country vs aggregate', async () => {
-    const { matches } = await mirror.resolve('area', { limit: 100 });
+    const { matches } = await mirror.resolve(FIXTURE_DOMAIN, 'area', { limit: 100 });
     const byCode = new Map(matches.map((m) => [m.code, m.kind]));
     expect(byCode.get(2)).toBe('country');
     expect(byCode.get(351)).toBe('country');
@@ -75,7 +75,7 @@ describe('FaostatMirror end-to-end', () => {
   });
 
   it('resolves an area by exact code', async () => {
-    const { matches } = await mirror.resolve('area', { code: 351, limit: 10 });
+    const { matches } = await mirror.resolve(FIXTURE_DOMAIN, 'area', { code: 351, limit: 10 });
     expect(matches).toEqual([{ code: 351, name: 'China', kind: 'country' }]);
   });
 
