@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.9](changelog/0.1.x/0.1.9.md) — 2026-07-13
+
+Adds offset-based pagination to faostat_resolve_codes (#7) and fixes cross-domain item/element code leakage by scoping resolution to the requested domain's actual code membership (#8).
+
 ## [0.1.8](changelog/0.1.x/0.1.8.md) — 2026-07-13
 
 Replaces the per-call unbounded COUNT(*) in faostat_query_observations and faostat_commodity_profile — the event-loop-blocking scan behind #3 — with a LIMIT+1 overflow probe and two composite indexes; spilled and preview rows now order by year.
