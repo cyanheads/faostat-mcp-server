@@ -11,13 +11,13 @@
 import { join } from 'node:path';
 import { openSqliteHandle, type SqliteHandle } from '@cyanheads/mcp-ts-core/mirror';
 import {
-  AGGREGATE_AREA_CODE_THRESHOLD,
   type AreaKind,
   type AreaRecord,
   type DimensionKind,
   type ElementRecord,
   type FlagRecord,
   type ItemRecord,
+  isAggregateAreaCode,
   type ResolvedCode,
 } from './types.js';
 
@@ -61,7 +61,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS elements_fts USING fts5(
 
 /** Classify an area code as an individual country or an aggregate region. */
 export function classifyArea(areaCode: number): AreaKind {
-  return areaCode >= AGGREGATE_AREA_CODE_THRESHOLD ? 'aggregate' : 'country';
+  return isAggregateAreaCode(areaCode) ? 'aggregate' : 'country';
 }
 
 /**
@@ -348,10 +348,14 @@ export class DimensionsStore {
 
   private toResolved(dimension: DimensionKind, row: Record<string, unknown>): ResolvedCode {
     if (dimension === 'area') {
+      const code = Number(row.area_code);
       return {
-        code: Number(row.area_code),
+        code,
         name: String(row.area),
-        kind: (row.kind as AreaKind) ?? null,
+        // Derive kind at read time from the code, not the stored `kind` column:
+        // mirrors ingested before the deny-set fix persisted the old classification,
+        // so recomputing here corrects them with no re-sync (issue #4).
+        kind: isAggregateAreaCode(code) ? 'aggregate' : 'country',
       };
     }
     if (dimension === 'item') {

@@ -121,12 +121,16 @@ describe('faostat_query_observations spillover dead band', () => {
     expect(total).toBe(300);
 
     const ctx = createMockContext({ tenantId: 'spill-test', errors: queryObservationsTool.errors });
+    // include_aggregates so the synthetic codes 1..300 (which include real FAOSTAT
+    // roll-up codes like 265) aren't deny-set-excluded — this test exercises the
+    // spillover dead band, not aggregate classification (#4).
     const input = queryObservationsTool.input.parse({
       domain: FIXTURE_DOMAIN,
       item_codes: [15],
       element_codes: [5510],
       year_start: 2020,
       year_end: 2020,
+      include_aggregates: true,
     });
 
     const result = await queryObservationsTool.handler(input, ctx);
@@ -197,12 +201,16 @@ describe('faostat_query_observations spillover dead band', () => {
       tenantId: 'spill-test-3',
       errors: queryObservationsTool.errors,
     });
+    // include_aggregates so the synthetic codes 1..1200 (which include real FAOSTAT
+    // roll-up codes like 265/351) aren't deny-set-excluded — this test exercises the
+    // char-budget spill, not aggregate classification (#4).
     const input = queryObservationsTool.input.parse({
       domain: FIXTURE_DOMAIN,
       item_codes: [15],
       element_codes: [5510],
       year_start: 2020,
       year_end: 2020,
+      include_aggregates: true,
     });
 
     const result = await queryObservationsTool.handler(input, ctx);

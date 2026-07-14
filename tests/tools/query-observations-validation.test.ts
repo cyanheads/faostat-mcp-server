@@ -32,7 +32,7 @@ describe('faostat_query_observations input validation (#12)', () => {
 
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'faostat-validation-'));
-    const zip = buildDomainZip(); // QCL: Afghanistan(2), China(351), World(5000); Wheat(15)/Production(5510); 2020, 2021
+    const zip = buildDomainZip(); // QCL: Afghanistan(2, country), China(351, aggregate roll-up), World(5000, aggregate); Wheat(15)/Production(5510); 2020, 2021
     vi.stubGlobal(
       'fetch',
       vi.fn(async () => chunkedResponse(zip, 64)),
@@ -107,7 +107,8 @@ describe('faostat_query_observations input validation (#12)', () => {
     });
     const result = await queryObservationsTool.handler(input, ctx);
 
-    // Not rejected: returns the 2020 country rows (World aggregate excluded by default).
+    // Not rejected: returns the 2020 country row(s) — World and the China (351)
+    // roll-up are both aggregate-excluded by default (#4), leaving Afghanistan.
     expect(result.observations.length).toBeGreaterThan(0);
     expect(result.observations.every((o) => o.year === 2020)).toBe(true);
     expect(result.spilled).toBe(false);

@@ -6,13 +6,42 @@
  */
 
 /**
- * Aggregate area-code boundary. FAOSTAT mixes individual countries (codes 2–351)
- * and aggregate regions (World, continents, economic groupings) in the same
- * `area` dimension; aggregate codes are exactly `>= 5000` (no country code
- * reaches 5000 — largest confirmed is China=351). Used to classify country vs
- * aggregate and to exclude aggregates from naive sums by default.
+ * Aggregate area-code boundary. FAOSTAT mixes individual countries and aggregate
+ * regions (World, continents, economic groupings) in the same `area` dimension.
+ * Most aggregates carry codes `>= 5000`, but a few roll-ups sit below it (see
+ * {@link AGGREGATE_AREA_CODES}), so this threshold is only half the boundary. Use
+ * {@link isAggregateAreaCode} for the full country-vs-aggregate test, never a bare
+ * `>= 5000` comparison.
  */
 export const AGGREGATE_AREA_CODE_THRESHOLD = 5000;
+
+/**
+ * Curated sub-threshold roll-up area codes — FAOSTAT composite areas whose value
+ * sums their member countries yet whose code sits below
+ * {@link AGGREGATE_AREA_CODE_THRESHOLD}, so the numeric bound alone misclassifies
+ * them as countries and lets a naive sum double-count (issue #4):
+ *   - `351` "China" = 41 mainland + 214 Taiwan + 96 Hong Kong + 128 Macao.
+ *   - `265` "China (excluding intra-trade)" — a TCL trade roll-up.
+ * Curated, not data-derived: FAOSTAT exposes no roll-up signal in the bulk channel
+ * this server mirrors — M49 codes don't discriminate aggregates from countries, no
+ * country-group membership file ships in the domain ZIPs, and the definitions API
+ * is unreachable. Historical predecessor codes (USSR=228, Yugoslavia,
+ * Czechoslovakia, …) are deliberately excluded: single successor entities, not
+ * member roll-ups, so they carry no double-count hazard.
+ */
+export const AGGREGATE_AREA_CODES: ReadonlySet<number> = new Set([265, 351]);
+
+/**
+ * True when an area code denotes an aggregate/roll-up region rather than an
+ * individual country: any code at or above {@link AGGREGATE_AREA_CODE_THRESHOLD},
+ * plus the curated sub-threshold roll-ups in {@link AGGREGATE_AREA_CODES}. The
+ * single source of truth for the country-vs-aggregate boundary — it drives both
+ * the `faostat_resolve_codes` `kind` label and the default aggregate exclusion in
+ * `faostat_query_observations`, so the two never drift apart.
+ */
+export function isAggregateAreaCode(code: number): boolean {
+  return code >= AGGREGATE_AREA_CODE_THRESHOLD || AGGREGATE_AREA_CODES.has(code);
+}
 
 /** One dataset entry in the bulk manifest (`datasets_E.json`). */
 export interface ManifestDataset {

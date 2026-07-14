@@ -15,10 +15,12 @@ const DATA_HEADER =
   'Area Code,Area Code (M49),Area,Item Code,Item,Element Code,Element,Year Code,Year,Unit,Value,Flag,Note';
 
 /**
- * Rows for a tiny QCL-shaped fixture: two countries (Afghanistan=2, China=351),
- * one aggregate (World=5000), one item (Wheat=15), one element (Production=5510),
+ * Rows for a tiny QCL-shaped fixture: one country (Afghanistan=2) plus two
+ * aggregates (China=351, a sub-5000 roll-up caught by the deny-set; World=5000,
+ * above the numeric threshold), one item (Wheat=15), one element (Production=5510),
  * two years. The China 2021 row carries a quoted Note with an embedded comma to
- * exercise the CSV splitter.
+ * exercise the CSV splitter. China 351 also anchors the #4 regression — default
+ * queries exclude it; include_aggregates or explicit area codes reach it.
  */
 const DATA_ROWS: string[] = [
   `2,'004,Afghanistan,15,Wheat,5510,Production,2020,2020,t,5000.000000,A,Official data`,

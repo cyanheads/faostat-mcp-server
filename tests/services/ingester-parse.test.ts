@@ -78,6 +78,20 @@ describe('dimension code-list parsers', () => {
     ]);
   });
 
+  it('classifies sub-5000 roll-up areas (China 351 / 265) as aggregate via the deny-set', () => {
+    // 351 "China" (mainland + Taiwan + HK + Macao) and 265 "China (excluding
+    // intra-trade)" roll up members but sit below the numeric threshold — the
+    // curated deny-set, not the >=5000 rule, must flag them aggregate so a default
+    // query stays sum-safe (#4). 41 "China; mainland" is a real country alongside.
+    const areas = parseAreaCodes(
+      "Area Code,M49 Code,Area\n41,'156,China; mainland\n265,'159,China (excluding intra-trade)\n351,'159,China",
+    );
+    const byCode = new Map(areas.map((a) => [a.area_code, a.kind]));
+    expect(byCode.get(41)).toBe('country');
+    expect(byCode.get(265)).toBe('aggregate');
+    expect(byCode.get(351)).toBe('aggregate');
+  });
+
   it('parses ItemCodes and strips the CPC apostrophe', () => {
     const items = parseItemCodes("Item Code,CPC Code,Item\n15,'0111,Wheat");
     expect(items).toEqual([{ item_code: 15, cpc_code: '0111', item: 'Wheat' }]);

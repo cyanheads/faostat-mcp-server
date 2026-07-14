@@ -23,7 +23,7 @@ import { DimensionsStore } from './dimensions-store.js';
 import { makeDomainSync } from './ingester.js';
 import { fetchManifest, findDataset } from './manifest.js';
 import type { DimensionKind, ManifestDataset, ObservationRow, ResolvedCode } from './types.js';
-import { AGGREGATE_AREA_CODE_THRESHOLD } from './types.js';
+import { AGGREGATE_AREA_CODE_THRESHOLD, AGGREGATE_AREA_CODES } from './types.js';
 
 /** The standard normalized-cube columns for every domain mirror table. */
 const CUBE_COLUMNS: Record<string, string> = {
@@ -196,9 +196,12 @@ export class FaostatMirror {
 
   /**
    * Build the `WHERE` clause + bound params shared by the observation query and
-   * stream paths. Aggregate exclusion (`area_code < THRESHOLD`) applies only when
-   * the caller neither opted into aggregates nor named explicit area codes — with
-   * explicit area codes the agent already chose them, so they are honored verbatim.
+   * stream paths. Aggregate exclusion applies only when the caller neither opted
+   * into aggregates nor named explicit area codes — with explicit area codes the
+   * agent already chose them, so they are honored verbatim. Aggregates are codes
+   * `>= THRESHOLD` plus the curated sub-threshold roll-ups in AGGREGATE_AREA_CODES
+   * (issue #4), the SQL mirror of isAggregateAreaCode() so the exclusion and the
+   * resolve_codes `kind` label stay in lockstep.
    */
   private buildObservationWhere(q: Omit<ObservationQuery, 'limit' | 'offset'>): {
     whereSql: string;
@@ -208,6 +211,11 @@ export class FaostatMirror {
     const params: (string | number)[] = [];
     if (!q.includeAggregates && !q.areaCodes?.length) {
       where.push(`area_code < ${AGGREGATE_AREA_CODE_THRESHOLD}`);
+      // Also drop the curated sub-threshold roll-ups (China=351, …) the numeric
+      // bound misses. Trusted integer constants — safe to inline like the threshold.
+      if (AGGREGATE_AREA_CODES.size > 0) {
+        where.push(`area_code NOT IN (${[...AGGREGATE_AREA_CODES].join(', ')})`);
+      }
     }
     if (q.areaCodes?.length) {
       where.push(`area_code IN (${q.areaCodes.map(() => '?').join(',')})`);
