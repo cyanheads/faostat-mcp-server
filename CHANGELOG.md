@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-07-27
+
+Adds query-planner statistics (ANALYZE) so the mirror's composite indexes are actually chosen, cutting commodity_profile aggregation from seconds to milliseconds, and caps faostat_query_observations's inline page at limit while staging overflow to a canvas table (#3, #14).
+
 ## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-07-27 · ⚠️ Breaking
 
 Rewrites faostat_commodity_profile's rankings and trend as SQL aggregates over the full match, replacing the per-row flag field with flags (#5); rejects reversed year ranges (#17); fixes cold-TCL misreporting and an inaccurate staged-set notice (#19); and syncs the fit-inline notice across both client surfaces (#20).
