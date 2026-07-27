@@ -11,7 +11,9 @@
  * the item+element filter shape the aggregation paths use — measured on the real
  * mirror as seconds per query instead of milliseconds. The second suite here
  * covers the statistics lifecycle that fixes it: built on first read, refreshed
- * when a sync applies rows, skipped when a refresh applies none.
+ * when a sync applies rows, skipped when a refresh applies none, retried after a
+ * failed attempt but only within a fixed budget (#21), and never charged to the
+ * dimension-code discovery read the statistics do not serve (#22).
  * @module tests/services/faostat-mirror-index
  */
 
@@ -201,6 +203,58 @@ describe('FaostatMirror query-planner statistics (#3)', () => {
     if (present) handle.exec('DROP TABLE sqlite_stat1');
   }
 
+  /**
+   * The state an inherited mirror is in: rows synced, statistics dropped, and a
+   * fresh instance so the in-process memo starts empty. Replaces the suite's
+   * `mirror` binding so `afterEach` still closes the live one.
+   */
+  async function reopenWithoutStatistics(): Promise<FaostatMirror> {
+    await clearStatistics(mirror);
+    await mirror.close();
+    mirror = new FaostatMirror({ dir, domains: [FIXTURE_DOMAIN] });
+    return mirror;
+  }
+
+  /** A filtering read — the shape the statistics serve, so it opens through the gate. */
+  async function readCube(target: FaostatMirror): Promise<void> {
+    await target.queryObservations(FIXTURE_DOMAIN, {
+      itemCodes: [15],
+      elementCodes: [5510],
+      includeAggregates: false,
+      limit: 10,
+      offset: 0,
+    });
+  }
+
+  /**
+   * Make `ANALYZE` fail on the target's handle, standing in for the writer holding
+   * the lock past `busy_timeout` that the gate's own docs name. `raw()` hands back
+   * one cached handle per domain, so patching `exec` intercepts the mirror's own
+   * pass. Returns the attempt count and a `clear()` that releases the obstruction.
+   */
+  async function obstructAnalyze(
+    target: FaostatMirror,
+  ): Promise<{ attempts: () => number; clear: () => void }> {
+    const m = target.getMirror(FIXTURE_DOMAIN);
+    if (!m) throw new Error('mirror not found');
+    const handle = await m.raw();
+    const passThrough = handle.exec.bind(handle);
+    let attempts = 0;
+    let obstructed = true;
+    handle.exec = (sql: string) => {
+      if (!sql.trimStart().toUpperCase().startsWith('ANALYZE')) return passThrough(sql);
+      attempts += 1;
+      if (obstructed) throw new Error('database is locked');
+      passThrough(sql);
+    };
+    return {
+      attempts: () => attempts,
+      clear: () => {
+        obstructed = false;
+      },
+    };
+  }
+
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'faostat-stats-'));
     const { zip } = buildMidSizeDomainZip({ countryCount: 60, aggregateCount: 4, years: 2 });
@@ -232,26 +286,68 @@ describe('FaostatMirror query-planner statistics (#3)', () => {
     // An already-synced .db from a deployment that predates this: indexes present,
     // statistics never computed. Reopening must catch it up from the read path —
     // a fix that only ran inside sync would leave every such mirror slow forever.
-    await clearStatistics(mirror);
-    expect(await statRows(mirror)).toHaveLength(0);
-    await mirror.close();
+    const reopened = await reopenWithoutStatistics();
+    expect(await statRows(reopened)).toHaveLength(0);
 
-    const reopened = new FaostatMirror({ dir, domains: [FIXTURE_DOMAIN] });
-    try {
-      const res = await reopened.queryObservations(FIXTURE_DOMAIN, {
-        itemCodes: [15],
-        elementCodes: [5510],
-        includeAggregates: false,
-        limit: 10,
-        offset: 0,
-      });
-      expect(res.rows.length).toBeGreaterThan(0);
-      expect((await statRows(reopened)).length).toBeGreaterThan(0);
-    } finally {
-      await reopened.close();
-    }
-    // Keep afterEach's close() valid — the outer mirror is already closed.
-    mirror = reopened;
+    const res = await reopened.queryObservations(FIXTURE_DOMAIN, {
+      itemCodes: [15],
+      elementCodes: [5510],
+      includeAggregates: false,
+      limit: 10,
+      offset: 0,
+    });
+    expect(res.rows.length).toBeGreaterThan(0);
+    expect((await statRows(reopened)).length).toBeGreaterThan(0);
+  });
+
+  it('retries ANALYZE on the next read after a failed attempt (#21)', async () => {
+    // The failure the memo used to swallow: an attempt that never ran to completion
+    // was remembered as success, so the domain kept the uninformed plan for the rest
+    // of the process even after the contention that caused it had gone.
+    const reopened = await reopenWithoutStatistics();
+    expect(await statRows(reopened)).toHaveLength(0);
+    const analyze = await obstructAnalyze(reopened);
+
+    await readCube(reopened);
+    expect(analyze.attempts()).toBe(1);
+    expect(await statRows(reopened)).toHaveLength(0);
+
+    analyze.clear();
+    await readCube(reopened);
+    expect(analyze.attempts()).toBe(2);
+    expect((await statRows(reopened)).length).toBeGreaterThan(0);
+  });
+
+  it('stops re-attempting ANALYZE once the retry budget is spent (#21)', async () => {
+    // The other half: an obstruction that never clears (a read-only volume) must not
+    // buy an ANALYZE — seconds to a minute on a real domain — on every single query.
+    const reopened = await reopenWithoutStatistics();
+    const analyze = await obstructAnalyze(reopened);
+
+    for (let i = 0; i < 8; i++) await readCube(reopened);
+    // Pinned, not bounded: a loose range still passes if the budget regresses to 2
+    // or 5, and the budget is the whole point of this test.
+    const spent = analyze.attempts();
+    expect(spent).toBe(3);
+
+    for (let i = 0; i < 4; i++) await readCube(reopened);
+    expect(analyze.attempts()).toBe(spent);
+    expect(await statRows(reopened)).toHaveLength(0);
+  });
+
+  it('does not analyze for a dimension-code discovery read, but does for a data read (#22)', async () => {
+    // resolve_codes reads distinct dimension codes off the single-column index — a
+    // shape the statistics do nothing for — and is the call an agent makes first, so
+    // it must not be the one that waits out the ANALYZE.
+    const reopened = await reopenWithoutStatistics();
+    expect(await statRows(reopened)).toHaveLength(0);
+
+    const resolved = await reopened.resolve(FIXTURE_DOMAIN, 'item', { limit: 10 });
+    expect(resolved.matches.length).toBeGreaterThan(0);
+    expect(await statRows(reopened)).toHaveLength(0);
+
+    await readCube(reopened);
+    expect((await statRows(reopened)).length).toBeGreaterThan(0);
   });
 
   it('re-analyzes when a refresh applies rows and skips the pass when it applies none', async () => {

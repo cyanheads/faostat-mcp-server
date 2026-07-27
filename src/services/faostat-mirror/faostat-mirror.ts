@@ -63,6 +63,15 @@ function cubeTable(code: string): string {
 }
 
 /**
+ * ANALYZE attempts a domain gets per process before the read path stops retrying
+ * it. A failure is not memoized as success (#21), so contention that clears is
+ * picked up by a later query; this bounds the other case, where the obstruction
+ * is permanent (a read-only volume) and an unbounded retry would re-run an
+ * expensive ANALYZE on every single query.
+ */
+const ANALYZE_MAX_ATTEMPTS = 3;
+
+/**
  * Normalize a `group_concat(DISTINCT flag)` result into a sorted, comma-space
  * separated set. SQLite guarantees neither ordering nor de-duplication of blanks
  * across grouping strategies, so the raw string is not stable enough to hand a
@@ -114,12 +123,17 @@ export class FaostatMirror {
    */
   private readonly ingesters = new Map<string, SyncGenerator | undefined>();
   /**
-   * Domains whose query-planner statistics have been checked (and built when
-   * missing) in this process — see {@link ensureQueryStatistics}. Marked on the
-   * first attempt whether or not it succeeded, so a failure costs one try, not
-   * one per query.
+   * Domains whose query-planner statistics are in place in this process — found
+   * already present, or built successfully — see {@link ensureQueryStatistics}.
    */
   private readonly analyzed = new Set<string>();
+  /**
+   * Failed ANALYZE attempts per domain. Only the outcome is memoized, so a
+   * failure leaves the domain eligible for a retry on the next read rather than
+   * being remembered as success; the count bounds that retry at
+   * {@link ANALYZE_MAX_ATTEMPTS}.
+   */
+  private readonly analyzeFailures = new Map<string, number>();
   private readonly log: MirrorLogger | undefined;
   private readonly dir: string;
   readonly domains: string[];
@@ -199,10 +213,10 @@ export class FaostatMirror {
   }
 
   /**
-   * Open a selected domain's SQLite handle and resolve its cube table name, with
-   * query-planner statistics ensured first. Every raw-SQL read path goes through
-   * here, so no path can query a domain whose planner is flying blind.
-   * Undefined when the domain is not selected.
+   * Open a selected domain's SQLite handle and resolve its cube table name.
+   * Undefined when the domain is not selected. Carries no statistics gate — the
+   * filtering and aggregating paths open through {@link openAnalyzedDomain}
+   * instead.
    */
   private async openDomain(
     code: string,
@@ -210,10 +224,25 @@ export class FaostatMirror {
     const upper = code.toUpperCase();
     const mirror = this.mirrors.get(upper);
     if (!mirror) return;
-    const handle = await mirror.raw();
-    const table = cubeTable(upper);
-    this.ensureQueryStatistics(upper, handle, table);
-    return { handle, table };
+    return { handle: await mirror.raw(), table: cubeTable(upper) };
+  }
+
+  /**
+   * {@link openDomain} with query-planner statistics ensured first. Every path
+   * that filters or aggregates the cube goes through here, so none of them can
+   * query a domain whose planner is flying blind. The gate is deliberately not
+   * on `openDomain` itself: the statistics serve the `item_code + element_code +
+   * year` filter shape, and a whole-column scan that shape does not describe —
+   * the distinct-code read behind {@link domainDimensionCodes} — would otherwise
+   * pay for an optimization it cannot use (#22).
+   */
+  private async openAnalyzedDomain(
+    code: string,
+  ): Promise<{ handle: SqliteHandle; table: string } | undefined> {
+    const opened = await this.openDomain(code);
+    if (!opened) return;
+    this.ensureQueryStatistics(code.toUpperCase(), opened.handle, opened.table);
+    return opened;
   }
 
   /**
@@ -238,13 +267,41 @@ export class FaostatMirror {
    *
    * Statistics are an optimization, so a failure (read-only volume, a writer
    * holding the lock past `busy_timeout`) degrades to the old plan rather than
-   * failing the caller's query.
+   * failing the caller's query. Only the outcome is memoized: a failed attempt
+   * is retried by the next read, so contention lasting milliseconds costs one
+   * slow query rather than every query for the life of the process, while
+   * {@link ANALYZE_MAX_ATTEMPTS} caps what an obstruction that never clears can
+   * cost (#21).
    */
   private ensureQueryStatistics(code: string, handle: SqliteHandle, table: string): void {
     if (this.analyzed.has(code)) return;
-    this.analyzed.add(code);
-    if (this.hasStatistics(handle, table)) return;
-    this.analyze(handle, table);
+    if ((this.analyzeFailures.get(code) ?? 0) >= ANALYZE_MAX_ATTEMPTS) return;
+    if (this.hasStatistics(handle, table)) {
+      this.analyzed.add(code);
+      return;
+    }
+    this.recordAnalyzeOutcome(code, this.analyze(handle, table));
+  }
+
+  /**
+   * Memoize an ANALYZE outcome. Success settles the domain for the process;
+   * failure buys a retry, and logs once when the budget runs out — otherwise the
+   * degraded plan persists with nothing in the record saying so.
+   */
+  private recordAnalyzeOutcome(code: string, succeeded: boolean): void {
+    if (succeeded) {
+      this.analyzed.add(code);
+      this.analyzeFailures.delete(code);
+      return;
+    }
+    this.analyzed.delete(code);
+    const failures = (this.analyzeFailures.get(code) ?? 0) + 1;
+    this.analyzeFailures.set(code, failures);
+    if (failures === ANALYZE_MAX_ATTEMPTS) {
+      this.log?.warning?.(
+        `ANALYZE failed ${failures} times for ${code} — reads stop retrying it this process (a sync will try again); its queries keep the planner's uninformed index choice`,
+      );
+    }
   }
 
   /** True when `sqlite_stat1` exists and carries a row for `table`. */
@@ -266,27 +323,36 @@ export class FaostatMirror {
    * mislead the planner as badly as absent ones. Syncs already run for minutes
    * out-of-band, so the ANALYZE pass is noise inside them; a refresh that applied
    * nothing skips it, so the nightly no-op refresh stays a no-op.
+   *
+   * Unconditional by design — it bypasses the read-path memo rather than
+   * consulting it, since the rows the recorded statistics describe have just been
+   * replaced.
    */
   private async refreshQueryStatistics(code: string): Promise<void> {
     const mirror = this.mirrors.get(code);
     if (!mirror) return;
-    this.analyzed.add(code);
-    this.analyze(await mirror.raw(), cubeTable(code));
+    this.recordAnalyzeOutcome(code, this.analyze(await mirror.raw(), cubeTable(code)));
   }
 
-  /** ANALYZE one cube table, timed and logged. Never throws — see {@link ensureQueryStatistics}. */
-  private analyze(handle: SqliteHandle, table: string): void {
+  /**
+   * ANALYZE one cube table, timed and logged. Never throws — see
+   * {@link ensureQueryStatistics} — and returns whether it succeeded, so callers
+   * memoize the outcome rather than the attempt.
+   */
+  private analyze(handle: SqliteHandle, table: string): boolean {
     const start = Date.now();
     try {
       handle.exec(`ANALYZE ${table}`);
       this.log?.info?.(`Query-planner statistics updated for ${table}`, {
         durationMs: Date.now() - start,
       });
+      return true;
     } catch (err) {
       this.log?.warning?.(
         `Could not ANALYZE ${table} — queries fall back to the planner's uninformed index choice`,
         { error: err instanceof Error ? err.message : String(err) },
       );
+      return false;
     }
   }
 
@@ -305,7 +371,7 @@ export class FaostatMirror {
     code: string,
     q: ObservationQuery,
   ): Promise<{ rows: ObservationRow[]; total: number; totalIsExact: boolean }> {
-    const opened = await this.openDomain(code);
+    const opened = await this.openAnalyzedDomain(code);
     if (!opened) return { rows: [], total: 0, totalIsExact: true };
     const { handle, table } = opened;
     const { whereSql, params } = this.buildObservationWhere(q);
@@ -384,7 +450,7 @@ export class FaostatMirror {
     q: Omit<ObservationQuery, 'limit' | 'offset'>,
     limit: number,
   ): AsyncGenerator<Record<string, unknown>> {
-    const opened = await this.openDomain(code);
+    const opened = await this.openAnalyzedDomain(code);
     if (!opened) return;
     const { handle, table } = opened;
     const { whereSql, params } = this.buildObservationWhere(q);
@@ -415,7 +481,7 @@ export class FaostatMirror {
     q: Omit<ObservationQuery, 'limit' | 'offset'>,
     topN: number,
   ): Promise<AreaAggregateRow[]> {
-    const opened = await this.openDomain(code);
+    const opened = await this.openAnalyzedDomain(code);
     if (!opened) return [];
     const { handle, table } = opened;
     const { whereSql, params } = this.buildValuedWhere(q);
@@ -465,7 +531,7 @@ export class FaostatMirror {
     code: string,
     q: Omit<ObservationQuery, 'limit' | 'offset'>,
   ): Promise<YearAggregateRow[]> {
-    const opened = await this.openDomain(code);
+    const opened = await this.openAnalyzedDomain(code);
     if (!opened) return [];
     const { handle, table } = opened;
     const { whereSql, params } = this.buildValuedWhere(q);
@@ -533,6 +599,11 @@ export class FaostatMirror {
    * so the table exists even for a selected-but-unsynced domain — then the cube is
    * empty, the set is `[]`, and resolve returns no matches (the honest answer for a
    * domain you cannot yet query).
+   *
+   * Opens ungated (#22). This is a discovery read — the single-column index already
+   * serves it, and it is the call an agent makes first, so routing it through the
+   * statistics gate charged the cheapest call for the slowest optimization and left
+   * an HTTP caller waiting out a full ANALYZE for codes it could have had at once.
    */
   private async domainDimensionCodes(
     domain: string,
