@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.10-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/faostat-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/faostat-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.11-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/faostat-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/faostat-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 [![Install in Claude Desktop](https://img.shields.io/badge/Install_in-Claude_Desktop-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://github.com/cyanheads/faostat-mcp-server/releases/latest/download/faostat-mcp-server.mcpb) [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=faostat-mcp-server&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBjeWFuaGVhZHMvZmFvc3RhdC1tY3Atc2VydmVyIl19) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22faostat-mcp-server%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40cyanheads%2Ffaostat-mcp-server%22%5D%7D)
 
@@ -53,6 +53,8 @@ Discover the catalog and what's queryable right now.
 - Per-domain `indexed` / `index_ready` flags, local row count, and last completed sync
 - `topic` substring filter over code, name, and topic (e.g. `"trade"`, `"emissions"`, `"QCL"`)
 - `indexed_only` to list just the domains queryable from the local mirror
+- `code` for an exact domain lookup (e.g. `"RL"`) — one full record, without a topic search that can match unrelated domains
+- `offset` + `limit` to page the catalog; the response reports `totalMatches`, `truncated`, and the `nextOffset` to resume at. Domain descriptions are long, so a browse call is bounded by default — raise `limit` (max 200) to pull the whole catalog in one response
 
 ---
 
@@ -114,7 +116,7 @@ FAOSTAT-specific:
 
 - **Persistent local SQLite mirror** of the FAOSTAT bulk corpus via the framework `MirrorService` — one indexed table per selected domain plus shared dimension tables, with FTS5 over the dimension labels driving code resolution
 - **Streaming bulk-ZIP ingester** — fetches the manifest, compares each domain's update date against the stored checkpoint to skip unchanged domains, and stream-parses the normalized CSV (∼18× decompression ratio) into SQLite without materializing the full file in memory
-- **Config-driven domain selection** (`FAOSTAT_DOMAINS`) — the indexed set can grow without code changes; `faostat_list_domains` always shows the full catalog and which domains are locally queryable
+- **Config-driven domain selection** (`FAOSTAT_DOMAINS`) — the indexed set can grow without code changes; `faostat_list_domains` covers the full catalog — paged, and annotated with which domains are locally queryable
 - **DataCanvas SQL surface** (DuckDB) — analytical cube queries spill to a staged table for ad-hoc `GROUP BY` / ranking / time-series analysis
 
 Agent-friendly output:

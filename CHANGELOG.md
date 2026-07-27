@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.11](changelog/0.1.x/0.1.11.md) — 2026-07-27
+
+Adopts @cyanheads/mcp-ts-core ^0.11.0 and TypeScript 7; adds offset/limit paging and an exact-code lookup to faostat_list_domains (#16); fixes dataframe_describe reporting every staged column as VARCHAR (#15) and the .mcpb bundle disabling every canvas tool by stripping DuckDB's platform binding (#18).
+
 ## [0.1.10](changelog/0.1.x/0.1.10.md) — 2026-07-13
 
 Fixes sub-5000 roll-up areas like China (351) evading aggregate exclusion and being mislabeled as a country (#4), and widens the data-quality flag legend across tool descriptions to the full FAOSTAT set (#6).
