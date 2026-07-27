@@ -2,7 +2,10 @@
  * @fileoverview `faostat_list_domains` — the entry-point tool. Reads the live
  * FAOSTAT bulk manifest for the full domain catalog and annotates each entry
  * with local mirror status (indexed? row count? last sync?). Every other query
- * keys on a domain code discovered here.
+ * keys on a domain code discovered here. Retrieval is bounded: `code` fetches one
+ * domain outright, `topic` / `indexed_only` narrow, and `offset` + `limit` page
+ * the rest with `truncated` / `nextOffset` disclosure — the catalog's ~69 entries
+ * carry long descriptions and cost a small model most of its context in one go.
  * @module mcp-server/tools/definitions/list-domains
  */
 
@@ -15,22 +18,50 @@ import {
   parseFileSizeBytes,
 } from '@/services/faostat-mirror/manifest.js';
 
+/** Cap on domains returned in one page. Exceeds the ~69-domain catalog, so a caller can opt into the whole thing. */
+const MAX_DOMAINS = 200;
+
 export const listDomainsTool = tool('faostat_list_domains', {
   title: 'faostat-mcp-server: list domains',
   description:
-    'Discover FAOSTAT statistical domains (production, trade, food balances, food security, land use, agri-emissions, prices, value) with their codes, descriptions, last-update date, upstream row count, and local index status. Every query keys on a domain code from here. The `indexed` flag tells you which domains are queryable right now; un-indexed domains exist in the catalog but must be added to FAOSTAT_DOMAINS and re-synced before faostat_query_observations can read them.',
+    'Discover FAOSTAT statistical domains (production, trade, food balances, food security, land use, agri-emissions, prices, value) with their codes, descriptions, last-update date, upstream row count, and local index status. Every query keys on a domain code from here. The `indexed` flag tells you which domains are queryable right now; un-indexed domains exist in the catalog but must be added to FAOSTAT_DOMAINS and re-synced before faostat_query_observations can read them. The catalog runs to ~69 domains with long descriptions, so responses are paged: narrow with `topic` / `indexed_only`, pass `code` to fetch one domain outright, or page with `offset` + `limit` — when the response reports `truncated`, pass the returned `nextOffset` to fetch the rest.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
 
   enrichment: {
-    totalCount: z.number().describe('Total domains in the FAOSTAT catalog.'),
+    totalCount: z
+      .number()
+      .describe('Total domains in the FAOSTAT catalog, independent of any filter.'),
+    totalMatches: z
+      .number()
+      .describe('Domains matching the current filters, before the page limit is applied.'),
+    truncated: z
+      .boolean()
+      .describe(
+        'True when more matches remain beyond the returned page — fetch them with nextOffset.',
+      ),
+    nextOffset: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        'Offset to pass on the next call to fetch the following page. Present only when truncated is true; absent on the last page and for exact-code lookups.',
+      ),
     indexedCount: z.number().describe('Domains currently indexed in the local mirror.'),
     notice: z
       .string()
       .optional()
-      .describe('Guidance when a topic filter matched nothing or no domains are indexed yet.'),
+      .describe(
+        'Guidance when a filter matched nothing, more pages remain, or no domains are indexed yet.',
+      ),
   },
 
   input: z.object({
+    code: z
+      .string()
+      .optional()
+      .describe(
+        'Exact domain code lookup (e.g. "RL"), case-insensitive. Returns that one domain\'s full record on a single page. Takes precedence over `topic` / `indexed_only` when provided.',
+      ),
     topic: z
       .string()
       .optional()
@@ -41,6 +72,23 @@ export const listDomainsTool = tool('faostat_list_domains', {
       .boolean()
       .default(false)
       .describe('When true, return only domains indexed in the local mirror (queryable now).'),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_DOMAINS)
+      .default(20)
+      .describe(
+        'Maximum domains to return on this page (max 200 — above the catalog size, so raise it to fetch everything at once). Domain descriptions are long; the default keeps a browse call small.',
+      ),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        'Zero-based pagination offset into the matching domains (code-sorted). When the response reports truncated, pass the returned nextOffset here to fetch the next page. Ignored for exact-code lookups (always single-page).',
+      ),
   }),
 
   output: z.object({
@@ -95,9 +143,13 @@ export const listDomainsTool = tool('faostat_list_domains', {
     ctx.log.info('Fetched FAOSTAT manifest', { datasetCount: datasets.length });
 
     const topic = input.topic?.trim().toLowerCase();
+    const exactCode = input.code?.trim().toUpperCase();
     const selected = new Set(mirror.selectedDomains());
 
+    // An exact code is a lookup, not a filter — it bypasses topic/indexed_only so
+    // "does RL exist, and is it queryable?" is answerable in one call.
     const matched = datasets.filter((d) => {
+      if (exactCode) return d.DatasetCode.toUpperCase() === exactCode;
       if (topic) {
         const hay = `${d.DatasetCode} ${d.DatasetName} ${d.Topic ?? ''}`.toLowerCase();
         if (!hay.includes(topic)) return false;
@@ -106,45 +158,73 @@ export const listDomainsTool = tool('faostat_list_domains', {
       return true;
     });
 
+    const sorted = matched.slice().sort((a, b) => a.DatasetCode.localeCompare(b.DatasetCode));
+    const total = sorted.length;
+    // Page before the per-domain mirror status reads so a page costs one status
+    // lookup per returned domain, not one per match.
+    const page = exactCode ? sorted : sorted.slice(input.offset, input.offset + input.limit);
+
     const domains = await Promise.all(
-      matched
-        .slice()
-        .sort((a, b) => a.DatasetCode.localeCompare(b.DatasetCode))
-        .map(async (d) => {
-          const code = d.DatasetCode.toUpperCase();
-          const indexed = selected.has(code);
-          const status = indexed ? await mirror.status(code) : undefined;
-          const upstreamRows = parseFileRows(d.FileRows);
-          const sizeBytes = parseFileSizeBytes(d.FileSize);
-          return {
-            code,
-            name: d.DatasetName,
-            ...(d.Topic ? { topic: d.Topic } : {}),
-            ...(d.DatasetDescription ? { description: d.DatasetDescription } : {}),
-            last_update: d.DateUpdate,
-            ...(upstreamRows !== null ? { upstream_row_count: upstreamRows } : {}),
-            ...(sizeBytes !== null ? { file_size_in_bytes: sizeBytes } : {}),
-            indexed,
-            index_ready: status?.ready ?? false,
-            ...(status?.total !== undefined ? { indexed_row_count: status.total } : {}),
-            ...(status?.completedAt ? { indexed_last_sync: status.completedAt } : {}),
-          };
-        }),
+      page.map(async (d) => {
+        const code = d.DatasetCode.toUpperCase();
+        const indexed = selected.has(code);
+        const status = indexed ? await mirror.status(code) : undefined;
+        const upstreamRows = parseFileRows(d.FileRows);
+        const sizeBytes = parseFileSizeBytes(d.FileSize);
+        return {
+          code,
+          name: d.DatasetName,
+          ...(d.Topic ? { topic: d.Topic } : {}),
+          ...(d.DatasetDescription ? { description: d.DatasetDescription } : {}),
+          last_update: d.DateUpdate,
+          ...(upstreamRows !== null ? { upstream_row_count: upstreamRows } : {}),
+          ...(sizeBytes !== null ? { file_size_in_bytes: sizeBytes } : {}),
+          indexed,
+          index_ready: status?.ready ?? false,
+          ...(status?.total !== undefined ? { indexed_row_count: status.total } : {}),
+          ...(status?.completedAt ? { indexed_last_sync: status.completedAt } : {}),
+        };
+      }),
     );
 
+    // Pagination window: this page covers [offset, offset + domains.length). More
+    // remain when that end is short of the matched total — then nextOffset is where
+    // the caller resumes. `totalCount` stays the whole catalog (filter-independent);
+    // `totalMatches` is the filtered set this page was cut from.
+    const nextOffset = input.offset + domains.length;
+    const truncated = nextOffset < total;
     ctx.enrich.total(datasets.length);
-    ctx.enrich({ indexedCount: selected.size });
+    ctx.enrich({
+      totalMatches: total,
+      truncated,
+      ...(truncated ? { nextOffset } : {}),
+      indexedCount: selected.size,
+    });
+
+    // Retrieval guidance and index-state guidance are independent — an empty page
+    // on an unconfigured mirror needs both, so collect rather than branch past one.
+    const notices: string[] = [];
     if (domains.length === 0) {
-      ctx.enrich.notice(
-        topic
-          ? `No domains matched topic "${input.topic}". Omit the topic filter to see the full catalog.`
-          : 'No domains matched. Omit indexed_only to see the full catalog.',
+      notices.push(
+        exactCode
+          ? `No domain matched code "${input.code}". Call faostat_list_domains without code to browse the catalog.`
+          : total > 0
+            ? `Offset ${input.offset} is past the ${total} matching domain(s). Lower offset (0-based) to page back through the results.`
+            : topic
+              ? `No domains matched topic "${input.topic}". Omit the topic filter to see the full catalog.`
+              : 'No domains matched. Omit indexed_only to see the full catalog.',
       );
-    } else if (selected.size === 0) {
-      ctx.enrich.notice(
+    } else if (truncated) {
+      notices.push(
+        `Showing domains ${input.offset + 1}–${nextOffset} of ${total}. Call again with offset ${nextOffset} to fetch the next page.`,
+      );
+    }
+    if (selected.size === 0) {
+      notices.push(
         'No domains are indexed yet. Set FAOSTAT_DOMAINS and run the mirror init script before querying observations.',
       );
     }
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
 
     return { domains };
   },
