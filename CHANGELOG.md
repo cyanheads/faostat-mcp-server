@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-07-27 · ⚠️ Breaking
+
+Rewrites faostat_commodity_profile's rankings and trend as SQL aggregates over the full match, replacing the per-row flag field with flags (#5); rejects reversed year ranges (#17); fixes cold-TCL misreporting and an inaccurate staged-set notice (#19); and syncs the fit-inline notice across both client surfaces (#20).
+
 ## [0.1.11](changelog/0.1.x/0.1.11.md) — 2026-07-27
 
 Adopts @cyanheads/mcp-ts-core ^0.11.0 and TypeScript 7; adds offset/limit paging and an exact-code lookup to faostat_list_domains (#16); fixes dataframe_describe reporting every staged column as VARCHAR (#15) and the .mcpb bundle disabling every canvas tool by stripping DuckDB's platform binding (#18).

@@ -1,6 +1,6 @@
 # faostat-mcp-server - Directory Structure
 
-Generated on: 2026-07-27 16:28:11
+Generated on: 2026-07-27 17:52:37
 
 ```text
 faostat-mcp-server/
@@ -23,6 +23,7 @@ faostat-mcp-server/
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
+│   ├── 0.2.x/
 │   └── template.md
 ├── docs/
 │   └── design.md
@@ -173,7 +174,9 @@ faostat-mcp-server/
 │   │   ├── ingester-parse.test.ts
 │   │   └── manifest.test.ts
 │   └── tools/
+│       ├── commodity-profile-aggregation.test.ts
 │       ├── commodity-profile-notice.test.ts
+│       ├── commodity-profile-year-range.test.ts
 │       ├── dataframe-canvas-id-optional.test.ts
 │       ├── dataframe-describe-provenance.test.ts
 │       ├── dataframe-query-reasons.test.ts
