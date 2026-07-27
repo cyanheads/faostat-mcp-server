@@ -95,6 +95,40 @@ export interface ObservationRow {
   year: number;
 }
 
+/**
+ * One per-area aggregate: the summed value across every matching item for that
+ * area, at the area's own latest year with data. Grouped by `(area_code, unit)`
+ * so values in different units are never added together — in the ordinary
+ * single-unit case that is exactly one row per country.
+ */
+export interface AreaAggregateRow {
+  area: string;
+  area_code: number;
+  /** Distinct data-quality flags across the summed observations; null when none carried one. */
+  flags: string | null;
+  /** Observations folded into `value`. */
+  observations: number;
+  unit: string | null;
+  value: number;
+  /** The latest year this `(area, unit)` group has data in — computed per group. */
+  year: number;
+}
+
+/**
+ * One per-year aggregate: the summed value across every matching area and item
+ * for that year. Grouped by `(year, unit)` for the same reason as
+ * {@link AreaAggregateRow}.
+ */
+export interface YearAggregateRow {
+  /** Distinct data-quality flags across the summed observations; null when none carried one. */
+  flags: string | null;
+  /** Observations folded into `value`. */
+  observations: number;
+  unit: string | null;
+  value: number;
+  year: number;
+}
+
 /** Dimension kinds resolvable via `faostat_resolve_codes`. */
 export type DimensionKind = 'area' | 'item' | 'element';
 

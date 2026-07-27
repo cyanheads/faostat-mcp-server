@@ -22,7 +22,14 @@ import {
 import { DimensionsStore } from './dimensions-store.js';
 import { makeDomainSync } from './ingester.js';
 import { fetchManifest, findDataset } from './manifest.js';
-import type { DimensionKind, ManifestDataset, ObservationRow, ResolvedCode } from './types.js';
+import type {
+  AreaAggregateRow,
+  DimensionKind,
+  ManifestDataset,
+  ObservationRow,
+  ResolvedCode,
+  YearAggregateRow,
+} from './types.js';
 import { AGGREGATE_AREA_CODE_THRESHOLD, AGGREGATE_AREA_CODES } from './types.js';
 
 /** The standard normalized-cube columns for every domain mirror table. */
@@ -45,6 +52,21 @@ const CUBE_COLUMNS: Record<string, string> = {
 /** SQLite filename for a domain mirror table. */
 function domainDbFile(code: string): string {
   return `domain-${code.toUpperCase()}.db`;
+}
+
+/**
+ * Normalize a `group_concat(DISTINCT flag)` result into a sorted, comma-space
+ * separated set. SQLite guarantees neither ordering nor de-duplication of blanks
+ * across grouping strategies, so the raw string is not stable enough to hand a
+ * client. Null (no observation in the group carried a flag) stays null — an
+ * absent flag is never filled with a placeholder.
+ */
+function normalizeFlagSet(raw: string | null): string | null {
+  if (raw === null) return null;
+  const flags = [...new Set(raw.split(',').map((f) => f.trim()))]
+    .filter((f) => f.length > 0)
+    .sort();
+  return flags.length > 0 ? flags.join(', ') : null;
 }
 
 export interface FaostatMirrorOptions {
@@ -267,6 +289,116 @@ export class FaostatMirror {
       )
       .all(...params, limit);
     for (const row of rows) yield row;
+  }
+
+  /**
+   * Rank areas by the summed value across every matching item, each area taken at
+   * its OWN latest year with data. Runs entirely in SQL over the full filtered
+   * match, so it is bounded by neither a row cap nor the `ORDER BY year ASC` page
+   * order the row-oriented read paths use — a country whose series ends early
+   * still ranks, and a country never appears once per resolved item (issue #5).
+   *
+   * Grouping is `(area_code, unit)`: FAOSTAT reports different items of one
+   * commodity family in different units (tonnes vs head), and summing across
+   * units would be arithmetic on incomparable quantities. With a single unit —
+   * the ordinary case — this is exactly one row per country.
+   *
+   * Assumes the domain is selected and ready (callers gate first).
+   */
+  async rankAreaTotals(
+    code: string,
+    q: Omit<ObservationQuery, 'limit' | 'offset'>,
+    topN: number,
+  ): Promise<AreaAggregateRow[]> {
+    const mirror = this.getMirror(code);
+    if (!mirror) return [];
+    const handle = await mirror.raw();
+    const table = `obs_${code.toUpperCase()}`;
+    const { whereSql, params } = this.buildValuedWhere(q);
+    /*
+     * `latest` resolves each (area, unit) group's own newest year; the join then
+     * sums only that year's rows. `l.unit IS m.unit` (not `=`) so the NULL-unit
+     * group joins to itself. `MAX(m.area)` picks the label without widening the
+     * GROUP BY — a label variant would otherwise split one area into two rows.
+     */
+    const rows = handle
+      .prepare<{
+        area: string;
+        area_code: number;
+        flags: string | null;
+        observations: number;
+        unit: string | null;
+        value: number;
+        year: number;
+      }>(
+        `WITH matched AS (SELECT area_code, area, unit, year, value, flag FROM ${table} ${whereSql}),
+              latest AS (SELECT area_code, unit, MAX(year) AS year FROM matched GROUP BY area_code, unit)
+         SELECT m.area_code AS area_code,
+                MAX(m.area) AS area,
+                m.unit AS unit,
+                m.year AS year,
+                SUM(m.value) AS value,
+                COUNT(*) AS observations,
+                group_concat(DISTINCT m.flag) AS flags
+           FROM matched m
+           JOIN latest l ON l.area_code = m.area_code AND l.year = m.year AND l.unit IS m.unit
+          GROUP BY m.area_code, m.unit, m.year
+          ORDER BY value DESC
+          LIMIT ?`,
+      )
+      .all(...params, topN);
+    return rows.map((r) => ({ ...r, flags: normalizeFlagSet(r.flags) }));
+  }
+
+  /**
+   * Sum matching observations per `(year, unit)` — the compact annual series
+   * behind a commodity's production trend. Bounded by the domain's year span (a
+   * few dozen rows), so it inlines rather than needing the canvas, and like
+   * {@link rankAreaTotals} it aggregates in SQL over the full filtered match
+   * rather than a capped page. Assumes the domain is selected and ready.
+   */
+  async sumByYear(
+    code: string,
+    q: Omit<ObservationQuery, 'limit' | 'offset'>,
+  ): Promise<YearAggregateRow[]> {
+    const mirror = this.getMirror(code);
+    if (!mirror) return [];
+    const handle = await mirror.raw();
+    const table = `obs_${code.toUpperCase()}`;
+    const { whereSql, params } = this.buildValuedWhere(q);
+    const rows = handle
+      .prepare<{
+        flags: string | null;
+        observations: number;
+        unit: string | null;
+        value: number;
+        year: number;
+      }>(
+        `SELECT year, unit, SUM(value) AS value, COUNT(*) AS observations,
+                group_concat(DISTINCT flag) AS flags
+           FROM ${table} ${whereSql}
+          GROUP BY year, unit
+          ORDER BY year ASC`,
+      )
+      .all(...params);
+    return rows.map((r) => ({ ...r, flags: normalizeFlagSet(r.flags) }));
+  }
+
+  /**
+   * {@link buildObservationWhere} narrowed to rows carrying a value. The
+   * aggregation paths sum values, so a null-valued cell contributes nothing but
+   * would inflate the observation count and pull a group's "latest year" forward
+   * to a year that holds no measurement.
+   */
+  private buildValuedWhere(q: Omit<ObservationQuery, 'limit' | 'offset'>): {
+    whereSql: string;
+    params: (string | number)[];
+  } {
+    const { whereSql, params } = this.buildObservationWhere(q);
+    return {
+      whereSql: whereSql ? `${whereSql} AND value IS NOT NULL` : 'WHERE value IS NOT NULL',
+      params,
+    };
   }
 
   /**

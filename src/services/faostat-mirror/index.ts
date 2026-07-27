@@ -12,9 +12,11 @@ export {
 } from './faostat-mirror.js';
 export { fetchManifest, findDataset, parseFileRows, parseFileSizeBytes } from './manifest.js';
 export type {
+  AreaAggregateRow,
   AreaKind,
   DimensionKind,
   ManifestDataset,
   ObservationRow,
   ResolvedCode,
+  YearAggregateRow,
 } from './types.js';

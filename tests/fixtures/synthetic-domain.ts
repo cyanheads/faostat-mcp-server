@@ -193,6 +193,63 @@ export function buildMidSizeDomainZip(opts: {
   };
 }
 
+/**
+ * One fully-specified observation for {@link buildExplicitDomainZip}. Unlike the
+ * cartesian builders above, every field is given, so a fixture can express the
+ * shapes aggregation logic turns on: the same country under several items, items
+ * whose series end in different years, and mixed units.
+ */
+export interface ExplicitObservation {
+  area: string;
+  areaCode: number;
+  element: string;
+  elementCode: number;
+  flag?: string;
+  item: string;
+  itemCode: number;
+  unit?: string;
+  value: number;
+  year: number;
+}
+
+/**
+ * Build a synthetic domain ZIP from explicit observations. The area, item, and
+ * element code lists are derived from the rows, so a caller only declares the
+ * observations it cares about.
+ */
+export function buildExplicitDomainZip(
+  observations: ExplicitObservation[],
+  domain = FIXTURE_DOMAIN,
+): Uint8Array {
+  const base = `Production_Crops_Livestock_${domain}`;
+  const dataRows = observations.map(
+    (o) =>
+      `${o.areaCode},'${String(o.areaCode).padStart(3, '0')},${o.area},${o.itemCode},${o.item},${o.elementCode},${o.element},${o.year},${o.year},${o.unit ?? 't'},${o.value.toFixed(6)},${o.flag ?? 'A'},Synth`,
+  );
+
+  const areas = new Map(observations.map((o) => [o.areaCode, o.area]));
+  const items = new Map(observations.map((o) => [o.itemCode, o.item]));
+  const elements = new Map(observations.map((o) => [o.elementCode, o.element]));
+
+  const files: Zippable = {
+    [`${base}_E_All_Data_(Normalized).csv`]: strToU8([DATA_HEADER, ...dataRows].join('\n')),
+    [`${base}_E_AreaCodes.csv`]: strToU8(
+      [
+        'Area Code,M49 Code,Area',
+        ...[...areas].map(([code, name]) => `${code},'${String(code).padStart(3, '0')},${name}`),
+      ].join('\n'),
+    ),
+    [`${base}_E_ItemCodes.csv`]: strToU8(
+      buildItemCodesCsv([...items].map(([code, name]) => ({ code, name }))),
+    ),
+    [`${base}_E_Elements.csv`]: strToU8(
+      buildElementsCsv([...elements].map(([code, name]) => ({ code, name }))),
+    ),
+    [`${base}_E_Flags.csv`]: strToU8(FLAGS_CSV),
+  };
+  return zipSync(files);
+}
+
 /** A manifest dataset entry pointing at the fixture ZIP. */
 export function fixtureDataset(domain = FIXTURE_DOMAIN): ManifestDataset {
   return {
