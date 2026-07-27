@@ -4,7 +4,9 @@
  * `DimensionsStore`. Lazily constructs a domain's `Mirror` from the manifest on
  * first access. Exposes the read helpers the tools query: observation lookup
  * with code/year filters and aggregate exclusion, per-domain readiness/status,
- * and code resolution. The init/refresh runners drive the bulk-ZIP ingesters.
+ * and code resolution. Owns each cube's query-planner statistics (built on first
+ * use, refreshed after a sync applies rows). The init/refresh runners drive the
+ * bulk-ZIP ingesters.
  * @module services/faostat-mirror/faostat-mirror
  */
 
@@ -13,6 +15,7 @@ import {
   defineMirror,
   type Mirror,
   type MirrorLogger,
+  type SqliteHandle,
   type SyncGenerator,
   type SyncMode,
   type SyncProgress,
@@ -52,6 +55,11 @@ const CUBE_COLUMNS: Record<string, string> = {
 /** SQLite filename for a domain mirror table. */
 function domainDbFile(code: string): string {
   return `domain-${code.toUpperCase()}.db`;
+}
+
+/** Cube table name for a domain — the single derivation every SQL path shares. */
+function cubeTable(code: string): string {
+  return `obs_${code.toUpperCase()}`;
 }
 
 /**
@@ -105,6 +113,13 @@ export class FaostatMirror {
    * `sync`) while letting one `Mirror` instance own both the read and sync paths.
    */
   private readonly ingesters = new Map<string, SyncGenerator | undefined>();
+  /**
+   * Domains whose query-planner statistics have been checked (and built when
+   * missing) in this process — see {@link ensureQueryStatistics}. Marked on the
+   * first attempt whether or not it succeeded, so a failure costs one try, not
+   * one per query.
+   */
+  private readonly analyzed = new Set<string>();
   private readonly log: MirrorLogger | undefined;
   private readonly dir: string;
   readonly domains: string[];
@@ -134,7 +149,7 @@ export class FaostatMirror {
       name: `faostat-${upper}`,
       store: sqliteMirrorStore({
         path: join(this.dir, domainDbFile(upper)),
-        table: `obs_${upper}`,
+        table: cubeTable(upper),
         primaryKey: 'id',
         columns: CUBE_COLUMNS,
         indexes: [
@@ -184,6 +199,98 @@ export class FaostatMirror {
   }
 
   /**
+   * Open a selected domain's SQLite handle and resolve its cube table name, with
+   * query-planner statistics ensured first. Every raw-SQL read path goes through
+   * here, so no path can query a domain whose planner is flying blind.
+   * Undefined when the domain is not selected.
+   */
+  private async openDomain(
+    code: string,
+  ): Promise<{ handle: SqliteHandle; table: string } | undefined> {
+    const upper = code.toUpperCase();
+    const mirror = this.mirrors.get(upper);
+    if (!mirror) return;
+    const handle = await mirror.raw();
+    const table = cubeTable(upper);
+    this.ensureQueryStatistics(upper, handle, table);
+    return { handle, table };
+  }
+
+  /**
+   * Build SQLite's cardinality statistics (`sqlite_stat1`) for a domain table on
+   * first use, once per process. Without them the cost-based optimizer cannot
+   * compare the composite indexes and falls back to a poor default — measured on
+   * the real mirror, it seeks `(element_code, year)` for an item+element filter
+   * and scans that entire element slice, so an aggregate over 5 items of one
+   * commodity takes ~5s on TCL and ~6s on QCL instead of ~60ms and ~5ms. ANALYZE
+   * is what makes the composite indexes declared above actually get chosen (#3).
+   *
+   * The `sqlite_stat1` probe is the guard: statistics persist inside the `.db`
+   * file, so an already-analyzed mirror (the steady state, since every sync
+   * re-analyzes) pays one sub-millisecond lookup per domain per process, and an
+   * inherited mirror that has never been analyzed is caught here without a
+   * re-sync. The build itself is not free — a full ANALYZE measured a few seconds
+   * on QCL (4.2M rows) and ~49s on TCL (17.1M) — so it is deliberately lazy: the
+   * cost lands on the first query against that domain, never on startup, where
+   * blocking the process before it can serve /healthz would be worse. A sampled ANALYZE
+   * (`PRAGMA analysis_limit`) was measured and rejected: at every limit tried it
+   * produced uniform per-key estimates that left the wrong index selected.
+   *
+   * Statistics are an optimization, so a failure (read-only volume, a writer
+   * holding the lock past `busy_timeout`) degrades to the old plan rather than
+   * failing the caller's query.
+   */
+  private ensureQueryStatistics(code: string, handle: SqliteHandle, table: string): void {
+    if (this.analyzed.has(code)) return;
+    this.analyzed.add(code);
+    if (this.hasStatistics(handle, table)) return;
+    this.analyze(handle, table);
+  }
+
+  /** True when `sqlite_stat1` exists and carries a row for `table`. */
+  private hasStatistics(handle: SqliteHandle, table: string): boolean {
+    const statTable = handle
+      .prepare(`SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'`)
+      .get();
+    if (!statTable) return false;
+    const stat = handle
+      .prepare(`SELECT 1 AS ok FROM sqlite_stat1 WHERE tbl = ? LIMIT 1`)
+      .get(table);
+    return stat !== undefined;
+  }
+
+  /**
+   * Re-run ANALYZE after a sync applied rows. A sync rewrites a domain wholesale
+   * (a FAOSTAT domain ZIP is one atomic unit), so the statistics computed against
+   * the previous vintage describe a table that no longer exists — stale stats can
+   * mislead the planner as badly as absent ones. Syncs already run for minutes
+   * out-of-band, so the ANALYZE pass is noise inside them; a refresh that applied
+   * nothing skips it, so the nightly no-op refresh stays a no-op.
+   */
+  private async refreshQueryStatistics(code: string): Promise<void> {
+    const mirror = this.mirrors.get(code);
+    if (!mirror) return;
+    this.analyzed.add(code);
+    this.analyze(await mirror.raw(), cubeTable(code));
+  }
+
+  /** ANALYZE one cube table, timed and logged. Never throws — see {@link ensureQueryStatistics}. */
+  private analyze(handle: SqliteHandle, table: string): void {
+    const start = Date.now();
+    try {
+      handle.exec(`ANALYZE ${table}`);
+      this.log?.info?.(`Query-planner statistics updated for ${table}`, {
+        durationMs: Date.now() - start,
+      });
+    } catch (err) {
+      this.log?.warning?.(
+        `Could not ANALYZE ${table} — queries fall back to the planner's uninformed index choice`,
+        { error: err instanceof Error ? err.message : String(err) },
+      );
+    }
+  }
+
+  /**
    * Query observations from a domain's mirror with structured filters, year
    * range, and aggregate exclusion. Rather than a per-call unbounded `COUNT(*)`,
    * it fetches one row past `limit` — an overflow probe — so the caller can decide
@@ -198,10 +305,9 @@ export class FaostatMirror {
     code: string,
     q: ObservationQuery,
   ): Promise<{ rows: ObservationRow[]; total: number; totalIsExact: boolean }> {
-    const mirror = this.getMirror(code);
-    if (!mirror) return { rows: [], total: 0, totalIsExact: true };
-    const handle = await mirror.raw();
-    const table = `obs_${code.toUpperCase()}`;
+    const opened = await this.openDomain(code);
+    if (!opened) return { rows: [], total: 0, totalIsExact: true };
+    const { handle, table } = opened;
     const { whereSql, params } = this.buildObservationWhere(q);
     // Fetch limit+1 to detect "more rows matched than were returned" without a
     // COUNT(*). `ORDER BY year` is backed by the composite / `year` indexes, so the
@@ -278,10 +384,9 @@ export class FaostatMirror {
     q: Omit<ObservationQuery, 'limit' | 'offset'>,
     limit: number,
   ): AsyncGenerator<Record<string, unknown>> {
-    const mirror = this.getMirror(code);
-    if (!mirror) return;
-    const handle = await mirror.raw();
-    const table = `obs_${code.toUpperCase()}`;
+    const opened = await this.openDomain(code);
+    if (!opened) return;
+    const { handle, table } = opened;
     const { whereSql, params } = this.buildObservationWhere(q);
     const rows = handle
       .prepare<Record<string, unknown>>(
@@ -310,10 +415,9 @@ export class FaostatMirror {
     q: Omit<ObservationQuery, 'limit' | 'offset'>,
     topN: number,
   ): Promise<AreaAggregateRow[]> {
-    const mirror = this.getMirror(code);
-    if (!mirror) return [];
-    const handle = await mirror.raw();
-    const table = `obs_${code.toUpperCase()}`;
+    const opened = await this.openDomain(code);
+    if (!opened) return [];
+    const { handle, table } = opened;
     const { whereSql, params } = this.buildValuedWhere(q);
     /*
      * `latest` resolves each (area, unit) group's own newest year; the join then
@@ -361,10 +465,9 @@ export class FaostatMirror {
     code: string,
     q: Omit<ObservationQuery, 'limit' | 'offset'>,
   ): Promise<YearAggregateRow[]> {
-    const mirror = this.getMirror(code);
-    if (!mirror) return [];
-    const handle = await mirror.raw();
-    const table = `obs_${code.toUpperCase()}`;
+    const opened = await this.openDomain(code);
+    if (!opened) return [];
+    const { handle, table } = opened;
     const { whereSql, params } = this.buildValuedWhere(q);
     const rows = handle
       .prepare<{
@@ -435,10 +538,9 @@ export class FaostatMirror {
     domain: string,
     dimension: Exclude<DimensionKind, 'area'>,
   ): Promise<number[]> {
-    const mirror = this.getMirror(domain);
-    if (!mirror) return [];
-    const handle = await mirror.raw();
-    const table = `obs_${domain.toUpperCase()}`;
+    const opened = await this.openDomain(domain);
+    if (!opened) return [];
+    const { handle, table } = opened;
     const column = dimension === 'item' ? 'item_code' : 'element_code';
     return handle
       .prepare<{ code: number }>(`SELECT DISTINCT ${column} AS code FROM ${table}`)
@@ -476,11 +578,15 @@ export class FaostatMirror {
       }),
     );
     try {
-      return await mirror.runSync({
+      const result = await mirror.runSync({
         mode,
         signal: args.signal,
         ...(args.onProgress ? { onProgress: args.onProgress } : {}),
       });
+      if (result.recordsApplied > 0 || result.tombstonesApplied > 0) {
+        await this.refreshQueryStatistics(upper);
+      }
+      return result;
     } finally {
       this.ingesters.delete(upper);
     }

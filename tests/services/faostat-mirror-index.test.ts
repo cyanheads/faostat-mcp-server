@@ -5,13 +5,20 @@
  * full materialize-and-sort — confirmed via `EXPLAIN QUERY PLAN` (no "USE TEMP
  * B-TREE FOR ORDER BY"), and (b) a broad query stays bounded and correct through
  * the LIMIT-probe path that replaced the per-call `COUNT(*)`.
+ *
+ * Declaring those indexes is not enough on its own: without `sqlite_stat1` the
+ * cost-based optimizer cannot compare them and picks the less selective one for
+ * the item+element filter shape the aggregation paths use — measured on the real
+ * mirror as seconds per query instead of milliseconds. The second suite here
+ * covers the statistics lifecycle that fixes it: built on first read, refreshed
+ * when a sync applies rows, skipped when a refresh applies none.
  * @module tests/services/faostat-mirror-index
  */
 
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FaostatMirror } from '@/services/faostat-mirror/faostat-mirror.js';
 import {
   buildMidSizeDomainZip,
@@ -148,4 +155,125 @@ describe('FaostatMirror index + overflow probe (#3)', () => {
     expect(res.total).toBe(YEARS);
     expect(res.rows).toHaveLength(YEARS);
   });
+});
+
+describe('FaostatMirror query-planner statistics (#3)', () => {
+  const TABLE = `obs_${FIXTURE_DOMAIN}`;
+  let dir: string;
+  let mirror: FaostatMirror;
+
+  /** Open a mirror on `dir` and sync the fixture domain into it. */
+  async function syncInto(target: FaostatMirror): Promise<void> {
+    await target.runDomainSync(FIXTURE_DOMAIN, 'init', {
+      signal: new AbortController().signal,
+      dataset: fixtureDataset(),
+    });
+  }
+
+  /** The `sqlite_stat1` rows SQLite holds for the cube table — empty when never analyzed. */
+  async function statRows(target: FaostatMirror): Promise<{ idx: string | null; stat: string }[]> {
+    const m = target.getMirror(FIXTURE_DOMAIN);
+    if (!m) throw new Error('mirror not found');
+    const handle = await m.raw();
+    const present = handle
+      .prepare(`SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'`)
+      .get();
+    if (!present) return [];
+    return handle
+      .prepare<{ idx: string | null; stat: string }>(
+        `SELECT idx, stat FROM sqlite_stat1 WHERE tbl = ?`,
+      )
+      .all(TABLE);
+  }
+
+  /**
+   * Drop the statistics table outright — the state of a mirror synced before any
+   * ANALYZE existed. (Dropping rather than emptying it: that is what an inherited
+   * `.db` actually looks like, and it is the state the guard reads.)
+   */
+  async function clearStatistics(target: FaostatMirror): Promise<void> {
+    const m = target.getMirror(FIXTURE_DOMAIN);
+    if (!m) throw new Error('mirror not found');
+    const handle = await m.raw();
+    const present = handle
+      .prepare(`SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'`)
+      .get();
+    if (present) handle.exec('DROP TABLE sqlite_stat1');
+  }
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'faostat-stats-'));
+    const { zip } = buildMidSizeDomainZip({ countryCount: 60, aggregateCount: 4, years: 2 });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => chunkedResponse(zip, 1 << 16)),
+    );
+    mirror = new FaostatMirror({ dir, domains: [FIXTURE_DOMAIN] });
+    await syncInto(mirror);
+  }, 30_000);
+
+  afterEach(async () => {
+    await mirror.close();
+    vi.unstubAllGlobals();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('records statistics for the cube table once a sync has applied rows', async () => {
+    const rows = await statRows(mirror);
+    expect(rows.length).toBeGreaterThan(0);
+    // The composite index whose selection the planner gets wrong without stats.
+    expect(rows.map((r) => r.idx)).toContain(`${TABLE}_item_code_element_code_year_idx`);
+    // Every stat string opens with the table's row count — the cardinality the
+    // optimizer lacked (60 countries + 4 aggregates, 2 years each).
+    for (const row of rows) expect(row.stat.split(' ')[0]).toBe('128');
+  });
+
+  it('builds statistics on first read for a mirror inherited without them (no re-sync)', async () => {
+    // An already-synced .db from a deployment that predates this: indexes present,
+    // statistics never computed. Reopening must catch it up from the read path —
+    // a fix that only ran inside sync would leave every such mirror slow forever.
+    await clearStatistics(mirror);
+    expect(await statRows(mirror)).toHaveLength(0);
+    await mirror.close();
+
+    const reopened = new FaostatMirror({ dir, domains: [FIXTURE_DOMAIN] });
+    try {
+      const res = await reopened.queryObservations(FIXTURE_DOMAIN, {
+        itemCodes: [15],
+        elementCodes: [5510],
+        includeAggregates: false,
+        limit: 10,
+        offset: 0,
+      });
+      expect(res.rows.length).toBeGreaterThan(0);
+      expect((await statRows(reopened)).length).toBeGreaterThan(0);
+    } finally {
+      await reopened.close();
+    }
+    // Keep afterEach's close() valid — the outer mirror is already closed.
+    mirror = reopened;
+  });
+
+  it('re-analyzes when a refresh applies rows and skips the pass when it applies none', async () => {
+    await clearStatistics(mirror);
+    expect(await statRows(mirror)).toHaveLength(0);
+
+    // Unchanged upstream: the ingester short-circuits on the checkpoint, so there
+    // is nothing to re-analyze and the scheduled no-op refresh must not pay for one.
+    const unchanged = await mirror.runDomainSync(FIXTURE_DOMAIN, 'refresh', {
+      signal: new AbortController().signal,
+      dataset: fixtureDataset(),
+    });
+    expect(unchanged.recordsApplied).toBe(0);
+    expect(await statRows(mirror)).toHaveLength(0);
+
+    // A rebuilt domain replaces the rows the old statistics described, so they are
+    // recomputed rather than left describing a vintage that no longer exists.
+    const rebuilt = await mirror.runDomainSync(FIXTURE_DOMAIN, 'refresh', {
+      signal: new AbortController().signal,
+      dataset: { ...fixtureDataset(), DateUpdate: '2026-06-01T00:00:00' },
+    });
+    expect(rebuilt.recordsApplied).toBeGreaterThan(0);
+    expect((await statRows(mirror)).length).toBeGreaterThan(0);
+  }, 30_000);
 });
