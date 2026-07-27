@@ -26,6 +26,7 @@ import { getCanvas } from './canvas-accessor.js';
 export interface StagedTableMeta {
   /** Canvas that holds this table — scopes describe listings to the right canvas. */
   canvasId: string;
+  /** Schema DuckDB resolved for the table, read back from the canvas at stage time. */
   columnSchema: ColumnSchema[];
   createdAt: string;
   expiresAt: string;
@@ -131,6 +132,17 @@ export async function stageObservations<T extends Record<string, unknown>>(
     const now = Date.now();
     const expiresAt = new Date(now + TABLE_TTL_MS).toISOString();
     if (result.spilled) {
+      // The spill handle carries column NAMES only — the types DuckDB resolved
+      // (BIGINT for the integer codes/year, DOUBLE for value, VARCHAR for text)
+      // are only readable from the catalog. Read them back once here, at stage
+      // time, so the persisted metadata dataframe_describe serves is the contract
+      // SQL callers must actually match rather than a synthesized VARCHAR each.
+      const [tableInfo] = await instance.describe({ tableName: result.handle.tableName });
+      if (!tableInfo) {
+        throw new Error(
+          `Staged table "${result.handle.tableName}" is absent from canvas ${instance.canvasId}.`,
+        );
+      }
       const meta: StagedTableMeta = {
         canvasId: instance.canvasId,
         tableName: result.handle.tableName,
@@ -146,7 +158,7 @@ export async function stageObservations<T extends Record<string, unknown>>(
         expiresAt,
         rowCount: result.handle.rowCount,
         truncated: result.truncated,
-        columnSchema: result.handle.columns.map((name) => ({ name, type: 'VARCHAR' as const })),
+        columnSchema: tableInfo.columns,
       };
       await ctx.state.set(`${META_PREFIX}${result.handle.tableName}`, meta);
       return {
