@@ -67,7 +67,7 @@ COPY --from=build /usr/src/app/node_modules ./node_modules
 # with: docker build --build-arg OTEL_ENABLED=true
 ARG OTEL_ENABLED=true
 RUN if [ "$OTEL_ENABLED" = "true" ]; then \
-      bun add @hono/otel \
+      bun add --omit=dev --ignore-scripts @hono/otel \
         @opentelemetry/instrumentation-http \
         @opentelemetry/exporter-metrics-otlp-http \
         @opentelemetry/exporter-trace-otlp-http \
