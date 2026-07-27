@@ -43,7 +43,7 @@ export const queryObservationsTool = tool('faostat_query_observations', {
     totalCount: z
       .number()
       .describe(
-        'Observations matched. Exact when the result was returned inline or fully staged; when the match set exceeded the 50,000-row staging cap this is that cap — a floor, not the exact count (truncated is then true).',
+        'Observations matched. Exact when the result was returned inline or fully staged. A floor — more matched — in two cases, both named by the notice: the match exceeded the 50,000-row staging cap (truncated is then true), or staging failed and the response fell back to an inline page.',
       ),
     notice: z
       .string()
@@ -116,7 +116,9 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       .min(1)
       .max(1000)
       .default(200)
-      .describe('Max observations returned inline when the result does not spill. Max 1000.'),
+      .describe(
+        'Max observations returned inline — also the preview size when the result stages to a canvas table. Rows past it are never dropped silently: a match larger than limit stages in full to a DataCanvas table (canvas_id + table_name), and when no table is staged the notice reports how many matched so you can raise limit or narrow the filters. Max 1000.',
+      ),
     canvas_id: z
       .string()
       .optional()
@@ -273,6 +275,11 @@ export const queryObservationsTool = tool('faostat_query_observations', {
         mirror.streamObservations(code, filters, STAGE_MAX_ROWS + 1),
         {
           sourceTool: 'faostat_query_observations',
+          // Spill on the caller's inline budget as well as the char budget, so a
+          // result that drains under the char budget but exceeds `limit` still
+          // lands on a table instead of forcing a choice between ignoring `limit`
+          // and dropping rows with no recovery path (#14, without regressing #1).
+          previewLimit: input.limit,
           queryParams: {
             domain: code,
             area_codes: input.area_codes,
@@ -287,11 +294,13 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       );
       if (staged) {
         // `previewRows` holds the preview slice when spilled, or — when the stream
-        // drained under the char budget — the COMPLETE set (the spill helper only
-        // stops short on an overflow row). Either way it's the rows to inline:
-        // returning the not-spilled full set here is what closes the 51–~600-row
-        // dead band where re-capping at `limit` silently dropped rows.
-        const observations = (staged.previewRows as unknown as ObservationRow[]).map(toObservation);
+        // drained under both budgets — the COMPLETE set. Capping at `limit` is safe
+        // on either branch: staging spills on the row budget too, so a set larger
+        // than `limit` is on the canvas table in full. That honors `limit` (#14)
+        // without reopening the dead band where capping dropped rows (#1).
+        const observations = (staged.previewRows as unknown as ObservationRow[])
+          .slice(0, input.limit)
+          .map(toObservation);
         // The stream yields the exact match count when it drains under the staging
         // cap, so staged.rowCount is the exact total when !truncated (and the exact
         // size of an inline-fit set), or the cap (a floor) when truncated.
@@ -303,7 +312,7 @@ export const queryObservationsTool = tool('faostat_query_observations', {
             );
           } else {
             ctx.enrich.notice(
-              `Result of ${staged.rowCount} observations staged on canvas table ${staged.tableName}. Use faostat_dataframe_query (canvas_id ${staged.canvasId}) for GROUP BY, ranking, and time-series analysis over the full set.`,
+              `Result of ${staged.rowCount} observations staged on canvas table ${staged.tableName}; the first ${observations.length} are shown inline. Use faostat_dataframe_query (canvas_id ${staged.canvasId}) for GROUP BY, ranking, and time-series analysis over the full set.`,
             );
           }
           return {
@@ -328,9 +337,14 @@ export const queryObservationsTool = tool('faostat_query_observations', {
     // or a spill attempt fell back to the inline page. Show up to input.limit rows.
     const inline = rows.slice(0, input.limit);
     ctx.enrich.total(total);
-    if (total > inline.length) {
+    // `!totalIsExact` is its own trigger, not a refinement of the row comparison:
+    // the probe fetches max(limit, 50) rows, so an overflowing probe with a limit
+    // at or above the inline budget leaves total === inline.length while the real
+    // match is larger. Without this the canvas-failure fallback returns a capped
+    // page reporting itself as the whole exact result — a silent drop.
+    if (!totalIsExact || total > inline.length) {
       ctx.enrich.notice(
-        `Showing ${inline.length} of ${totalIsExact ? total : `more than ${total}`} observations (inline page). Raise limit (max 1000) to return more rows, or narrow the filters.`,
+        `Showing ${inline.length} of ${totalIsExact ? total : `more than ${total}`} observations (inline page)${shouldSpill ? ' — staging the full set to a canvas table failed, so the rows past this page are not on a table' : ''}. Raise limit (max 1000) to return more rows, or narrow the filters.`,
       );
     }
     return {
@@ -352,7 +366,9 @@ export const queryObservationsTool = tool('faostat_query_observations', {
         `Full result spilled to canvas table **${result.table_name}** (canvas_id ${result.canvas_id}). Preview below — query the table for the complete set.\n`,
       );
     } else {
-      lines.push('_Full result returned inline (not spilled to a canvas table)._\n');
+      // Not "the full result": the inline page is capped at `limit`, and a failed
+      // canvas op also lands here. The enrichment notice carries the exact total.
+      lines.push('_Returned inline — no canvas table was staged for this result._\n');
     }
     lines.push(`**${result.observations.length} observation(s)** in ${result.domain}\n`);
     if (result.observations.length === 0) {

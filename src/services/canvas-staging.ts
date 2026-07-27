@@ -14,7 +14,9 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import {
   type CanvasInstance,
   type ColumnSchema,
+  inferSchemaFromRows,
   type QueryResult,
+  type RegisterTableResult,
   SQL_GATE_REASONS,
   spillover,
 } from '@cyanheads/mcp-ts-core/canvas';
@@ -97,6 +99,12 @@ async function acquireShared(ctx: Context): Promise<CanvasInstance> {
  * the stream overflows the preview budget, registers the full set under a fresh
  * `faostat_<id>` table with a 2h TTL + provenance. Returns a degraded
  * (non-spilled) result if the canvas op fails.
+ *
+ * `previewLimit` adds a row-count spill trigger on top of the character budget:
+ * a stream that drains under the budget but yields more rows than the caller can
+ * show inline is registered too, so the caller can cap its inline page at that
+ * limit without the rows past it becoming unreachable (issue #14). Omit it to
+ * spill on the character budget alone.
  */
 export async function stageObservations<T extends Record<string, unknown>>(
   ctx: Context,
@@ -105,6 +113,7 @@ export async function stageObservations<T extends Record<string, unknown>>(
     sourceTool: string;
     queryParams: Record<string, unknown>;
     canvasId?: string;
+    previewLimit?: number;
     tableName?: string;
     schema?: ColumnSchema[];
   },
@@ -129,23 +138,41 @@ export async function stageObservations<T extends Record<string, unknown>>(
       ...(opts.schema ? { schema: opts.schema } : {}),
     });
 
+    // The character budget alone leaves a band where the stream drains whole yet
+    // still carries more rows than the caller shows inline. Register that buffered
+    // set so the caller's inline cap costs nothing in reachability: every row is on
+    // the table. Bounded by the preview budget, so it is a small in-memory array.
+    let handle: RegisterTableResult | undefined;
+    if (result.spilled) {
+      handle = result.handle;
+    } else if (opts.previewLimit !== undefined && result.previewRows.length > opts.previewLimit) {
+      handle = await instance.registerTable(tableName, result.previewRows, {
+        schema: opts.schema ?? inferSchemaFromRows(result.previewRows),
+        ttlMs: TABLE_TTL_MS,
+        signal: ctx.signal,
+      });
+    }
+
     const now = Date.now();
     const expiresAt = new Date(now + TABLE_TTL_MS).toISOString();
-    if (result.spilled) {
+    if (handle) {
+      // Only the char-budget spill can hit the row cap; the buffered registration
+      // above is bounded by the preview budget, far under it.
+      const truncated = result.spilled ? result.truncated : false;
       // The spill handle carries column NAMES only — the types DuckDB resolved
       // (BIGINT for the integer codes/year, DOUBLE for value, VARCHAR for text)
       // are only readable from the catalog. Read them back once here, at stage
       // time, so the persisted metadata dataframe_describe serves is the contract
       // SQL callers must actually match rather than a synthesized VARCHAR each.
-      const [tableInfo] = await instance.describe({ tableName: result.handle.tableName });
+      const [tableInfo] = await instance.describe({ tableName: handle.tableName });
       if (!tableInfo) {
         throw new Error(
-          `Staged table "${result.handle.tableName}" is absent from canvas ${instance.canvasId}.`,
+          `Staged table "${handle.tableName}" is absent from canvas ${instance.canvasId}.`,
         );
       }
       const meta: StagedTableMeta = {
         canvasId: instance.canvasId,
-        tableName: result.handle.tableName,
+        tableName: handle.tableName,
         sourceTool: opts.sourceTool,
         // Strip undefined-valued keys: structuredContent drops them on JSON
         // serialization while content[] renders them as `key=undefined`, so
@@ -156,19 +183,19 @@ export async function stageObservations<T extends Record<string, unknown>>(
         ),
         createdAt: new Date(now).toISOString(),
         expiresAt,
-        rowCount: result.handle.rowCount,
-        truncated: result.truncated,
+        rowCount: handle.rowCount,
+        truncated,
         columnSchema: tableInfo.columns,
       };
-      await ctx.state.set(`${META_PREFIX}${result.handle.tableName}`, meta);
+      await ctx.state.set(`${META_PREFIX}${handle.tableName}`, meta);
       return {
         canvasId: instance.canvasId,
         isNewCanvas: instance.isNew,
-        tableName: result.handle.tableName,
+        tableName: handle.tableName,
         spilled: true,
         previewRows: result.previewRows,
-        rowCount: result.handle.rowCount,
-        truncated: result.truncated,
+        rowCount: handle.rowCount,
+        truncated,
         expiresAt,
       };
     }

@@ -7,11 +7,19 @@
  * handler re-capped output at `limit` — silently dropping rows and emitting an
  * "enable DataCanvas" notice even though DataCanvas was on.
  *
+ * Closing that band by returning the whole buffered set then left `limit`
+ * unenforced for those same mid-size results (#14). The contract both issues
+ * settle on: the inline page never exceeds `limit`, and a match that outgrows the
+ * page is staged in full to a canvas table — so capping the page never costs
+ * reachability.
+ *
  * These tests run a real domain sync into a temp SQLite mirror and a real DuckDB
- * canvas, then assert the handler returns EVERY matched row inline with a
- * truthful notice (no row loss, no false "enable DataCanvas" advice), and still
- * spills to a canvas table when the result is genuinely large enough to overflow
- * the char budget.
+ * canvas, then assert the inline page honors `limit`, every matched row is
+ * reachable (inline when it fits, on the staged table otherwise), the notice is
+ * truthful (no false "enable DataCanvas" advice), and the char-budget spill path
+ * still works for genuinely large results. The one path where no table can hold
+ * the remainder — a canvas op that fails outright — is covered too: it must
+ * disclose the shortfall rather than pass a capped page off as the whole result.
  * @module tests/tools/query-observations-spillover
  */
 
@@ -114,9 +122,10 @@ describe('faostat_query_observations spillover dead band', () => {
     expect(getEnrichment(ctx).totalCount).toBe(50);
   });
 
-  it('returns ALL rows inline for a mid-size result (no dropped rows, no false canvas notice)', async () => {
-    // 300 countries: well past the default inline page (limit 200) but only ~30k
-    // serialized chars — squarely inside the old dead band.
+  it('returns a mid-size result whole inline when it fits under limit (no dropped rows, no false canvas notice)', async () => {
+    // 300 countries and a limit that covers them: the stream drains under both the
+    // char budget and the caller's inline budget, so every row comes back inline
+    // with no canvas table — the #1 guarantee, stated as the caller's own cap.
     const total = await syncDomain(300, 0);
     expect(total).toBe(300);
 
@@ -131,6 +140,7 @@ describe('faostat_query_observations spillover dead band', () => {
       year_start: 2020,
       year_end: 2020,
       include_aggregates: true,
+      limit: 300,
     });
 
     const result = await queryObservationsTool.handler(input, ctx);
@@ -161,6 +171,128 @@ describe('faostat_query_observations spillover dead band', () => {
     }
   });
 
+  it('caps the inline page at limit and stages the whole mid-size set to a canvas table (#14)', async () => {
+    // Same 300-row mid-size match under the DEFAULT limit (200). The inline page
+    // honors `limit` — but the rows past it are on the canvas table, not dropped,
+    // which is what keeps #1 closed while the input contract is honored.
+    const total = await syncDomain(300, 0);
+    expect(total).toBe(300);
+
+    const ctx = createMockContext({ tenantId: 'spill-cap', errors: queryObservationsTool.errors });
+    const input = queryObservationsTool.input.parse({
+      domain: FIXTURE_DOMAIN,
+      item_codes: [15],
+      element_codes: [5510],
+      year_start: 2020,
+      year_end: 2020,
+      include_aggregates: true,
+    });
+
+    const result = await queryObservationsTool.handler(input, ctx);
+
+    expect(result.observations).toHaveLength(200);
+    expect(result.spilled).toBe(true);
+    expect(result.truncated).toBe(false);
+    expect(result.staged_row_count).toBe(300);
+    expect(getEnrichment(ctx).totalCount).toBe(300);
+
+    // Every matched row — including the 100 past the inline page — is on the table.
+    const instance = await canvas.acquire(result.canvas_id, ctx);
+    const staged = await instance.query(
+      `SELECT COUNT(*) AS n, COUNT(DISTINCT area_code) AS areas, MIN(area_code) AS lo, MAX(area_code) AS hi FROM ${result.table_name}`,
+      { rowLimit: 1, denySystemCatalogs: true },
+    );
+    expect(Number(staged.rows[0]?.n)).toBe(300);
+    expect(Number(staged.rows[0]?.areas)).toBe(300);
+    expect(Number(staged.rows[0]?.lo)).toBe(1);
+    expect(Number(staged.rows[0]?.hi)).toBe(300);
+
+    // The notice points at the table and never advises enabling an already-on canvas.
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toMatch(/staged on canvas table/i);
+    expect(notice).toMatch(/first 200/);
+    expect(notice).not.toMatch(/enable datacanvas/i);
+  });
+
+  it('honors an explicit small limit on a mid-size match, full set still reachable (#14)', async () => {
+    // The issue's repro: 238 matches with limit 1 used to return all 238 inline.
+    const total = await syncDomain(238, 0);
+    expect(total).toBe(238);
+
+    const ctx = createMockContext({
+      tenantId: 'spill-limit-1',
+      errors: queryObservationsTool.errors,
+    });
+    const input = queryObservationsTool.input.parse({
+      domain: FIXTURE_DOMAIN,
+      item_codes: [15],
+      element_codes: [5510],
+      year_start: 2020,
+      year_end: 2020,
+      include_aggregates: true,
+      limit: 1,
+    });
+
+    const result = await queryObservationsTool.handler(input, ctx);
+
+    expect(result.observations).toHaveLength(1);
+    expect(result.spilled).toBe(true);
+    expect(result.staged_row_count).toBe(238);
+    expect(getEnrichment(ctx).totalCount).toBe(238);
+
+    const instance = await canvas.acquire(result.canvas_id, ctx);
+    const counted = await instance.query(`SELECT COUNT(*) AS n FROM ${result.table_name}`, {
+      rowLimit: 1,
+      denySystemCatalogs: true,
+    });
+    expect(Number(counted.rows[0]?.n)).toBe(238);
+
+    // content[] twin carries the same one-row page, not a different slice.
+    const text = queryObservationsTool
+      .format(result)
+      .map((c) => (c.type === 'text' ? c.text : ''))
+      .join('\n');
+    expect(text).toMatch(/\*\*1 observation\(s\)\*\*/);
+    expect(text).toMatch(new RegExp(String(result.table_name)));
+  });
+
+  it('discloses the shortfall when staging fails and the response falls back to an inline page', async () => {
+    // An unknown canvas_id makes the staging layer's acquire throw, so it returns
+    // undefined and the handler falls back to the inline page. The probe fetches
+    // max(limit, 50) rows, so at the default limit the page length equals the
+    // reported total — the row comparison alone cannot see the shortfall, and
+    // without the totalIsExact trigger this returned 200 of 300 rows announcing
+    // itself as the whole exact result, with no table holding the rest.
+    const total = await syncDomain(300, 0);
+    expect(total).toBe(300);
+
+    const ctx = createMockContext({
+      tenantId: 'spill-canvas-fail',
+      errors: queryObservationsTool.errors,
+    });
+    const input = queryObservationsTool.input.parse({
+      domain: FIXTURE_DOMAIN,
+      item_codes: [15],
+      element_codes: [5510],
+      year_start: 2020,
+      year_end: 2020,
+      include_aggregates: true,
+      canvas_id: 'no-such-canvas',
+    });
+
+    const result = await queryObservationsTool.handler(input, ctx);
+
+    expect(result.observations).toHaveLength(200);
+    expect(result.spilled).toBe(false);
+    expect(result.table_name).toBeUndefined();
+
+    // The notice names the shortfall as a floor and says no table holds the rest.
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toMatch(/more than 200/);
+    expect(notice).toMatch(/failed/i);
+    expect(notice).toMatch(/raise limit/i);
+  });
+
   it('matches the issue repro shape: mid-size with aggregates included, every row reachable', async () => {
     // 264-row analogue of the issue's RL repro: 228 countries + 36 aggregates.
     const total = await syncDomain(228, 36);
@@ -181,11 +313,18 @@ describe('faostat_query_observations spillover dead band', () => {
 
     const result = await queryObservationsTool.handler(input, ctx);
 
-    expect(result.observations).toHaveLength(264);
-    expect(result.spilled).toBe(false);
-    // The requested aggregate rows (codes >= 5000) are present, not dropped.
-    const aggregates = result.observations.filter((o) => o.area_code >= 5000);
-    expect(aggregates).toHaveLength(36);
+    // Past the default limit, so the set stages; the inline page is the cap.
+    expect(result.observations).toHaveLength(200);
+    expect(result.spilled).toBe(true);
+
+    // The requested aggregate rows (codes >= 5000) are present on the staged
+    // table, not dropped — all 36 of them, whether or not they made the page.
+    const instance = await canvas.acquire(result.canvas_id, ctx);
+    const staged = await instance.query(
+      `SELECT COUNT(*) AS n FROM ${result.table_name} WHERE area_code >= 5000`,
+      { rowLimit: 1, denySystemCatalogs: true },
+    );
+    expect(Number(staged.rows[0]?.n)).toBe(36);
 
     const totalCount = (getEnrichment(ctx).totalCount as number | undefined) ?? 0;
     expect(totalCount).toBe(264);
