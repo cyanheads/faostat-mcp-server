@@ -3,8 +3,15 @@
 #
 # This stage installs all dependencies (including dev), builds the TypeScript
 # source code into JavaScript, and prepares the production assets.
+#
+# Pinned to BUILDPLATFORM, not the target platform. `bun run build` emits
+# platform-independent JavaScript, so this stage has no reason to run under
+# emulation — and under QEMU it does not run at all: Bun's JavaScriptCore
+# aborts with a spurious MemoryExhaustion assertion, so a cross-arch build of
+# this stage fails outright on an arm64 host. Building natively also removes
+# emulation from the slowest stage of a multi-arch build.
 # ==============================================================================
-FROM oven/bun:1.3.14 AS build
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.0 AS build
 
 WORKDIR /usr/src/app
 
@@ -38,7 +45,7 @@ RUN bun run build
 # application. It uses a slim base image and only includes production
 # dependencies and build artifacts.
 # ==============================================================================
-FROM oven/bun:1.3.14-slim AS production
+FROM oven/bun:1.4.0-slim AS production
 
 WORKDIR /usr/src/app
 
@@ -65,9 +72,12 @@ COPY --from=build /usr/src/app/node_modules ./node_modules
 # Conditionally install OpenTelemetry optional peer dependencies (Tier 3).
 # These are not bundled by default to keep the base image lean. Enable at build time
 # with: docker build --build-arg OTEL_ENABLED=true
+# `--omit=peer` is load-bearing: without it this step re-resolves the graph and
+# pulls the framework's optional peer tiers (a test runner, several service SDKs)
+# back into the image.
 ARG OTEL_ENABLED=true
 RUN if [ "$OTEL_ENABLED" = "true" ]; then \
-      bun add --omit=dev --ignore-scripts @hono/otel \
+      bun add --omit=dev --omit=peer --ignore-scripts @hono/otel \
         @opentelemetry/instrumentation-http \
         @opentelemetry/exporter-metrics-otlp-http \
         @opentelemetry/exporter-trace-otlp-http \
