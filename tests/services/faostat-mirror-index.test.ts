@@ -20,6 +20,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { SqliteHandle, SqlValue } from '@cyanheads/mcp-ts-core/mirror';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FaostatMirror } from '@/services/faostat-mirror/faostat-mirror.js';
 import {
@@ -30,11 +31,7 @@ import {
 } from '../fixtures/synthetic-domain.js';
 
 /** Run EXPLAIN QUERY PLAN and flatten the plan into one detail string. */
-function queryPlan(
-  handle: { prepare: <T>(sql: string) => { all: (...p: unknown[]) => T[] } },
-  sql: string,
-  params: unknown[],
-): string {
+function queryPlan(handle: SqliteHandle, sql: string, params: SqlValue[]): string {
   const rows = handle.prepare<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`).all(...params);
   return rows.map((r) => r.detail).join(' | ');
 }

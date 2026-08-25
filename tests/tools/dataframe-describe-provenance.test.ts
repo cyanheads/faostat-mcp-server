@@ -42,6 +42,18 @@ import {
 
 let canvas: DataCanvas;
 
+/**
+ * A mock context carrying both contracts — every test here stages through
+ * `faostat_query_observations` and reads back through
+ * `faostat_dataframe_describe` on one context, since the staging layer resolves
+ * the session canvas from `ctx.state`.
+ */
+const makeCtx = (tenantId: string) =>
+  createMockContext({
+    tenantId,
+    errors: [...(queryObservationsTool.errors ?? []), ...(dataframeDescribeTool.errors ?? [])],
+  });
+
 beforeAll(() => {
   const cfg = parseConfig({ CANVAS_PROVIDER_TYPE: 'duckdb' });
   const built = createCanvasService(cfg);
@@ -87,10 +99,7 @@ describe('faostat_dataframe_describe provenance parity', () => {
     // 1200 country rows overflow the inline budget, so the set spills and its
     // provenance is persisted for dataframe_describe to read back.
     await syncDomain(1200);
-    const ctx = createMockContext({
-      tenantId: 'provenance',
-      errors: queryObservationsTool.errors,
-    });
+    const ctx = makeCtx('provenance');
 
     // ONLY domain — every optional filter (area/item/element codes, year range)
     // is omitted; the handler used to persist them as undefined-valued keys.
@@ -116,8 +125,7 @@ describe('faostat_dataframe_describe provenance parity', () => {
     }
 
     // content[]: the rendered params must match — no `key=undefined` lines.
-    const text = dataframeDescribeTool
-      .format(described)
+    const text = (dataframeDescribeTool.format?.(described) ?? [])
       .map((c) => (c.type === 'text' ? c.text : ''))
       .join('\n');
     expect(text).not.toContain('=undefined');
@@ -126,10 +134,7 @@ describe('faostat_dataframe_describe provenance parity', () => {
 
   it('throws missing_table for a name miss while other tables are active', async () => {
     await syncDomain(1200);
-    const ctx = createMockContext({
-      tenantId: 'name-miss',
-      errors: [...queryObservationsTool.errors, ...dataframeDescribeTool.errors],
-    });
+    const ctx = makeCtx('name-miss');
 
     // Stage a real table so the canvas is NOT empty.
     const staged = await queryObservationsTool.handler(
@@ -152,10 +157,7 @@ describe('faostat_dataframe_describe provenance parity', () => {
 
   it('reports the types DuckDB resolved, not VARCHAR for every column', async () => {
     await syncDomain(1200);
-    const ctx = createMockContext({
-      tenantId: 'column-types',
-      errors: queryObservationsTool.errors,
-    });
+    const ctx = makeCtx('column-types');
 
     const staged = await queryObservationsTool.handler(
       queryObservationsTool.input.parse({ domain: FIXTURE_DOMAIN }),
@@ -194,8 +196,7 @@ describe('faostat_dataframe_describe provenance parity', () => {
     expect(probe.rows[0]).toEqual(byName);
 
     // content[] carries the same resolved types, not a second (stale) rendering.
-    const text = dataframeDescribeTool
-      .format(described)
+    const text = (dataframeDescribeTool.format?.(described) ?? [])
       .map((c) => (c.type === 'text' ? c.text : ''))
       .join('\n');
     for (const [name, type] of Object.entries(byName)) {
@@ -213,10 +214,7 @@ describe('staged column types for a non-integer measure', () => {
   }
 
   it('resolves a fractional measure column to DOUBLE', async () => {
-    const ctx = createMockContext({
-      tenantId: 'double-column',
-      errors: dataframeDescribeTool.errors,
-    });
+    const ctx = makeCtx('double-column');
     const staged = await stageObservations(ctx, fractionalRows(), {
       sourceTool: 'faostat_query_observations',
       queryParams: { domain: FIXTURE_DOMAIN },

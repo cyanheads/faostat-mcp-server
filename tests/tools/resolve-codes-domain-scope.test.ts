@@ -58,7 +58,9 @@ describe('faostat_resolve_codes domain-scoped resolution (#8)', () => {
 
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'faostat-domain-scope-'));
-    const zips: Record<string, Uint8Array> = {
+    // Keyed by the two literal domain codes, not Record<string, …>, so the
+    // lookup below resolves to a Uint8Array rather than a possibly-absent one.
+    const zips = {
       LND: buildDomainZip('LND', LND_VOCAB),
       FRT: buildDomainZip('FRT', FRT_VOCAB),
     };

@@ -155,8 +155,7 @@ describe('faostat_commodity_profile per-country latest year (#5b, #5d)', () => {
     expect(result.trend_points).toBe(5);
 
     // content[]-only clients must see the same year/value pairs, not just a count.
-    const text = commodityProfileTool
-      .format(result)
+    const text = (commodityProfileTool.format?.(result) ?? [])
       .map((c) => (c.type === 'text' ? c.text : ''))
       .join('\n');
     expect(text).toContain('| 2020 | 1,100 | t | 2 | A |');
@@ -202,8 +201,8 @@ describe('faostat_commodity_profile item-resolution disclosure (#5c)', () => {
 
 describe('faostat_commodity_profile empty ranking sections (#5f)', () => {
   it('renders every ranking heading, so empty is distinguishable from not returned', () => {
-    const text = commodityProfileTool
-      .format({
+    const text = (
+      commodityProfileTool.format?.({
         item_query: 'wheat',
         resolved_items: [{ code: 15, name: 'Wheat' }],
         top_producers: [
@@ -223,7 +222,8 @@ describe('faostat_commodity_profile empty ranking sections (#5f)', () => {
         trend_points: 0,
         spilled: false,
         truncated: false,
-      })
+      }) ?? []
+    )
       .map((c) => (c.type === 'text' ? c.text : ''))
       .join('\n');
 

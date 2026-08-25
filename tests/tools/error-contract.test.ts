@@ -33,8 +33,8 @@ import {
 } from '../fixtures/synthetic-domain.js';
 
 /** Reasons declared in each tool's contract — guards against dead-reason regressions. */
-function declaredReasons(errors: readonly { reason: string }[]): string[] {
-  return errors.map((e) => e.reason).sort();
+function declaredReasons(errors: readonly { reason: string }[] | undefined): string[] {
+  return (errors ?? []).map((e) => e.reason).sort();
 }
 
 describe('error-contract conformance', () => {

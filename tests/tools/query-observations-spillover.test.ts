@@ -248,8 +248,7 @@ describe('faostat_query_observations spillover dead band', () => {
     expect(Number(counted.rows[0]?.n)).toBe(238);
 
     // content[] twin carries the same one-row page, not a different slice.
-    const text = queryObservationsTool
-      .format(result)
+    const text = (queryObservationsTool.format?.(result) ?? [])
       .map((c) => (c.type === 'text' ? c.text : ''))
       .join('\n');
     expect(text).toMatch(/\*\*1 observation\(s\)\*\*/);
@@ -411,8 +410,7 @@ describe('faostat_query_observations spillover dead band', () => {
     expect(notice).not.toMatch(/over the full set/i);
 
     // content[] twin agrees — INCOMPLETE, never "the complete set".
-    const text = queryObservationsTool
-      .format(result)
+    const text = (queryObservationsTool.format?.(result) ?? [])
       .map((c) => (c.type === 'text' ? c.text : ''))
       .join('\n');
     expect(text).toMatch(/INCOMPLETE|Partial result/i);

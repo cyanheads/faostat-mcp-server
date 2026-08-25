@@ -75,8 +75,7 @@ describe('faostat_query_observations input validation (#12)', () => {
       expect(notice).toMatch(/empty (array|selection)|matches nothing/i);
 
       // content[] twin agrees: no observations, no false completeness claim.
-      const text = queryObservationsTool
-        .format(result)
+      const text = (queryObservationsTool.format?.(result) ?? [])
         .map((c) => (c.type === 'text' ? c.text : ''))
         .join('\n');
       expect(text).toMatch(/No observations/i);

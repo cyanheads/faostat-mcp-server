@@ -183,8 +183,7 @@ describe('faostat_list_domains bounded retrieval (#16)', () => {
 
   it('renders every paged domain into content[] so both surfaces agree', async () => {
     const { result } = await list({ limit: 3, offset: 0 });
-    const text = listDomainsTool
-      .format(result)
+    const text = (listDomainsTool.format?.(result) ?? [])
       .map((c) => (c.type === 'text' ? c.text : ''))
       .join('\n');
     expect(text).toContain('**3 domain(s):**');

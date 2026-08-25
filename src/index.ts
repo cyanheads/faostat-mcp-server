@@ -7,7 +7,13 @@
  */
 
 import { createApp } from '@cyanheads/mcp-ts-core';
-import { logger, runtimeCaps, schedulerService } from '@cyanheads/mcp-ts-core/utils';
+import type { MirrorLogger } from '@cyanheads/mcp-ts-core/mirror';
+import {
+  logger,
+  requestContextService,
+  runtimeCaps,
+  schedulerService,
+} from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, selectedDomainCodes } from '@/config/server-config.js';
 import { commodityProfileTool } from '@/mcp-server/tools/definitions/commodity-profile.tool.js';
 import { dataframeDescribeTool } from '@/mcp-server/tools/definitions/dataframe-describe.tool.js';
@@ -23,6 +29,26 @@ import { initFaostatMirror } from '@/services/faostat-mirror/index.js';
 // memory-constrained deployment); the analytical tools then degrade to inline-
 // only and refuse to stage large result sets with a clear canvas_disabled error.
 process.env.CANVAS_PROVIDER_TYPE ??= 'duckdb';
+
+/**
+ * Adapts the framework logger to the mirror's duck-typed `MirrorLogger`. Sync
+ * runs outside any request and `RequestContext` is closed, so the per-line
+ * metadata the mirror emits rides in `extra` on a synthetic operation context
+ * rather than as loose top-level keys.
+ */
+const mirrorContext = (meta?: Readonly<Record<string, unknown>>) =>
+  requestContextService.createRequestContext({
+    operation: 'faostatMirrorSync',
+    ...(meta ? { additionalContext: meta } : {}),
+  });
+
+const mirrorLogger: MirrorLogger = {
+  debug: (message, meta) => logger.debug(message, mirrorContext(meta)),
+  info: (message, meta) => logger.info(message, mirrorContext(meta)),
+  notice: (message, meta) => logger.notice(message, mirrorContext(meta)),
+  warning: (message, meta) => logger.warning(message, mirrorContext(meta)),
+  error: (message, meta) => logger.error(message, mirrorContext(meta)),
+};
 
 await createApp({
   name: 'faostat-mcp-server',
@@ -45,7 +71,7 @@ await createApp({
     // runtime neither is constructed; the read tools surface index_not_ready /
     // canvas_disabled rather than crashing.
     setCanvas(core.canvas);
-    initFaostatMirror({ dir: cfg.mirrorPath, domains, log: logger });
+    initFaostatMirror({ dir: cfg.mirrorPath, domains, log: mirrorLogger });
 
     // Incremental refresh runs in-process on HTTP transport only; stdio
     // operators run `bun run mirror:refresh` out-of-band. Initial sync is never

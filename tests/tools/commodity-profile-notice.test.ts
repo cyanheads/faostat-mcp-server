@@ -91,7 +91,7 @@ describe('faostat_commodity_profile notice (canvas on, merged set fits inline)',
     }
 
     // The content[] twin must not tell the caller to enable a canvas that is on.
-    const formatted = commodityProfileTool.format(result);
+    const formatted = commodityProfileTool.format?.(result) ?? [];
     const text = formatted.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
     expect(text).not.toMatch(/CANVAS_PROVIDER_TYPE/i);
     expect(text).not.toMatch(/enable.*duckdb/i);
@@ -115,8 +115,7 @@ describe('faostat_commodity_profile notice (canvas on, merged set fits inline)',
     const notice = getEnrichment(ctx).notice as string;
     expect(notice).toMatch(/fit inline/i);
 
-    const text = commodityProfileTool
-      .format(result)
+    const text = (commodityProfileTool.format?.(result) ?? [])
       .map((c) => (c.type === 'text' ? c.text : ''))
       .join('\n');
     expect(text).toMatch(/fit inline/i);
@@ -291,8 +290,7 @@ describe('faostat_commodity_profile truncation disclosure (production exceeds th
     expect(notice).not.toMatch(/full time-series analysis/i);
 
     // content[] twin agrees — the canvas table is incomplete, never "Full … staged".
-    const text = commodityProfileTool
-      .format(result)
+    const text = (commodityProfileTool.format?.(result) ?? [])
       .map((c) => (c.type === 'text' ? c.text : ''))
       .join('\n');
     expect(text).toMatch(/incomplete/i);

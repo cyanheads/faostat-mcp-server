@@ -29,7 +29,9 @@ function headersOf(init: RequestInit | undefined): Headers {
 
 describe('FAOSTAT bulk fetches carry an identifying User-Agent', () => {
   it('sends a non-empty User-Agent on the manifest fetch', async () => {
-    const fetchSpy = vi.fn(async () => Response.json(fixtureManifestResponse()));
+    const fetchSpy = vi.fn(async (_url: string | URL, _init?: RequestInit) =>
+      Response.json(fixtureManifestResponse()),
+    );
     vi.stubGlobal('fetch', fetchSpy);
     try {
       await fetchManifest('https://bulks-faostat.fao.org/production', new AbortController().signal);
@@ -45,7 +47,9 @@ describe('FAOSTAT bulk fetches carry an identifying User-Agent', () => {
   it('sends a non-empty User-Agent on the domain ZIP download', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'faostat-ua-'));
     const zip = buildDomainZip();
-    const fetchSpy = vi.fn(async () => chunkedResponse(zip, 256));
+    const fetchSpy = vi.fn(async (_url: string | URL, _init?: RequestInit) =>
+      chunkedResponse(zip, 256),
+    );
     vi.stubGlobal('fetch', fetchSpy);
     const mirror = new FaostatMirror({ dir, domains: [FIXTURE_DOMAIN] });
     try {

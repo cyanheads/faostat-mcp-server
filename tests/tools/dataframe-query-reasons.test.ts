@@ -21,7 +21,6 @@
  * @module tests/tools/dataframe-query-reasons
  */
 
-import type { Context } from '@cyanheads/mcp-ts-core';
 import { createCanvasService, type DataCanvas } from '@cyanheads/mcp-ts-core/canvas';
 import { parseConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
@@ -31,6 +30,10 @@ import { dataframeQueryTool } from '@/mcp-server/tools/definitions/dataframe-que
 import { setCanvas } from '@/services/canvas-accessor.js';
 
 let canvas: DataCanvas;
+
+/** A fresh mock context typed against the tool's declared error contract. */
+const makeCtx = (tenantId: string) =>
+  createMockContext({ tenantId, errors: dataframeQueryTool.errors });
 
 /** A handful of synthetic observation rows to register as one canvas table. */
 function* sampleRows(): Generator<Record<string, unknown>> {
@@ -57,11 +60,11 @@ describe('faostat_dataframe_query error-contract reasons', () => {
   // One ctx per test: the tool resolves the shared canvas from `ctx.state`
   // (key `canvas-id`), and the mock state is per-ctx, so staging and querying
   // must run on the same ctx for the handler to find the registered table.
-  let ctx: Context;
+  let ctx: ReturnType<typeof makeCtx>;
   let seq = 0;
 
   beforeEach(async () => {
-    ctx = createMockContext({ tenantId: `df-reasons-${seq++}`, errors: dataframeQueryTool.errors });
+    ctx = makeCtx(`df-reasons-${seq++}`);
     const instance = await canvas.acquire(undefined, ctx);
     await ctx.state.set('canvas-id', instance.canvasId);
     const handle = await instance.registerTable('faostat_test_tbl', sampleRows(), {
@@ -81,7 +84,7 @@ describe('faostat_dataframe_query error-contract reasons', () => {
   };
 
   it('declares the stable contract (invalid_sql, not raw gate reasons)', () => {
-    const reasons = dataframeQueryTool.errors.map((e) => e.reason).sort();
+    const reasons = (dataframeQueryTool.errors ?? []).map((e) => e.reason).sort();
     expect(reasons).toEqual([
       'canvas_disabled',
       'canvas_not_found',
@@ -150,8 +153,7 @@ describe('faostat_dataframe_query error-contract reasons', () => {
     expect(result.rows).toHaveLength(2);
     // The old `rowCount > rows.length` branch never fires on this path: both are 2.
     expect(result.row_count).toBe(result.rows.length);
-    const text = dataframeQueryTool
-      .format(result)
+    const text = (dataframeQueryTool.format?.(result) ?? [])
       .map((c) => (c.type === 'text' ? c.text : ''))
       .join('\n');
     expect(text).toMatch(/cap/i);
