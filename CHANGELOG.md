@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.3](changelog/0.2.x/0.2.3.md) — 2026-08-24
+
+MCP 2026-07-28 support, strict tool inputs, valid error envelopes, explicit stateless serving, and bounded dataframe_describe listings.
+
 ## [0.2.2](changelog/0.2.x/0.2.2.md) — 2026-07-27
 
 Fixes the lazy ANALYZE gate from 0.2.1: a failed attempt is no longer memoized as success, and the dimension-code discovery read no longer pays for statistics it doesn't use (#21, #22).

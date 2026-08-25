@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/faostat-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/faostat-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/faostat-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/faostat-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 [![Install in Claude Desktop](https://img.shields.io/badge/Install_in-Claude_Desktop-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://github.com/cyanheads/faostat-mcp-server/releases/latest/download/faostat-mcp-server.mcpb) [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=faostat-mcp-server&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBjeWFuaGVhZHMvZmFvc3RhdC1tY3Atc2VydmVyIl19) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22faostat-mcp-server%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40cyanheads%2Ffaostat-mcp-server%22%5D%7D)
 
@@ -102,6 +102,7 @@ SQL analytics over the canvas tables (`faostat_xxxxxxxx`) that `faostat_query_ob
 - **Read-only.** Writes, DDL, `DROP`, `COPY`, `PRAGMA`, `ATTACH`, and external-file table functions are rejected by the framework SQL gate. System catalogs (`information_schema`, `sqlite_master`, `duckdb_*`) are denied so a caller can't enumerate staged tables it doesn't hold a handle for — list them via `faostat_dataframe_describe`.
 - Staged-table columns: `area_code`, `area`, `item_code`, `item`, `element_code`, `element`, `year`, `unit`, `value`, `flag`. Keep `flag` in projections and honor it in interpretation.
 - `canvas_id` is optional on both tools — omit it to operate on the tables staged in the current session (the common case).
+- `faostat_dataframe_describe` lists newest-first and pages: pass `name` for one table, or `offset` + `limit` (default 20, max 100) and follow the reported `nextOffset` while `truncated` is true.
 
 All tool output is also rendered as human-readable markdown (`content[]`) alongside the structured payload, so tool-only MCP clients reach the same data.
 
@@ -266,6 +267,7 @@ bun run mirror:verify    # report sync status, local row counts, and sample read
 | `FAOSTAT_REFRESH_CRON` | Cron for the in-process incremental refresh (HTTP transport only). Omit to disable and run `mirror:refresh` out-of-band. | — |
 | `CANVAS_PROVIDER_TYPE` | DataCanvas engine. `duckdb` enables the SQL surface; set `none` to disable analytical staging (the `dataframe_*` tools then report `canvas_disabled` and large queries refuse to spill). | `duckdb` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
+| `MCP_SESSION_MODE` | HTTP session mode: `stateless`, `stateful`, or `auto` (resolves to `stateful`). The Docker image sets `stateless`. | `auto` |
 | `MCP_HTTP_PORT` | Port for the HTTP server. | `3010` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |

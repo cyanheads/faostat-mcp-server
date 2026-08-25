@@ -1,21 +1,21 @@
 # faostat-mcp-server - Directory Structure
 
-Generated on: 2026-07-27 17:52:37
+Generated on: 2026-08-25 05:20:01
 
 ```text
 faostat-mcp-server/
-├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
 │   ├── mcp.json
 │   └── plugin.json
-├── .faostat-mirror/
 ├── .github/
 │   ├── ISSUE_TEMPLATE/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── CODE_OF_CONDUCT.md
+│   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
 │   └── SECURITY.md
 ├── .vscode/
@@ -178,6 +178,7 @@ faostat-mcp-server/
 │       ├── commodity-profile-notice.test.ts
 │       ├── commodity-profile-year-range.test.ts
 │       ├── dataframe-canvas-id-optional.test.ts
+│       ├── dataframe-describe-pagination.test.ts
 │       ├── dataframe-describe-provenance.test.ts
 │       ├── dataframe-query-reasons.test.ts
 │       ├── error-contract.test.ts
