@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.4](changelog/0.2.x/0.2.4.md) — 2026-09-19 · 🛡️ Security
+
+Fixes a markdown-escaping CodeQL finding, validates canvas_id at the schema, declares stateless session mode in code, and bumps mcp-ts-core to ^0.13.6.
+
 ## [0.2.3](changelog/0.2.x/0.2.3.md) — 2026-08-24
 
 MCP 2026-07-28 support, strict tool inputs, valid error envelopes, explicit stateless serving, and bounded dataframe_describe listings.

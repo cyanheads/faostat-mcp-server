@@ -1,6 +1,6 @@
 # faostat-mcp-server - Directory Structure
 
-Generated on: 2026-08-25 05:20:01
+Generated on: 2026-09-19 16:58:49
 
 ```text
 faostat-mcp-server/
@@ -14,6 +14,8 @@ faostat-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── workflows/
+│   │   └── codeql.yml
 │   ├── CODE_OF_CONDUCT.md
 │   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
@@ -27,27 +29,7 @@ faostat-mcp-server/
 │   └── template.md
 ├── docs/
 │   └── design.md
-├── scripts/
-│   ├── _mirror-context.ts
-│   ├── build-changelog.ts
-│   ├── build.ts
-│   ├── check-dependency-specifiers.ts
-│   ├── check-docs-sync.ts
-│   ├── check-framework-antipatterns.ts
-│   ├── check-skill-versions.ts
-│   ├── check-skills-sync.ts
-│   ├── clean-mcpb.ts
-│   ├── clean.ts
-│   ├── devcheck.ts
-│   ├── faostat-mirror-init.ts
-│   ├── faostat-mirror-refresh.ts
-│   ├── faostat-mirror-verify.ts
-│   ├── lint-mcp.ts
-│   ├── lint-packaging.ts
-│   ├── list-skills.ts
-│   ├── release-github.ts
-│   └── tree.ts
-├── skills/
+├── framework-skills/
 │   ├── add-app-tool/
 │   │   └── SKILL.md
 │   ├── add-prompt/
@@ -118,6 +100,8 @@ faostat-mcp-server/
 │   │   └── SKILL.md
 │   ├── release-and-publish/
 │   │   └── SKILL.md
+│   ├── release-pr-review/
+│   │   └── SKILL.md
 │   ├── report-issue-framework/
 │   │   └── SKILL.md
 │   ├── report-issue-local/
@@ -132,6 +116,26 @@ faostat-mcp-server/
 │   │   └── SKILL.md
 │   └── tool-defs-analysis/
 │       └── SKILL.md
+├── scripts/
+│   ├── _mirror-context.ts
+│   ├── build-changelog.ts
+│   ├── build.ts
+│   ├── check-dependency-specifiers.ts
+│   ├── check-docs-sync.ts
+│   ├── check-framework-antipatterns.ts
+│   ├── check-skill-versions.ts
+│   ├── check-skills-sync.ts
+│   ├── clean-mcpb.ts
+│   ├── clean.ts
+│   ├── devcheck.ts
+│   ├── faostat-mirror-init.ts
+│   ├── faostat-mirror-refresh.ts
+│   ├── faostat-mirror-verify.ts
+│   ├── lint-mcp.ts
+│   ├── lint-packaging.ts
+│   ├── list-skills.ts
+│   ├── release-github.ts
+│   └── tree.ts
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -180,6 +184,7 @@ faostat-mcp-server/
 │       ├── dataframe-canvas-id-optional.test.ts
 │       ├── dataframe-describe-pagination.test.ts
 │       ├── dataframe-describe-provenance.test.ts
+│       ├── dataframe-query-format.test.ts
 │       ├── dataframe-query-reasons.test.ts
 │       ├── error-contract.test.ts
 │       ├── list-domains-pagination.test.ts
