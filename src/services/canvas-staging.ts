@@ -14,6 +14,7 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import {
   type CanvasInstance,
   type ColumnSchema,
+  DUCKDB_ERROR_REASONS,
   inferSchemaFromRows,
   type QueryResult,
   type RegisterTableResult,
@@ -289,6 +290,18 @@ const INVALID_SQL_GATE_REASONS = new Set<string>([
 ]);
 
 /**
+ * The DuckDB engine's own caller-side rejections, which the framework classifies as
+ * `ValidationError` with one of these reasons rather than as a gate rejection: SQL the
+ * engine could not parse, a write it refused, and a gated SELECT that prepared cleanly
+ * and then failed on the staged data (a cast a row's value cannot satisfy). All three
+ * are what `faostat_dataframe_query` advertises as `invalid_sql` — "a syntax or
+ * execution error, or not a single read-only SELECT" — so they are folded into the
+ * same remap. Without it they reach the client carrying a `data.reason` the tool's
+ * `errors[]` never declared, which is the failure the gate remap above exists to stop.
+ */
+const DUCKDB_INVALID_SQL_REASONS = new Set<string>(Object.values(DUCKDB_ERROR_REASONS));
+
+/**
  * Run a read-only SELECT against the tenant's shared canvas. System catalogs are
  * denied so a caller can't enumerate every staged handle. Normalizes the SQL
  * gate's rejections to this tool's declared contract: `missing_table` (with
@@ -340,13 +353,22 @@ export async function queryStaged(
       }
       // system_catalog_access is a declared contract reason — let it through as-is.
       if (reason === SQL_GATE_REASONS.systemCatalogAccess) throw err;
-      // Every other gate reason means the SQL is not a valid read-only SELECT.
-      // Remap to the stable contract reason, preserving the gate's message.
-      if (reason !== undefined && INVALID_SQL_GATE_REASONS.has(reason)) {
+      // Every other gate reason, plus the engine's own caller-side rejections, means
+      // the SQL is not a valid read-only SELECT (or failed executing). Remap to the
+      // stable contract reason, preserving the message and — when the framework
+      // synthesized one — its per-reason recovery hint, which is more specific than
+      // the generic fallback (e.g. "wrap the cast in TRY_CAST" for a bad conversion).
+      if (
+        reason !== undefined &&
+        (INVALID_SQL_GATE_REASONS.has(reason) || DUCKDB_INVALID_SQL_REASONS.has(reason))
+      ) {
+        const hint = (data?.recovery as { hint?: string } | undefined)?.hint;
         throw validationError(err.message, {
           reason: 'invalid_sql',
           recovery: {
-            hint: 'Use one read-only SELECT and verify table/column names against faostat_dataframe_describe.',
+            hint:
+              hint ??
+              'Use one read-only SELECT and verify table/column names against faostat_dataframe_describe.',
           },
         });
       }

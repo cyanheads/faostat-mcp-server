@@ -122,6 +122,20 @@ describe('faostat_dataframe_query error-contract reasons', () => {
     });
   });
 
+  // A gated SELECT that prepares cleanly and then fails on the staged data — a cast
+  // no row value can satisfy. The framework classifies it as ValidationError with
+  // data.reason `sql_execution_error`, which this tool never declares, so queryStaged
+  // folds it into the advertised `invalid_sql` and keeps the engine's own recovery hint.
+  it('remaps a DuckDB execution-time data error to invalid_sql', async () => {
+    await expect(run(`SELECT CAST(area AS INTEGER) AS n FROM ${tableName}`)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'invalid_sql',
+        recovery: { hint: expect.stringMatching(/TRY_CAST/i) },
+      },
+    });
+  });
+
   it('keeps system_catalog_access for a denied catalog reference', async () => {
     await expect(run(`SELECT * FROM information_schema.tables`)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
