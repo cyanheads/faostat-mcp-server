@@ -25,16 +25,9 @@
 
 ## Overview
 
-[FAOSTAT](https://www.fao.org/faostat/) is the UN Food and Agriculture Organization's authoritative global statistics service — crop and livestock production, agricultural trade, food balances, food security and nutrition, land use, fertilizer use, and agrifood-systems emissions for 245+ countries and territories from 1961 to the present. Each domain is a data cube of **area** (country/region) × **item** (commodity) × **element** (metric) × **year**, with a data-quality flag on every observation.
+Global food and agriculture statistics from the UN FAOSTAT bulk-download corpus — crop and livestock production, agricultural trade, food balances, food security and nutrition, land use, fertilizer use, and agrifood-systems emissions for 245+ countries and territories from 1961 to the present. Discover a domain, resolve area/item/element codes, then query the cube; large or merged result sets spill to a DataCanvas SQL surface for `GROUP BY`, ranking, and time-series analysis. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
 
-This server does not call the FAOSTAT REST query API — that endpoint is auth-gated (`HTTP 401` keyless). Instead it syncs FAOSTAT's keyless **bulk-download service** (per-domain ZIPs of normalized CSVs plus their dimension code lists) into a persistent local **SQLite mirror** (embedded, with FTS5 over the dimension labels) and serves every query from that mirror — fast, offline-capable, and free of per-request rate limits. Analytical query results spill to a **DataCanvas** (DuckDB-backed) so an agent can run SQL `GROUP BY`, rankings, joins, and time-series analysis over the full result set.
-
-> [!IMPORTANT]
-> **First run requires a mirror build.** The corpus is not bundled. Run `bun run mirror:init` once to download and index the selected FAOSTAT domains before querying. The read tools return `index_not_ready` until the first sync completes. See [Building the mirror](#building-the-mirror).
-
-## Tools
-
-Six tools organized around the mirror's discover → resolve → query flow, with a DataCanvas pair for SQL over large result sets:
+### Tools
 
 | Tool | Description |
 |:---|:---|
@@ -45,90 +38,79 @@ Six tools organized around the mirror's discover → resolve → query flow, wit
 | `faostat_dataframe_query` | Run a read-only SQL `SELECT` against the canvas tables staged by the analytical tools. |
 | `faostat_dataframe_describe` | List the canvas tables staged this session, each with provenance, row count, and column schema. |
 
-### `faostat_list_domains`
+## Capability reference
 
-Discover the catalog and what's queryable right now.
+### `faostat_list_domains` <sub>tool</sub>
 
-- Full FAOSTAT catalog read live from the bulk manifest, annotated with local mirror status
-- Per-domain `indexed` / `index_ready` flags, local row count, and last completed sync
-- `topic` substring filter over code, name, and topic (e.g. `"trade"`, `"emissions"`, `"QCL"`)
-- `indexed_only` to list just the domains queryable from the local mirror
-- `code` for an exact domain lookup (e.g. `"RL"`) — one full record, without a topic search that can match unrelated domains
-- `offset` + `limit` to page the catalog; the response reports `totalMatches`, `truncated`, and the `nextOffset` to resume at. Domain descriptions are long, so a browse call is bounded by default — raise `limit` (max 200) to pull the whole catalog in one response
+- Full FAOSTAT catalog (~69 domains) read live from the bulk manifest, annotated with local mirror status
+- `code` for an exact domain lookup; `topic` substring filter over code/name/topic; `indexed_only` to list only domains queryable from the local mirror
+- `offset` + `limit` (max 200, default 20) page the catalog — response reports `totalMatches`, `truncated`, and `nextOffset`
+- Each entry reports `indexed` / `index_ready` flags, local row count, and last completed sync
 
 ---
 
-### `faostat_resolve_codes`
+### `faostat_resolve_codes` <sub>tool</sub>
 
-Turn names into the integer codes the cube requires — FAOSTAT is unqueryable without code resolution.
-
-- FTS5 full-text matching (`query`, e.g. `"maize"` → item 56), substring filter (`name_contains`), or exact-code lookup (`code`)
-- Resolves within a `dimension`: `area` (countries/regions), `item` (commodities), or `element` (metrics like production, yield, import quantity)
-- Every area match is flagged `country` or `aggregate` (World, continents, economic groupings; codes ≥ 5000) so an agent can avoid summing a region with its member countries
-- Surfaces the CPC crosswalk code for items where available
-- Omit all of `query` / `name_contains` / `code` to list the whole dimension
+- FTS5 full-text `query`, substring `name_contains`, or exact `code` lookup within a `dimension`: `area`, `item`, or `element`
+- Item/element matches are scoped to codes present in the given `domain`'s cube; area codes are shared across domains
+- Every area match is flagged `country` or `aggregate` (codes ≥ 5000, plus curated sub-threshold roll-ups such as China=351)
+- `limit` (max 200, default 50) + `offset` page the match set
+- Typed errors: `unknown_domain`, `index_not_ready`
 
 ---
 
-### `faostat_query_observations`
+### `faostat_query_observations` <sub>tool</sub>
 
-The core data tool — query a domain's cube and get observations with their data-quality flag.
-
-- Filter by `area_codes`, `item_codes`, `element_codes` (resolve them first), and a `year_start` / `year_end` range
-- **Aggregate regions are excluded by default** (`include_aggregates: false`) so a naive `SUM` does not double-count a region with its members — set `include_aggregates: true` for World/continent roll-ups, or pass explicit `area_codes` to query exactly what you name
-- Small result sets return inline; large ones spill to a DataCanvas table (returned `canvas_id` + `table_name`) for SQL aggregation
-- `limit` caps the inline page (default 200, max 1000); a match that outgrows the page is staged to the canvas table in full, and when no table is staged the response reports how many matched — so a low `limit` trims the response without putting rows out of reach
-- Every row carries its flag (`A`=Official, `E`=Estimated, `I`=Imputed, `B`=break, `X`=external) — honor it; never treat estimated/imputed values as official
+- Filters by `area_codes` / `item_codes` / `element_codes` and an inclusive `year_start` / `year_end` range
+- Aggregate regions excluded by default (`include_aggregates: false`); explicit `area_codes` bypass the exclusion
+- `limit` caps the inline page (default 200, max 1000); a match that exceeds it spills in full to a DataCanvas table (50,000-row staging cap) for SQL via `faostat_dataframe_query`
+- Every row carries its data-quality `flag` (`A`/`E`/`I`/`B`/`M`/`T`/`X`, others per domain) — never dropped
+- Typed errors: `domain_not_indexed`, `index_not_ready`, `canvas_disabled`, `invalid_year_range`
 
 ---
 
-### `faostat_commodity_profile`
+### `faostat_commodity_profile` <sub>tool</sub>
 
-A workflow tool that assembles a global profile for one commodity in a single call.
-
-- Accepts a commodity name, resolves it to at most five item codes, then queries the production (`QCL`) and trade (`TCL`) domains and merges the results — the response discloses how many items the name matched in total, so a broad term like `"milk"` never silently narrows
-- Ranks top producers, top exporters, and top importers by a **per-country sum across the resolved items**, each country taken at its own latest year with data and grouped by unit so incomparable quantities are never added — countries only, aggregates excluded
-- Returns the annual production trend inline as year/value points. Rankings and trend are aggregated in SQL over the complete filtered match, so neither is bounded by the canvas staging cap
-- Returns a **partial profile** with a notice naming the gap when a required domain (e.g. trade) is not indexed, rather than failing
-- Rejects a reversed `year_start` / `year_end` range with `invalid_year_range` instead of returning an empty profile
-- The full merged production + trade observation set spills to a DataCanvas table for deeper SQL
+- Resolves `item_query` to up to 5 item codes, then ranks top producers/exporters/importers and returns an annual production trend in one call
+- Rankings are per-country sums grouped by unit, each country at its own latest reporting year; countries only (aggregates excluded)
+- Returns a partial, production-only profile with a notice — rather than failing — when the trade domain (TCL) isn't indexed or still syncing
+- `top_n` caps each ranked list (max 50); the merged observation set spills to a DataCanvas table for further SQL
+- Typed errors: `no_match`, `index_not_ready`, `invalid_year_range`
 
 ---
 
-### `faostat_dataframe_query` / `faostat_dataframe_describe`
+### `faostat_dataframe_query` <sub>tool</sub>
 
-SQL analytics over the canvas tables (`faostat_xxxxxxxx`) that `faostat_query_observations` and `faostat_commodity_profile` stage. Call `faostat_dataframe_describe` first to discover table and column names, then `faostat_dataframe_query` for cross-country and cross-item aggregation, `GROUP BY` rankings, joins, window functions, and CTEs — standard DuckDB SQL.
+- Single-statement read-only `SELECT` over staged `faostat_xxxxxxxx` tables — joins, aggregates, window functions, and CTEs all work
+- Writes, DDL, `DROP`, `COPY`, `PRAGMA`, `ATTACH`, external-file functions, and system catalogs (`information_schema`, `sqlite_master`, `duckdb_*`) are rejected
+- `row_limit` caps the response (default 1000, max 10000); `truncated` means more rows exist, with no exact total computed on this path
+- Typed errors: `canvas_disabled`, `canvas_not_found`, `missing_table`, `system_catalog_access`, `invalid_sql`
 
-- **Read-only.** Writes, DDL, `DROP`, `COPY`, `PRAGMA`, `ATTACH`, and external-file table functions are rejected by the framework SQL gate. System catalogs (`information_schema`, `sqlite_master`, `duckdb_*`) are denied so a caller can't enumerate staged tables it doesn't hold a handle for — list them via `faostat_dataframe_describe`.
-- Staged-table columns: `area_code`, `area`, `item_code`, `item`, `element_code`, `element`, `year`, `unit`, `value`, `flag`. Keep `flag` in projections and honor it in interpretation.
-- `canvas_id` is optional on both tools — omit it to operate on the tables staged in the current session (the common case).
-- `faostat_dataframe_describe` lists newest-first and pages: pass `name` for one table, or `offset` + `limit` (default 20, max 100) and follow the reported `nextOffset` while `truncated` is true.
+---
 
-All tool output is also rendered as human-readable markdown (`content[]`) alongside the structured payload, so tool-only MCP clients reach the same data.
+### `faostat_dataframe_describe` <sub>tool</sub>
+
+- Lists staged tables with source tool, query params, row count, column schema, and creation/expiry (2-hour sliding TTL)
+- `name` describes one table outright; otherwise `offset` + `limit` (max 100, default 20) page the listing newest-first
+- Typed errors: `canvas_disabled`, `canvas_not_found`, `missing_table`
 
 ## Features
 
-Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp-ts-core):
-
-- Declarative tool definitions — single file per tool, framework handles registration and validation
-- Unified error handling — handlers throw, the framework catches, classifies, and formats; typed error contracts give agents actionable recovery hints
-- Pluggable auth: `none`, `jwt`, `oauth`
-- Structured logging with optional OpenTelemetry tracing
-- STDIO and Streamable HTTP transports
+Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
 FAOSTAT-specific:
 
-- **Persistent local SQLite mirror** of the FAOSTAT bulk corpus via the framework `MirrorService` — one indexed table per selected domain plus shared dimension tables, with FTS5 over the dimension labels driving code resolution
-- **Streaming bulk-ZIP ingester** — fetches the manifest, compares each domain's update date against the stored checkpoint to skip unchanged domains, and stream-parses the normalized CSV (∼18× decompression ratio) into SQLite without materializing the full file in memory
-- **Config-driven domain selection** (`FAOSTAT_DOMAINS`) — the indexed set can grow without code changes; `faostat_list_domains` covers the full catalog — paged, and annotated with which domains are locally queryable
-- **DataCanvas SQL surface** (DuckDB) — analytical cube queries spill to a staged table for ad-hoc `GROUP BY` / ranking / time-series analysis
+- Persistent local SQLite mirror of the FAOSTAT bulk corpus via the framework `MirrorService`, with FTS5 over the dimension labels driving code resolution
+- Streaming bulk-ZIP ingester — skips domains whose upstream update date hasn't advanced, and stream-parses the normalized CSV into SQLite without materializing the full file in memory
+- Config-driven domain selection (`FAOSTAT_DOMAINS`) — the indexed set can grow without code changes, and the full catalog stays browsable regardless
+- DataCanvas SQL surface (DuckDB) for `GROUP BY`, ranking, and time-series analysis over spilled result sets
 
 Agent-friendly output:
 
-- **Country-vs-aggregate classification** on every area, plus aggregate exclusion by default — guards against the double-counting hazard of summing World/continent rows with their member countries
-- **Data-quality flags carried through** on every observation (`A`/`E`/`I`/`B`/`X`) — never dropped, so downstream rigor can honor official-vs-estimated distinctions
-- **Graceful partial results** — `faostat_commodity_profile` returns a production-only profile with a notice when trade is not indexed, rather than failing the request
-- **Typed error contracts** — `index_not_ready`, `domain_not_indexed`, `empty_result`, `canvas_disabled`, and `no_match` each carry a concrete recovery hint (run the init script, pick an indexed domain, widen the query, enable the canvas)
+- Country-vs-aggregate classification on every area, with aggregates excluded from sums by default — guards against double-counting World/continent rows with their member countries
+- Data-quality provenance — every observation carries its FAOSTAT flag (`A`/`E`/`I`/`B`/`M`/`T`/`X`, others per domain), never dropped from output
+- Graceful partial results — `faostat_commodity_profile` returns a production-only profile with a notice, rather than failing, when the trade domain isn't indexed
+- Typed error contracts — `index_not_ready`, `domain_not_indexed`, `canvas_disabled`, and others each carry a concrete recovery hint
 
 ## Getting started
 
@@ -255,7 +237,7 @@ bun run mirror:refresh   # re-sync domains whose upstream update date has advanc
 bun run mirror:verify    # report sync status, local row counts, and sample reads
 ```
 
-`mirror:init` is idempotent and resumable per domain — re-running after an interrupt re-streams only the unfinished domain ZIP. `FAOSTAT_DOMAINS` selects which domains are indexed; everything else in the catalog shows in `faostat_list_domains` with `indexed: false` until added and re-synced. On HTTP transport, set `FAOSTAT_REFRESH_CRON` to refresh in-process on a schedule; on stdio, run `mirror:refresh` out-of-band.
+`mirror:init` is idempotent and resumable per domain — re-running after an interrupt re-streams only the unfinished domain ZIP. `FAOSTAT_DOMAINS` selects which domains are indexed; everything else in the catalog shows in `faostat_list_domains` with `indexed: false` until added and re-synced. On HTTP transport, set `FAOSTAT_REFRESH_CRON` to refresh in-process on a schedule; on stdio, run `mirror:refresh` out-of-band. The read tools return `index_not_ready` until the first sync completes.
 
 ## Configuration
 
@@ -267,7 +249,7 @@ bun run mirror:verify    # report sync status, local row counts, and sample read
 | `FAOSTAT_REFRESH_CRON` | Cron for the in-process incremental refresh (HTTP transport only). Omit to disable and run `mirror:refresh` out-of-band. | — |
 | `CANVAS_PROVIDER_TYPE` | DataCanvas engine. `duckdb` enables the SQL surface; set `none` to disable analytical staging (the `dataframe_*` tools then report `canvas_disabled` and large queries refuse to spill). | `duckdb` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
-| `MCP_SESSION_MODE` | HTTP session mode: `stateless`, `stateful`, or `auto` (resolves to `stateful`). The Docker image sets `stateless`. | `auto` |
+| `MCP_SESSION_MODE` | HTTP session mode: `stateless`, `stateful`, or `auto` (resolves to `stateful`). The server declares `stateless` in `src/index.ts` — no tool asks the caller for input mid-handler — and setting this overrides that declaration. | `stateless` |
 | `MCP_HTTP_PORT` | Port for the HTTP server. | `3010` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
@@ -341,7 +323,7 @@ Data is sourced from [FAOSTAT](https://www.fao.org/faostat/), the statistics div
 
 ## Contributing
 
-Issues and pull requests are welcome. Run checks and tests before submitting:
+Issues are welcome. Run checks and tests before submitting:
 
 ```sh
 bun run devcheck
