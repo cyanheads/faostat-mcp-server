@@ -1,13 +1,36 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "faostat-mcp-server",
   "version": "0.2.3",
   "description": "Global food & agriculture statistics from the UN FAOSTAT bulk-download corpus, served from a local SQLite mirror with a DataCanvas SQL surface, over MCP. STDIO & Streamable HTTP.",
   "author": {
-    "name": "cyanheads"
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
   },
   "homepage": "https://github.com/cyanheads/faostat-mcp-server",
   "repository": "https://github.com/cyanheads/faostat-mcp-server",
   "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "faostat",
+    "fao",
+    "agriculture",
+    "food-security",
+    "agricultural-statistics",
+    "crop-production",
+    "agricultural-trade",
+    "food-balances",
+    "duckdb",
+    "sqlite",
+    "dataframe"
+  ],
   "mcpServers": {
     "faostat-mcp-server": {
       "command": "npx",
