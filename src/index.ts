@@ -22,7 +22,7 @@ import { listDomainsTool } from '@/mcp-server/tools/definitions/list-domains.too
 import { queryObservationsTool } from '@/mcp-server/tools/definitions/query-observations.tool.js';
 import { resolveCodesTool } from '@/mcp-server/tools/definitions/resolve-codes.tool.js';
 import { setCanvas } from '@/services/canvas-accessor.js';
-import { initFaostatMirror } from '@/services/faostat-mirror/index.js';
+import { type FaostatMirror, initFaostatMirror } from '@/services/faostat-mirror/index.js';
 
 // DuckDB is the only canvas engine and ships as a direct dependency, so enable
 // the canvas by default. Set CANVAS_PROVIDER_TYPE=none to turn it off (e.g. on a
@@ -50,9 +50,17 @@ const mirrorLogger: MirrorLogger = {
   error: (message, meta) => logger.error(message, mirrorContext(meta)),
 };
 
+/** The mirror constructed in `setup()`, held so `teardown()` can close its SQLite handles. */
+let mirror: FaostatMirror | undefined;
+
 await createApp({
   name: 'faostat-mcp-server',
   title: 'faostat-mcp-server',
+  // Every tool is read-only and non-interactive — no handler calls ctx.requestInput,
+  // so the per-session state a stateful server keeps buys nothing. Declared here
+  // rather than left to a deployment's MCP_SESSION_MODE, which still wins when it
+  // carries a meaningful value. No `require: 'stateful'`: nothing here needs it.
+  sessionMode: 'stateless',
   tools: [
     listDomainsTool,
     resolveCodesTool,
@@ -71,7 +79,7 @@ await createApp({
     // runtime neither is constructed; the read tools surface index_not_ready /
     // canvas_disabled rather than crashing.
     setCanvas(core.canvas);
-    initFaostatMirror({ dir: cfg.mirrorPath, domains, log: mirrorLogger });
+    mirror = initFaostatMirror({ dir: cfg.mirrorPath, domains, log: mirrorLogger });
 
     // Incremental refresh runs in-process on HTTP transport only; stdio
     // operators run `bun run mirror:refresh` out-of-band. Initial sync is never
@@ -83,9 +91,9 @@ await createApp({
           cfg.refreshCron,
           async () => {
             const { getFaostatMirror } = await import('@/services/faostat-mirror/index.js');
-            const mirror = getFaostatMirror();
-            for (const code of mirror.selectedDomains()) {
-              await mirror.runDomainSync(code, 'refresh', {
+            const service = getFaostatMirror();
+            for (const code of service.selectedDomains()) {
+              await service.runDomainSync(code, 'refresh', {
                 signal: AbortSignal.timeout(3_600_000),
               });
             }
@@ -100,5 +108,17 @@ await createApp({
           ),
         );
     }
+  },
+
+  /**
+   * Counterpart to `setup()`. The mirror holds a SQLite handle per selected
+   * domain plus the shared dimension database, opened lazily on the read path
+   * and held until closed — nothing else calls `close()`, so without this the
+   * files stay open until the process dies. The framework already stops the
+   * refresh cron via `schedulerService.destroyAll()`.
+   */
+  async teardown() {
+    await mirror?.close();
+    mirror = undefined;
   },
 });
