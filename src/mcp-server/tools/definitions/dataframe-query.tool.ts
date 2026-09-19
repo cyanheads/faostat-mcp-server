@@ -8,8 +8,37 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { canvasEnabled, queryStaged } from '@/services/canvas-staging.js';
+
+/**
+ * Render one result value as a Markdown table cell.
+ *
+ * Order is load-bearing: backslashes are doubled BEFORE pipes are escaped. Escaping
+ * `|` alone turns a value's own `\` before a pipe into `\\|`, which a renderer reads
+ * as a literal backslash plus an UNESCAPED cell separator — the row splits at a
+ * value-controlled point and every later column shifts. Doubling first keeps the
+ * separator escaped and the original backslash intact. CR and LF become their escape
+ * sequences for the same reason: a raw newline ends the table row outright.
+ *
+ * Values reach here straight from DuckDB, so their content is whatever the queried
+ * rows hold. `structuredContent` carries them unescaped; this is the `content[]` twin.
+ */
+function markdownCell(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  const text =
+    typeof value === 'string'
+      ? value
+      : typeof value === 'object'
+        ? JSON.stringify(value)
+        : String(value);
+  return text
+    .replace(/\\/g, '\\\\')
+    .replace(/\|/g, '\\|')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n');
+}
 
 export const dataframeQueryTool = tool('faostat_dataframe_query', {
   title: 'faostat-mcp-server: dataframe query',
@@ -32,9 +61,13 @@ export const dataframeQueryTool = tool('faostat_dataframe_query', {
       recovery:
         'Set CANVAS_PROVIDER_TYPE=duckdb in the server environment to enable SQL on staged results.',
     },
+    // The four reasons below are raised by the staging layer (queryStaged) and the
+    // framework canvas beneath it, never by a ctx.fail in this handler — marked
+    // thrownBy so error-contract-unthrown scans the handler for canvas_disabled alone.
     {
       reason: 'canvas_not_found',
       code: JsonRpcErrorCode.NotFound,
+      thrownBy: 'service',
       when: 'An explicit canvas_id does not resolve to a live canvas — unknown, expired, or owned by another tenant.',
       recovery:
         'Verify the canvas_id was returned by a prior faostat_query_observations / faostat_commodity_profile call, or omit canvas_id to fall back to the shared session canvas.',
@@ -42,6 +75,7 @@ export const dataframeQueryTool = tool('faostat_dataframe_query', {
     {
       reason: 'missing_table',
       code: JsonRpcErrorCode.NotFound,
+      thrownBy: 'service',
       when: 'The SQL references a faostat_<id> table that has expired or was never staged.',
       recovery:
         'Call faostat_dataframe_describe to list staged tables, or re-run the query that staged the data.',
@@ -49,12 +83,14 @@ export const dataframeQueryTool = tool('faostat_dataframe_query', {
     {
       reason: 'system_catalog_access',
       code: JsonRpcErrorCode.ValidationError,
+      thrownBy: 'service',
       when: 'The SQL references a denied system catalog (information_schema, sqlite_master, duckdb_*).',
       recovery: 'Query only faostat_<id> tables. Use faostat_dataframe_describe to list them.',
     },
     {
       reason: 'invalid_sql',
       code: JsonRpcErrorCode.ValidationError,
+      thrownBy: 'service',
       when: 'The SQL has a syntax or execution error, or is not a single read-only SELECT.',
       recovery:
         'Use one read-only SELECT and verify column/table names against faostat_dataframe_describe.',
@@ -62,12 +98,9 @@ export const dataframeQueryTool = tool('faostat_dataframe_query', {
   ],
 
   input: z.object({
-    canvas_id: z
-      .string()
-      .optional()
-      .describe(
-        'Optional canvas ID from a prior faostat_query_observations / faostat_commodity_profile call. Omit to query the tables staged in this session (the common case).',
-      ),
+    canvas_id: CanvasIdSchema.optional().describe(
+      'Optional canvas ID as returned by a prior faostat_query_observations / faostat_commodity_profile call — exactly 10 characters of letters, digits, hyphens, and underscores. Omit to query the tables staged in this session (the common case).',
+    ),
     sql: z
       .string()
       .min(1)
@@ -149,16 +182,12 @@ export const dataframeQueryTool = tool('faostat_dataframe_query', {
       lines.push('_No rows._');
       return [{ type: 'text', text: lines.join('\n') }];
     }
-    lines.push(`| ${result.columns.join(' | ')} |`);
+    // Column names are the caller's SQL projection — a quoted alias can carry a pipe
+    // or a backslash just as a value can, so the header row is escaped the same way.
+    lines.push(`| ${result.columns.map(markdownCell).join(' | ')} |`);
     lines.push(`| ${result.columns.map(() => '---').join(' | ')} |`);
     for (const row of result.rows) {
-      const cells = result.columns.map((c) => {
-        const v = row[c];
-        if (v === null || v === undefined) return '';
-        if (typeof v === 'string') return v.replace(/\|/g, '\\|');
-        if (typeof v === 'object') return JSON.stringify(v).replace(/\|/g, '\\|');
-        return String(v);
-      });
+      const cells = result.columns.map((c) => markdownCell(row[c]));
       lines.push(`| ${cells.join(' | ')} |`);
     }
     if (result.truncated) {

@@ -9,6 +9,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { canvasEnabled, describeStaged } from '@/services/canvas-staging.js';
 
@@ -52,8 +53,10 @@ export const dataframeDescribeTool = tool('faostat_dataframe_describe', {
         'Set CANVAS_PROVIDER_TYPE=duckdb in the server environment to enable staged tables.',
     },
     {
+      // Raised by the framework canvas inside describeStaged, not by a ctx.fail here.
       reason: 'canvas_not_found',
       code: JsonRpcErrorCode.NotFound,
+      thrownBy: 'service',
       when: 'An explicit canvas_id does not resolve to a live canvas — unknown, expired, or owned by another tenant.',
       recovery:
         'Verify the canvas_id was returned by a prior faostat_query_observations / faostat_commodity_profile call, or omit canvas_id to fall back to the shared session canvas.',
@@ -68,12 +71,9 @@ export const dataframeDescribeTool = tool('faostat_dataframe_describe', {
   ],
 
   input: z.object({
-    canvas_id: z
-      .string()
-      .optional()
-      .describe(
-        'Optional canvas ID from a prior faostat_query_observations / faostat_commodity_profile call. Omit to list the tables staged in this session (the common case).',
-      ),
+    canvas_id: CanvasIdSchema.optional().describe(
+      'Optional canvas ID as returned by a prior faostat_query_observations / faostat_commodity_profile call — exactly 10 characters of letters, digits, hyphens, and underscores. Omit to list the tables staged in this session (the common case).',
+    ),
     name: z
       .string()
       .optional()

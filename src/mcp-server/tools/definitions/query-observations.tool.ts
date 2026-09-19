@@ -9,6 +9,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { canvasEnabled, STAGE_MAX_ROWS, stageObservations } from '@/services/canvas-staging.js';
 import type { ObservationRow } from '@/services/faostat-mirror/index.js';
@@ -119,12 +120,9 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       .describe(
         'Max observations returned inline — also the preview size when the result stages to a canvas table. Rows past it are never dropped silently: a match larger than limit stages in full to a DataCanvas table (canvas_id + table_name), and when no table is staged the notice reports how many matched so you can raise limit or narrow the filters. Max 1000.',
       ),
-    canvas_id: z
-      .string()
-      .optional()
-      .describe(
-        'Canvas ID from a prior call to stage onto. Omit to start a fresh canvas (a new id is returned).',
-      ),
+    canvas_id: CanvasIdSchema.optional().describe(
+      'Canvas ID to stage onto, as returned by a prior faostat_query_observations / faostat_commodity_profile call — exactly 10 characters of letters, digits, hyphens, and underscores. Omit to stage onto this session’s canvas, created on the first spill and reused by every later call, so tables staged earlier in the session sit alongside this one.',
+    ),
   }),
 
   output: z.object({

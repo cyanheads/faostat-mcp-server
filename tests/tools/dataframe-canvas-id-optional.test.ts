@@ -12,13 +12,16 @@
  * @module tests/tools/dataframe-canvas-id-optional
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { createCanvasService, type DataCanvas } from '@cyanheads/mcp-ts-core/canvas';
 import { parseConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { commodityProfileTool } from '@/mcp-server/tools/definitions/commodity-profile.tool.js';
 import { dataframeDescribeTool } from '@/mcp-server/tools/definitions/dataframe-describe.tool.js';
 import { dataframeQueryTool } from '@/mcp-server/tools/definitions/dataframe-query.tool.js';
+import { queryObservationsTool } from '@/mcp-server/tools/definitions/query-observations.tool.js';
 import { setCanvas } from '@/services/canvas-accessor.js';
 import { stageObservations } from '@/services/canvas-staging.js';
 
@@ -49,6 +52,57 @@ describe('faostat_dataframe_query input', () => {
 
   it('still requires sql', () => {
     expect(() => dataframeQueryTool.input.parse({ canvas_id: 'abc1234567' })).toThrow();
+  });
+});
+
+/**
+ * Every tool taking a `canvas_id` *input* declares it with `CanvasIdSchema`, so the
+ * minted `^[A-Za-z0-9_-]{10}$` shape is advertised in `inputSchema` and an impossible
+ * token is rejected at argument validation instead of reaching the handler and
+ * surfacing as a canvas miss. Output `canvas_id` fields stay plain strings — they
+ * echo a value the server minted.
+ */
+describe('canvas_id input shape', () => {
+  const tools = [
+    [
+      'faostat_dataframe_describe',
+      (v: string) => dataframeDescribeTool.input.parse({ canvas_id: v }),
+    ],
+    [
+      'faostat_dataframe_query',
+      (v: string) => dataframeQueryTool.input.parse({ sql: 'SELECT 1', canvas_id: v }),
+    ],
+    [
+      'faostat_query_observations',
+      (v: string) => queryObservationsTool.input.parse({ domain: 'QCL', canvas_id: v }),
+    ],
+    [
+      'faostat_commodity_profile',
+      (v: string) => commodityProfileTool.input.parse({ item_query: 'maize', canvas_id: v }),
+    ],
+  ] as const;
+
+  // Too short, too long, and a character outside the minted charset.
+  const malformed = ['abc', 'abc12345678', 'no-such-canvas', 'abc123456!'];
+
+  for (const [name, parse] of tools) {
+    it(`${name} accepts a well-formed canvas_id`, () => {
+      expect(() => parse('abc1234567')).not.toThrow();
+      expect(() => parse('A-b_9Z0x1Y')).not.toThrow();
+    });
+
+    it(`${name} rejects a malformed canvas_id`, () => {
+      for (const value of malformed) {
+        expect(() => parse(value), `expected "${value}" to be rejected`).toThrow();
+      }
+    });
+  }
+
+  it('advertises the pattern in the JSON Schema a client sees', () => {
+    const schema = z.toJSONSchema(dataframeQueryTool.input) as {
+      properties: { canvas_id?: { pattern?: string } };
+    };
+    expect(schema.properties.canvas_id?.pattern).toBe('^[A-Za-z0-9_-]{10}$');
   });
 });
 

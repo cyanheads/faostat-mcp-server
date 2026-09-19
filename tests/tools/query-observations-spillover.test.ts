@@ -256,8 +256,10 @@ describe('faostat_query_observations spillover dead band', () => {
   });
 
   it('discloses the shortfall when staging fails and the response falls back to an inline page', async () => {
-    // An unknown canvas_id makes the staging layer's acquire throw, so it returns
-    // undefined and the handler falls back to the inline page. The probe fetches
+    // A well-formed but unknown canvas_id makes the staging layer's acquire throw,
+    // so it returns undefined and the handler falls back to the inline page. It has
+    // to be well-formed: `canvas_id` is declared with CanvasIdSchema, so a malformed
+    // token is rejected at argument validation and never reaches the handler. The probe fetches
     // max(limit, 50) rows, so at the default limit the page length equals the
     // reported total — the row comparison alone cannot see the shortfall, and
     // without the totalIsExact trigger this returned 200 of 300 rows announcing
@@ -276,7 +278,7 @@ describe('faostat_query_observations spillover dead band', () => {
       year_start: 2020,
       year_end: 2020,
       include_aggregates: true,
-      canvas_id: 'no-such-canvas',
+      canvas_id: 'zzzzzzzzzz',
     });
 
     const result = await queryObservationsTool.handler(input, ctx);
