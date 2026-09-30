@@ -4,9 +4,11 @@
  * `Context`; this wires console output and a SIGINT/SIGTERM-driven
  * AbortController to the `MirrorLogger` shape the ingesters consume — an
  * interrupt lets the framework persist sync state before exit so a re-run
- * resumes cleanly.
+ * resumes cleanly. Also prints a failed run's error with its recovery hint.
  * @module scripts/_mirror-context
  */
+
+import { McpError } from '@cyanheads/mcp-ts-core/errors';
 
 type LogLevel = 'debug' | 'info' | 'notice' | 'warning' | 'error';
 
@@ -41,4 +43,18 @@ export function makeScriptContext(prefix: string): {
   process.once('SIGINT', onSignal('SIGINT'));
   process.once('SIGTERM', onSignal('SIGTERM'));
   return { log: makeLogger(prefix), signal: controller.signal };
+}
+
+/**
+ * Print a failed run's error to stderr: the message, then the recovery hint the
+ * error carries — the same one an MCP client sees — so a refused manifest names
+ * `FAOSTAT_BULK_BASE_URL` at the terminal too.
+ */
+export function printFailure(label: string, err: unknown): void {
+  console.error(`\n${label} failed:`, err instanceof Error ? err.message : err);
+  const hint =
+    err instanceof McpError
+      ? (err.data as { recovery?: { hint?: unknown } } | undefined)?.recovery?.hint
+      : undefined;
+  if (typeof hint === 'string') console.error(`Recovery: ${hint}`);
 }

@@ -1,5 +1,6 @@
 /**
- * @fileoverview Shared HTTP constants for the FAOSTAT bulk-download fetches.
+ * @fileoverview Shared HTTP constants for the FAOSTAT bulk-download fetches: the
+ * User-Agent both fetches send and the service name their status errors carry.
  * The FAO bulk host (`bulks-faostat.fao.org`) sits behind a WAF that rejects
  * requests with an absent/empty `User-Agent` (HTTP 403). Node's default fetch UA
  * happens to pass today, but an identifying UA is both correct etiquette for a
@@ -11,3 +12,6 @@
 /** Identifying User-Agent for FAOSTAT bulk-service requests. */
 export const FAOSTAT_USER_AGENT =
   'faostat-mcp-server (+https://github.com/cyanheads/faostat-mcp-server)';
+
+/** Service name a bulk-host HTTP error leads its message with. */
+export const FAOSTAT_BULK_SERVICE = 'FAOSTAT bulk service';

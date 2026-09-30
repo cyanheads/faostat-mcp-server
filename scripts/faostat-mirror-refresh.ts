@@ -2,7 +2,8 @@
  * @fileoverview Incremental refresh of the FAOSTAT local mirror. For each
  * selected domain, HEAD/manifest-checks the domain's `DateUpdate` against the
  * stored checkpoint and re-streams only the domains FAO has rebuilt since the
- * last sync. Safe to run on a schedule; a no-op when nothing changed.
+ * last sync, then builds query-planner statistics for any domain that lacks them.
+ * Safe to run on a schedule: an unchanged domain with statistics is left alone.
  *
  * Usage:
  *   bun run mirror:refresh
@@ -13,7 +14,7 @@
 import { getServerConfig, selectedDomainCodes } from '@/config/server-config.js';
 import { FaostatMirror } from '@/services/faostat-mirror/faostat-mirror.js';
 import { fetchManifest, findDataset } from '@/services/faostat-mirror/manifest.js';
-import { makeScriptContext } from './_mirror-context.js';
+import { makeScriptContext, printFailure } from './_mirror-context.js';
 
 async function main(): Promise<void> {
   const cfg = getServerConfig();
@@ -39,7 +40,7 @@ async function main(): Promise<void> {
     console.log(`\nRefresh complete in ${totalMin}m across ${domains.length} domain(s).`);
     await mirror.close();
   } catch (err) {
-    console.error('\nRefresh failed:', err instanceof Error ? err.message : err);
+    printFailure('Refresh', err);
     await mirror.close().catch(() => {});
     process.exit(1);
   }

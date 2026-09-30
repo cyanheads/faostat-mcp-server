@@ -6,13 +6,35 @@
  * @module services/faostat-mirror/manifest
  */
 
-import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
-import { withRetry } from '@cyanheads/mcp-ts-core/utils';
-import { FAOSTAT_USER_AGENT } from './http.js';
+import { McpError, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { defaultIsTransient, httpErrorFromResponse, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { FAOSTAT_BULK_SERVICE, FAOSTAT_USER_AGENT } from './http.js';
 import type { ManifestDataset, ManifestResponse } from './types.js';
 
 /** Canonical manifest filename (lowercase — the capitalized variant 403s). */
 const MANIFEST_FILE = 'datasets_E.json';
+
+/**
+ * Recovery for a manifest status that retrying cannot change. The base URL is
+ * operator configuration, so the hint names the setting rather than echoing its
+ * value onto a client-visible error.
+ */
+const BASE_URL_HINT =
+  'Retrying will not help. Check that FAOSTAT_BULK_BASE_URL points at the FAOSTAT bulk-download base that serves datasets_E.json (default https://bulks-faostat.fao.org/production); the FAO bulk host answers a wrong path with HTTP 403.';
+
+/**
+ * Map a non-2xx manifest response to its status-classified error. Only a status
+ * `withRetry` treats as transient (408, 425, 429, 5xx other than 501) re-enters
+ * the backoff; anything else fails on this request with {@link BASE_URL_HINT}.
+ */
+async function manifestStatusError(response: Response): Promise<McpError> {
+  const error = await httpErrorFromResponse(response, { service: FAOSTAT_BULK_SERVICE });
+  if (defaultIsTransient(error)) return error;
+  return new McpError(error.code, error.message, {
+    ...error.data,
+    recovery: { hint: BASE_URL_HINT },
+  });
+}
 
 /**
  * Parse a `FileSize` value into bytes; null when absent/unparseable. The live
@@ -43,8 +65,9 @@ export function parseFileRows(fileRows: number | string | undefined): number | n
 
 /**
  * Fetch and parse the bulk manifest. Retries transient failures with a calibrated
- * backoff (the service is occasionally slow/degraded). Returns the full dataset
- * array, unmodified. `signal` cancels the fetch and the retry loop.
+ * backoff (the service is occasionally slow/degraded); a permanent status fails on
+ * the first request. Returns the full dataset array, unmodified. `signal` cancels
+ * the fetch and the retry loop.
  */
 export function fetchManifest(baseUrl: string, signal: AbortSignal): Promise<ManifestDataset[]> {
   const url = `${baseUrl.replace(/\/$/, '')}/${MANIFEST_FILE}`;
@@ -54,18 +77,12 @@ export function fetchManifest(baseUrl: string, signal: AbortSignal): Promise<Man
         signal,
         headers: { 'User-Agent': FAOSTAT_USER_AGENT },
       });
-      if (!response.ok) {
-        throw serviceUnavailable(`FAOSTAT manifest fetch failed (HTTP ${response.status})`, {
-          url,
-          status: response.status,
-        });
-      }
+      if (!response.ok) throw await manifestStatusError(response);
       const json = (await response.json()) as ManifestResponse;
       const datasets = json?.Datasets?.Dataset;
       if (!Array.isArray(datasets)) {
         throw serviceUnavailable(
           'FAOSTAT manifest missing Datasets.Dataset array — upstream format changed.',
-          { url },
         );
       }
       return datasets;

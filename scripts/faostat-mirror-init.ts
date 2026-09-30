@@ -19,7 +19,7 @@
 import { getServerConfig, selectedDomainCodes } from '@/config/server-config.js';
 import { FaostatMirror } from '@/services/faostat-mirror/faostat-mirror.js';
 import { fetchManifest, findDataset } from '@/services/faostat-mirror/manifest.js';
-import { makeScriptContext } from './_mirror-context.js';
+import { makeScriptContext, printFailure } from './_mirror-context.js';
 
 async function main(): Promise<void> {
   const cfg = getServerConfig();
@@ -60,7 +60,7 @@ async function main(): Promise<void> {
     console.log(`\nInit complete in ${totalMin}m across ${domains.length} domain(s).`);
     await mirror.close();
   } catch (err) {
-    console.error('\nInit failed:', err instanceof Error ? err.message : err);
+    printFailure('Init', err);
     await mirror.close().catch(() => {});
     process.exit(1);
   }

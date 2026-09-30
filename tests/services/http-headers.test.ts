@@ -10,6 +10,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { describe, expect, it, vi } from 'vitest';
 import { FaostatMirror } from '@/services/faostat-mirror/faostat-mirror.js';
 import { FAOSTAT_USER_AGENT } from '@/services/faostat-mirror/http.js';
@@ -41,6 +42,29 @@ describe('FAOSTAT bulk fetches carry an identifying User-Agent', () => {
       expect(ua).toBeTruthy();
     } finally {
       vi.unstubAllGlobals();
+    }
+  });
+
+  it('sends the User-Agent on a domain ZIP download the host refuses', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'faostat-ua-refused-'));
+    const fetchSpy = vi.fn(
+      async (_url: string | URL, _init?: RequestInit) => new Response('denied', { status: 403 }),
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+    const mirror = new FaostatMirror({ dir, domains: [FIXTURE_DOMAIN] });
+    try {
+      await expect(
+        mirror.runDomainSync(FIXTURE_DOMAIN, 'init', {
+          signal: new AbortController().signal,
+          dataset: fixtureDataset(),
+        }),
+      ).rejects.toMatchObject({ code: JsonRpcErrorCode.Forbidden });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(headersOf(fetchSpy.mock.calls[0]?.[1]).get('user-agent')).toBe(FAOSTAT_USER_AGENT);
+    } finally {
+      await mirror.close();
+      vi.unstubAllGlobals();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

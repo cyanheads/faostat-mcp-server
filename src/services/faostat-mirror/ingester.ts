@@ -17,11 +17,12 @@ import type {
   SyncGenerator,
   SyncPage,
 } from '@cyanheads/mcp-ts-core/mirror';
+import { httpErrorFromResponse } from '@cyanheads/mcp-ts-core/utils';
 import { Unzip, UnzipInflate } from 'fflate';
 import { CsvRecordSplitter, headerIndex, parseCsvLine, stripApostrophe } from './csv.js';
 import type { DimensionsStore } from './dimensions-store.js';
 import { classifyArea } from './dimensions-store.js';
-import { FAOSTAT_USER_AGENT } from './http.js';
+import { FAOSTAT_BULK_SERVICE, FAOSTAT_USER_AGENT } from './http.js';
 import type {
   AreaRecord,
   ElementRecord,
@@ -213,9 +214,17 @@ export function makeDomainSync(opts: {
       signal: ctx.signal,
       headers: { 'User-Agent': FAOSTAT_USER_AGENT },
     });
-    if (!response.ok || !response.body) {
+    if (!response.ok) {
+      // Status-classified, so a 4xx reads as what it is rather than an outage. The
+      // error reaches only the sync logs, so it may carry the ZIP URL.
+      throw await httpErrorFromResponse(response, {
+        service: `${FAOSTAT_BULK_SERVICE} (${dataset.DatasetCode} ZIP)`,
+        includeUrl: true,
+      });
+    }
+    if (!response.body) {
       throw serviceUnavailable(
-        `FAOSTAT ZIP download failed for ${dataset.DatasetCode} (HTTP ${response.status})`,
+        `FAOSTAT ZIP download for ${dataset.DatasetCode} returned HTTP ${response.status} with no body.`,
         { url: dataset.FileLocation, status: response.status },
       );
     }
