@@ -196,3 +196,9 @@ repomix-output*
 duckdata/
 .claude
 .agents
+# Local FAOSTAT mirror (multi-GB SQLite corpus) — never part of the build context;
+# the image bootstraps its own via `bun run mirror:init` on a mounted volume.
+.faostat-mirror/
+*.db
+*.db-shm
+*.db-wal
