@@ -8,7 +8,9 @@
  * id throws `canvas_not_found` (NotFound) instead of silently listing the session
  * canvas, and a valid id for a second, distinct canvas lists ONLY that canvas's
  * tables — closing the leak where a valid-but-different id returned the wrong
- * canvas's metadata.
+ * canvas's metadata. Through the public contract, both dataframe tools put their
+ * own declared `canvas_not_found` recovery on both surfaces rather than the
+ * framework's throw-site hint (#35).
  * @module tests/tools/dataframe-canvas-id-optional
  */
 
@@ -16,14 +18,18 @@ import { z } from '@cyanheads/mcp-ts-core';
 import { createCanvasService, type DataCanvas } from '@cyanheads/mcp-ts-core/canvas';
 import { parseConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { commodityProfileTool } from '@/mcp-server/tools/definitions/commodity-profile.tool.js';
 import { dataframeDescribeTool } from '@/mcp-server/tools/definitions/dataframe-describe.tool.js';
 import { dataframeQueryTool } from '@/mcp-server/tools/definitions/dataframe-query.tool.js';
 import { queryObservationsTool } from '@/mcp-server/tools/definitions/query-observations.tool.js';
 import { setCanvas } from '@/services/canvas-accessor.js';
-import { stageObservations } from '@/services/canvas-staging.js';
+import {
+  OBSERVATION_TABLE_SCHEMA,
+  PROFILE_TABLE_SCHEMA,
+  stageObservations,
+} from '@/services/canvas-staging.js';
 
 describe('faostat_dataframe_describe input', () => {
   it('accepts no arguments (canvas_id omitted — the discovery call)', () => {
@@ -140,6 +146,7 @@ describe('faostat_dataframe_describe honors canvas_id (handler behavior)', () =>
     });
     const staged = await stageObservations(ctx, manyRows('own'), {
       sourceTool: 'faostat_query_observations',
+      schema: OBSERVATION_TABLE_SCHEMA,
       queryParams: { domain: 'QCL' },
     });
     expect(staged?.spilled).toBe(true);
@@ -163,6 +170,7 @@ describe('faostat_dataframe_describe honors canvas_id (handler behavior)', () =>
     });
     await stageObservations(ctx, manyRows('own'), {
       sourceTool: 'faostat_query_observations',
+      schema: OBSERVATION_TABLE_SCHEMA,
       queryParams: { domain: 'QCL' },
     });
 
@@ -185,6 +193,7 @@ describe('faostat_dataframe_describe honors canvas_id (handler behavior)', () =>
     // Table A on the session (shared) canvas.
     const a = await stageObservations(ctx, manyRows('session'), {
       sourceTool: 'faostat_query_observations',
+      schema: OBSERVATION_TABLE_SCHEMA,
       queryParams: { domain: 'QCL' },
     });
     // Table B on a second, distinct canvas.
@@ -192,6 +201,7 @@ describe('faostat_dataframe_describe honors canvas_id (handler behavior)', () =>
     expect(second.canvasId).not.toBe(a?.canvasId);
     const b = await stageObservations(ctx, manyRows('second'), {
       sourceTool: 'faostat_commodity_profile',
+      schema: PROFILE_TABLE_SCHEMA,
       queryParams: { domain: 'TCL' },
       canvasId: second.canvasId,
     });
@@ -215,4 +225,58 @@ describe('faostat_dataframe_describe honors canvas_id (handler behavior)', () =>
     expect(sessionNames).toContain(a?.tableName);
     expect(sessionNames).not.toContain(b?.tableName);
   });
+});
+
+/**
+ * An unknown `canvas_id` through the public contract (#35). The framework throws
+ * `canvas_not_found` with its own recovery hint set at the throw site ("Re-run the
+ * tool that produced this canvas_id…"), and a hint on the error outranks a declared
+ * one — so without stripping it, each tool's declared text, which names the producing
+ * tools and the omit-`canvas_id` fallback, never reaches the caller.
+ */
+describe('dataframe tools: declared canvas_not_found recovery on the wire (#35)', () => {
+  let canvas: DataCanvas;
+
+  beforeAll(() => {
+    const built = createCanvasService(parseConfig({ CANVAS_PROVIDER_TYPE: 'duckdb' }));
+    if (!built) throw new Error('expected a DuckDB canvas to be constructed for the test');
+    canvas = built;
+    setCanvas(canvas);
+  });
+
+  afterAll(async () => {
+    setCanvas(undefined);
+    await canvas.shutdown(createMockContext({ tenantId: 'teardown' }));
+  });
+
+  it.each([
+    ['faostat_dataframe_describe', dataframeDescribeTool, { canvas_id: 'zzzzzzzzzz' }],
+    [
+      'faostat_dataframe_query',
+      dataframeQueryTool,
+      { sql: 'SELECT 1 AS n', canvas_id: 'zzzzzzzzzz' },
+    ],
+  ] as [string, Parameters<typeof runToolContract>[0], Record<string, unknown>][])(
+    '%s carries its declared recovery on structuredContent and content[]',
+    async (name, tool, input) => {
+      const declared = tool.errors?.find((e) => e.reason === 'canvas_not_found')?.recovery;
+      expect(declared).toMatch(/omit canvas_id/);
+
+      const wire = await runToolContract(tool, input, { context: { tenantId: `df-wire-${name}` } });
+
+      expect(wire.isError).toBe(true);
+      const { error } = wire.structuredContent as {
+        error: { code: number; data: Record<string, unknown> };
+      };
+      expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+      expect(error.data).toMatchObject({
+        reason: 'canvas_not_found',
+        canvasId: 'zzzzzzzzzz',
+        recovery: { hint: declared },
+      });
+      const text = wire.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+      expect(text).toContain(declared);
+      expect(text).not.toMatch(/Re-run the tool that produced this canvas_id/);
+    },
+  );
 });

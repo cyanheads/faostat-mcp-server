@@ -4,7 +4,8 @@
  * `ctx.state`), spills an observation stream to a `faostat_<id>` table with a
  * per-table TTL + provenance metadata, and runs read-only SQL across staged
  * tables. Best-effort: a canvas failure logs and returns a degraded result so
- * the caller's inline answer still lands. Mirrors the secedgar canvas-bridge
+ * the caller's inline answer still lands — except a caller-named canvas that
+ * does not resolve, which fails the call. Mirrors the secedgar canvas-bridge
  * shape, scoped to FAOSTAT's per-query spillover (tables are ephemeral working
  * slices, not the durable corpus — that lives in the mirror).
  * @module services/canvas-staging
@@ -14,8 +15,8 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import {
   type CanvasInstance,
   type ColumnSchema,
+  type DataCanvas,
   DUCKDB_ERROR_REASONS,
-  inferSchemaFromRows,
   type QueryResult,
   type RegisterTableResult,
   SQL_GATE_REASONS,
@@ -68,6 +69,37 @@ const PREVIEW_CHARS = 100_000;
  */
 export const STAGE_MAX_ROWS = 50_000;
 
+/**
+ * Column schema of a table staged from `FaostatMirror.streamObservations` rows —
+ * the ten columns that stream selects, in its order. Declared rather than inferred:
+ * the framework would type each column from the rows already buffered for the
+ * inline preview, and `value` is the one column that window can mistype — whole
+ * numbers infer BIGINT, an all-null window VARCHAR — after which every later row is
+ * coerced to that type (a fractional value truncated) without an error. `nullable`
+ * is left at its default (`true`), matching an inferred schema.
+ */
+export const OBSERVATION_TABLE_SCHEMA: ColumnSchema[] = [
+  { name: 'area_code', type: 'BIGINT' },
+  { name: 'area', type: 'VARCHAR' },
+  { name: 'item_code', type: 'BIGINT' },
+  { name: 'item', type: 'VARCHAR' },
+  { name: 'element_code', type: 'BIGINT' },
+  { name: 'element', type: 'VARCHAR' },
+  { name: 'year', type: 'BIGINT' },
+  { name: 'unit', type: 'VARCHAR' },
+  { name: 'value', type: 'DOUBLE' },
+  { name: 'flag', type: 'VARCHAR' },
+];
+
+/**
+ * Column schema of a `faostat_commodity_profile` table: the observation columns
+ * plus the `domain` (`QCL` / `TCL`) each merged row came from.
+ */
+export const PROFILE_TABLE_SCHEMA: ColumnSchema[] = [
+  ...OBSERVATION_TABLE_SCHEMA,
+  { name: 'domain', type: 'VARCHAR' },
+];
+
 /** True when the canvas is enabled on this deployment. */
 export function canvasEnabled(): boolean {
   return getCanvas() !== undefined;
@@ -96,16 +128,52 @@ async function acquireShared(ctx: Context): Promise<CanvasInstance> {
 }
 
 /**
+ * Acquire the canvas a caller named by `canvas_id`. An unknown or expired id is the
+ * caller's input, so its `canvas_not_found` propagates — for staging, rather than
+ * degrading the call — rethrown without the framework's recovery hint, which sends
+ * the caller back to the tool that produced the id. A hint set on the error
+ * outranks a declared one, so with it gone each tool's own declared recovery fills
+ * both surfaces instead (#35).
+ */
+async function acquireExplicit(
+  canvas: DataCanvas,
+  canvasId: string,
+  ctx: Context,
+): Promise<CanvasInstance> {
+  try {
+    return await canvas.acquire(canvasId, ctx);
+  } catch (error) {
+    if (error instanceof McpError && error.data?.reason === 'canvas_not_found') {
+      const { recovery: _frameworkHint, ...data } = error.data;
+      throw new McpError(error.code, error.message, data, { cause: error });
+    }
+    throw error;
+  }
+}
+
+/**
  * Spill an observation row stream to a canvas table. Inlines a preview and, when
  * the stream overflows the preview budget, registers the full set under a fresh
  * `faostat_<id>` table with a 2h TTL + provenance. Returns a degraded
- * (non-spilled) result if the canvas op fails.
+ * (non-spilled) result if the canvas op fails — except that a caller-named
+ * `canvasId` that does not resolve fails the call with `canvas_not_found` (#35).
+ * Omitted, the session canvas is used, and a dead one is replaced silently.
  *
  * `previewLimit` adds a row-count spill trigger on top of the character budget:
  * a stream that drains under the budget but yields more rows than the caller can
  * show inline is registered too, so the caller can cap its inline page at that
  * limit without the rows past it becoming unreachable (issue #14). Omit it to
  * spill on the character budget alone.
+ *
+ * `schema` types the table on both registration paths — pass
+ * {@link OBSERVATION_TABLE_SCHEMA} or {@link PROFILE_TABLE_SCHEMA} to match the
+ * rows. It also sets the table's column order; a row key it does not name is not
+ * staged, and a name absent from a row stages as NULL.
+ *
+ * A failure the `source` itself raises is rethrown rather than degraded: that is
+ * the mirror read failing (the per-call `query_timeout` ceiling, a cancellation, a
+ * crashed read worker — #3), and an inline fallback would present a truncated
+ * page as the call's answer.
  */
 export async function stageObservations<T extends Record<string, unknown>>(
   ctx: Context,
@@ -113,30 +181,40 @@ export async function stageObservations<T extends Record<string, unknown>>(
   opts: {
     sourceTool: string;
     queryParams: Record<string, unknown>;
+    schema: ColumnSchema[];
     canvasId?: string;
     previewLimit?: number;
     tableName?: string;
-    schema?: ColumnSchema[];
   },
 ): Promise<StageResult | undefined> {
   const canvas = getCanvas();
   if (!canvas) return;
+  // Resolved outside the degrade path below: a bad id is the caller's to fix.
+  const named = opts.canvasId ? await acquireExplicit(canvas, opts.canvasId, ctx) : undefined;
+  // What the source threw, if anything — spillover passes it through unchanged, so
+  // the catch below tells a read failure from a canvas failure by identity.
+  let readFailure: unknown;
+  async function* recorded(): AsyncGenerator<T> {
+    try {
+      yield* source;
+    } catch (error) {
+      readFailure = error;
+      throw error;
+    }
+  }
   try {
-    const instance = opts.canvasId
-      ? await canvas.acquire(opts.canvasId, ctx)
-      : await acquireShared(ctx);
-    if (instance.isNew) await ctx.state.set(CANVAS_ID_KEY, instance.canvasId);
+    const instance = named ?? (await acquireShared(ctx));
 
     const tableName = opts.tableName ?? mintTableName();
     const result = await spillover({
       canvas: instance,
-      source,
+      source: recorded(),
       previewChars: PREVIEW_CHARS,
       caps: { maxRows: STAGE_MAX_ROWS },
       tableName,
       ttlMs: TABLE_TTL_MS,
       signal: ctx.signal,
-      ...(opts.schema ? { schema: opts.schema } : {}),
+      schema: opts.schema,
     });
 
     // The character budget alone leaves a band where the stream drains whole yet
@@ -148,7 +226,7 @@ export async function stageObservations<T extends Record<string, unknown>>(
       handle = result.handle;
     } else if (opts.previewLimit !== undefined && result.previewRows.length > opts.previewLimit) {
       handle = await instance.registerTable(tableName, result.previewRows, {
-        schema: opts.schema ?? inferSchemaFromRows(result.previewRows),
+        schema: opts.schema,
         ttlMs: TABLE_TTL_MS,
         signal: ctx.signal,
       });
@@ -160,8 +238,7 @@ export async function stageObservations<T extends Record<string, unknown>>(
       // Only the char-budget spill can hit the row cap; the buffered registration
       // above is bounded by the preview budget, far under it.
       const truncated = result.spilled ? result.truncated : false;
-      // The spill handle carries column NAMES only — the types DuckDB resolved
-      // (BIGINT for the integer codes/year, DOUBLE for value, VARCHAR for text)
+      // The spill handle carries column NAMES only — the types DuckDB registered
       // are only readable from the catalog. Read them back once here, at stage
       // time, so the persisted metadata dataframe_describe serves is the contract
       // SQL callers must actually match rather than a synthesized VARCHAR each.
@@ -211,6 +288,9 @@ export async function stageObservations<T extends Record<string, unknown>>(
       expiresAt,
     };
   } catch (error) {
+    // A cancelled call, or a source read that failed, must not degrade into a
+    // "successful" inline answer.
+    if (ctx.signal?.aborted || error === readFailure) throw error;
     ctx.log.warning('Canvas staging failed', {
       error: error instanceof Error ? error.message : String(error),
       sourceTool: opts.sourceTool,
@@ -221,11 +301,12 @@ export async function stageObservations<T extends Record<string, unknown>>(
 
 /**
  * List staged table metadata for the resolved canvas (newest first), sweeping
- * expired entries. An explicit `canvasId` resolves that canvas — throwing the
- * framework's enriched `canvas_not_found` for an unknown/other-tenant id — and
- * scopes the listing to it; omitted uses the session's shared canvas. Filtering
- * on the resolved canvas is what stops a valid-but-different `canvas_id` from
- * leaking another canvas's table metadata.
+ * expired entries. An explicit `canvasId` resolves that canvas — throwing
+ * `canvas_not_found` for an unknown/other-tenant id, which the tool's declared
+ * recovery completes (see {@link acquireExplicit}) — and scopes the listing to it;
+ * omitted uses the session's shared canvas. Filtering on the resolved canvas is
+ * what stops a valid-but-different `canvas_id` from leaking another canvas's table
+ * metadata.
  */
 export async function describeStaged(
   ctx: Context,
@@ -235,7 +316,7 @@ export async function describeStaged(
   if (!canvas) throw new Error('DataCanvas is not enabled. Set CANVAS_PROVIDER_TYPE=duckdb.');
   await sweepExpired(ctx);
   const instance = opts.canvasId
-    ? await canvas.acquire(opts.canvasId, ctx)
+    ? await acquireExplicit(canvas, opts.canvasId, ctx)
     : await acquireShared(ctx);
   if (opts.tableName) {
     const meta = await ctx.state.get<StagedTableMeta>(`${META_PREFIX}${opts.tableName}`);
@@ -320,11 +401,12 @@ export async function queryStaged(
   if (!canvas) throw new Error('DataCanvas is not enabled. Set CANVAS_PROVIDER_TYPE=duckdb.');
   await sweepExpired(ctx);
   // An explicit canvas_id resolves that canvas — an unknown/other-tenant id throws
-  // the framework's enriched `canvas_not_found` (NotFound), which is left to bubble
-  // (it fires here, outside the try below, so it is never remapped to invalid_sql).
-  // Omitted falls back to the session's shared canvas.
+  // `canvas_not_found` (NotFound) with no hint of its own, so the tool's declared
+  // recovery fills in. It is left to bubble (it fires here, outside the try below,
+  // so it is never remapped to invalid_sql). Omitted falls back to the session's
+  // shared canvas.
   const instance = opts.canvasId
-    ? await canvas.acquire(opts.canvasId, ctx)
+    ? await acquireExplicit(canvas, opts.canvasId, ctx)
     : await acquireShared(ctx);
   try {
     const result = await instance.query(sql, {

@@ -19,7 +19,7 @@ import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { dataframeDescribeTool } from '@/mcp-server/tools/definitions/dataframe-describe.tool.js';
 import { setCanvas } from '@/services/canvas-accessor.js';
-import { stageObservations } from '@/services/canvas-staging.js';
+import { OBSERVATION_TABLE_SCHEMA, stageObservations } from '@/services/canvas-staging.js';
 
 let canvas: DataCanvas;
 
@@ -53,6 +53,7 @@ async function stageTables(ctx: ReturnType<typeof makeCtx>, count: number): Prom
       [{ area_code: i, area: `Country ${i}`, value: 100 + i, flag: 'A' }],
       {
         sourceTool: 'faostat_query_observations',
+        schema: OBSERVATION_TABLE_SCHEMA,
         queryParams: { domain: 'QCL', item_codes: [i] },
         previewLimit: 0,
       },

@@ -139,11 +139,7 @@ export const dataframeDescribeTool = tool('faostat_dataframe_describe', {
 
   async handler(input, ctx) {
     if (!canvasEnabled()) {
-      throw ctx.fail(
-        'canvas_disabled',
-        'DataCanvas is not configured on this server.',
-        ctx.recoveryFor('canvas_disabled'),
-      );
+      throw ctx.fail('canvas_disabled', 'DataCanvas is not configured on this server.');
     }
     const entries = await describeStaged(ctx, {
       ...(input.name ? { tableName: input.name } : {}),
@@ -152,11 +148,7 @@ export const dataframeDescribeTool = tool('faostat_dataframe_describe', {
     // A name filter that matched nothing is a missing-table miss, not an empty
     // canvas — surface it as a typed NotFound instead of "No active staged tables".
     if (input.name && entries.length === 0) {
-      throw ctx.fail(
-        'missing_table',
-        `No staged table named "${input.name}" on this canvas.`,
-        ctx.recoveryFor('missing_table'),
-      );
+      throw ctx.fail('missing_table', `No staged table named "${input.name}" on this canvas.`);
     }
 
     // A `name` lookup resolves at most one table and is never paged, so `limit`

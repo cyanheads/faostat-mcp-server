@@ -10,35 +10,8 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { markdownCell } from '@/mcp-server/tools/markdown-cell.js';
 import { canvasEnabled, queryStaged } from '@/services/canvas-staging.js';
-
-/**
- * Render one result value as a Markdown table cell.
- *
- * Order is load-bearing: backslashes are doubled BEFORE pipes are escaped. Escaping
- * `|` alone turns a value's own `\` before a pipe into `\\|`, which a renderer reads
- * as a literal backslash plus an UNESCAPED cell separator — the row splits at a
- * value-controlled point and every later column shifts. Doubling first keeps the
- * separator escaped and the original backslash intact. CR and LF become their escape
- * sequences for the same reason: a raw newline ends the table row outright.
- *
- * Values reach here straight from DuckDB, so their content is whatever the queried
- * rows hold. `structuredContent` carries them unescaped; this is the `content[]` twin.
- */
-function markdownCell(value: unknown): string {
-  if (value === null || value === undefined) return '';
-  const text =
-    typeof value === 'string'
-      ? value
-      : typeof value === 'object'
-        ? JSON.stringify(value)
-        : String(value);
-  return text
-    .replace(/\\/g, '\\\\')
-    .replace(/\|/g, '\\|')
-    .replace(/\r/g, '\\r')
-    .replace(/\n/g, '\\n');
-}
 
 export const dataframeQueryTool = tool('faostat_dataframe_query', {
   title: 'faostat-mcp-server: dataframe query',
@@ -105,7 +78,7 @@ export const dataframeQueryTool = tool('faostat_dataframe_query', {
       .string()
       .min(1)
       .describe(
-        'Single-statement read-only SELECT against staged faostat_<id> tables. Columns: area_code, area, item_code, item, element_code, element, year, unit, value, flag. CAST(value AS DOUBLE) for arithmetic.',
+        'Single-statement read-only SELECT against staged faostat_<id> tables. Columns: area_code, area, item_code, item, element_code, element, year, unit, value, flag — plus domain (QCL or TCL) on tables staged by faostat_commodity_profile.',
       ),
     row_limit: z
       .number()
@@ -138,11 +111,7 @@ export const dataframeQueryTool = tool('faostat_dataframe_query', {
     // against the session's shared canvas (resolved from ctx.state by the staging
     // layer). An unknown/other-tenant canvas_id throws canvas_not_found.
     if (!canvasEnabled()) {
-      throw ctx.fail(
-        'canvas_disabled',
-        'DataCanvas is not configured on this server.',
-        ctx.recoveryFor('canvas_disabled'),
-      );
+      throw ctx.fail('canvas_disabled', 'DataCanvas is not configured on this server.');
     }
 
     const { result } = await queryStaged(ctx, input.sql, {

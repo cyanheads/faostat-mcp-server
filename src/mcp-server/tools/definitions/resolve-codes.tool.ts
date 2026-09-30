@@ -58,6 +58,16 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       recovery:
         'Wait for the initial sync to finish or run the mirror init script, then retry shortly.',
     },
+    // Raised by the mirror read pool when the call's ceiling fires.
+    {
+      reason: 'query_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      thrownBy: 'service',
+      retryable: true,
+      when: "The item or element lookup's mirror read — time queued behind other calls' reads plus execution — ran past the 45-second per-call ceiling.",
+      recovery:
+        'Retry in a few seconds — the lookup itself is fast; it waited behind slower reads from other calls.',
+    },
   ],
 
   input: z.object({
@@ -136,18 +146,10 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
   async handler(input, ctx) {
     const mirror = getFaostatMirror();
     if (!mirror.isSelected(input.domain)) {
-      throw ctx.fail(
-        'unknown_domain',
-        `Domain "${input.domain}" is not in the indexed set.`,
-        ctx.recoveryFor('unknown_domain'),
-      );
+      throw ctx.fail('unknown_domain', `Domain "${input.domain}" is not in the indexed set.`);
     }
     if (!(await mirror.dimensions.isPopulated())) {
-      throw ctx.fail(
-        'index_not_ready',
-        'FAOSTAT dimension tables are not yet populated.',
-        ctx.recoveryFor('index_not_ready'),
-      );
+      throw ctx.fail('index_not_ready', 'FAOSTAT dimension tables are not yet populated.');
     }
 
     const { matches, total } = await mirror.resolve(input.domain, input.dimension, {
@@ -156,6 +158,7 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       ...(input.name_contains ? { nameContains: input.name_contains } : {}),
       limit: input.limit,
       offset: input.offset,
+      signal: mirror.readSignal(ctx.signal),
     });
 
     // Pagination window: this page covers [offset, offset + matches.length). More

@@ -20,16 +20,30 @@
  * still works for genuinely large results. The one path where no table can hold
  * the remainder — a canvas op that fails outright — is covered too: it must
  * disclose the shortfall rather than pass a capped page off as the whole result.
+ * A caller-named `canvas_id` that does not resolve is not that path: it fails the
+ * call with `canvas_not_found` and the tool's declared recovery (#35), while a
+ * failure after the named canvas resolves still degrades.
+ * Every branch that returns a `canvas_id` points at `faostat_dataframe_describe`
+ * before `faostat_dataframe_query` (#23); those cases run through
+ * `runToolContract` so the notice is read from `structuredContent` and from the
+ * `content[]` trailer the framework renders.
  * @module tests/tools/query-observations-spillover
  */
 
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createCanvasService, type DataCanvas } from '@cyanheads/mcp-ts-core/canvas';
+import { z } from '@cyanheads/mcp-ts-core';
+import {
+  CanvasInstance,
+  createCanvasService,
+  type DataCanvas,
+} from '@cyanheads/mcp-ts-core/canvas';
 import { parseConfig } from '@cyanheads/mcp-ts-core/config';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { dataframeDescribeTool } from '@/mcp-server/tools/definitions/dataframe-describe.tool.js';
 import { queryObservationsTool } from '@/mcp-server/tools/definitions/query-observations.tool.js';
 import { setCanvas } from '@/services/canvas-accessor.js';
 import { STAGE_MAX_ROWS } from '@/services/canvas-staging.js';
@@ -43,6 +57,93 @@ import {
 
 /** Real DuckDB canvas shared across the suite (lazy-loads `@duckdb/node-api`). */
 let canvas: DataCanvas;
+
+/** The fixture slice every dead-band case queries: Wheat production in 2020. */
+const WHEAT_2020 = {
+  domain: FIXTURE_DOMAIN,
+  item_codes: [15],
+  element_codes: [5510],
+  year_start: 2020,
+  year_end: 2020,
+  include_aggregates: true,
+};
+
+/** Both client surfaces of one wire-level call. */
+interface WireQuery {
+  /** The `format()` block alone — `content[0]`, before the enrichment trailer. */
+  formatted: string;
+  notice: string | undefined;
+  structured: Record<string, unknown>;
+  /** Every `content[]` block joined, the enrichment trailer included. */
+  text: string;
+}
+
+/** Run the query through its public contract and split out both surfaces. */
+async function queryWire(
+  tenantId: string,
+  input: z.input<typeof queryObservationsTool.input>,
+): Promise<WireQuery> {
+  const wire = await runToolContract(queryObservationsTool, input, { context: { tenantId } });
+  expect(wire.isError).toBeFalsy();
+  const blocks = wire.content.map((c) => (c.type === 'text' ? c.text : ''));
+  const structured = wire.structuredContent as Record<string, unknown>;
+  return {
+    formatted: blocks[0] ?? '',
+    notice: structured.notice as string | undefined,
+    structured,
+    text: blocks.join('\n'),
+  };
+}
+
+interface ErrorEnvelope {
+  error: { code: number; data: Record<string, unknown>; message: string };
+}
+
+/** Run the query through its public contract, expecting a failure; split out both surfaces. */
+async function queryWireError(
+  tenantId: string,
+  input: z.input<typeof queryObservationsTool.input>,
+): Promise<{ error: ErrorEnvelope['error']; text: string }> {
+  const wire = await runToolContract(queryObservationsTool, input, { context: { tenantId } });
+  expect(wire.isError).toBe(true);
+  return {
+    error: (wire.structuredContent as unknown as ErrorEnvelope).error,
+    text: wire.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n'),
+  };
+}
+
+/** The recovery `faostat_query_observations` declares for `canvas_not_found`. */
+function declaredCanvasNotFoundRecovery(): string {
+  const entry = queryObservationsTool.errors?.find((e) => e.reason === 'canvas_not_found');
+  expect(entry).toBeDefined();
+  return (entry as { recovery: string }).recovery;
+}
+
+/**
+ * Make the next `registerTable` on any canvas instance reject — a staging failure
+ * after the canvas was acquired. Returns the spy so a test can assert it fired.
+ */
+function failNextRegisterTable() {
+  return vi
+    .spyOn(CanvasInstance.prototype, 'registerTable')
+    .mockRejectedValueOnce(new Error('simulated registerTable failure'));
+}
+
+/**
+ * Assert a spilled response's notice reached both surfaces and points at the
+ * staged table through the dataframe pair — `faostat_dataframe_describe` with the
+ * table's name and canvas_id first, then `faostat_dataframe_query`.
+ */
+function expectDescribeThenQuery(wire: WireQuery) {
+  const notice = wire.notice as string;
+  expect(notice).toContain(
+    `faostat_dataframe_describe (name ${wire.structured.table_name}, canvas_id ${wire.structured.canvas_id})`,
+  );
+  const describeAt = notice.indexOf('faostat_dataframe_describe');
+  expect(notice.indexOf('faostat_dataframe_query')).toBeGreaterThan(describeAt);
+  // The framework renders the notice as a `> …` trailer line on content[].
+  expect(wire.text).toContain(`> ${notice}`);
+}
 
 beforeAll(() => {
   // CANVAS_PROVIDER_TYPE=duckdb makes the factory build an in-process DuckDB
@@ -90,6 +191,7 @@ describe('faostat_query_observations spillover dead band', () => {
   afterEach(async () => {
     await mirror?.close();
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -214,6 +316,19 @@ describe('faostat_query_observations spillover dead band', () => {
     expect(notice).not.toMatch(/enable datacanvas/i);
   });
 
+  it('points a buffered-stage table at describe-then-query on both surfaces (#23)', async () => {
+    // 300 rows drain under the char budget but exceed limit (200), so the staging
+    // layer registers the buffered set — the row-budget spill path.
+    await syncDomain(300, 0);
+    const wire = await queryWire('spill-buffered-pointer', WHEAT_2020);
+
+    expect(wire.structured.spilled).toBe(true);
+    expect(wire.structured.staged_row_count).toBe(300);
+    expect(wire.notice).toMatch(/Result of 300 observations staged on canvas table/);
+    expect(wire.notice).toMatch(/the first 200 are shown inline/);
+    expectDescribeThenQuery(wire);
+  });
+
   it('honors an explicit small limit on a mid-size match, full set still reachable (#14)', async () => {
     // The issue's repro: 238 matches with limit 1 used to return all 238 inline.
     const total = await syncDomain(238, 0);
@@ -256,33 +371,26 @@ describe('faostat_query_observations spillover dead band', () => {
   });
 
   it('discloses the shortfall when staging fails and the response falls back to an inline page', async () => {
-    // A well-formed but unknown canvas_id makes the staging layer's acquire throw,
-    // so it returns undefined and the handler falls back to the inline page. It has
-    // to be well-formed: `canvas_id` is declared with CanvasIdSchema, so a malformed
-    // token is rejected at argument validation and never reaches the handler. The probe fetches
-    // max(limit, 50) rows, so at the default limit the page length equals the
-    // reported total — the row comparison alone cannot see the shortfall, and
-    // without the totalIsExact trigger this returned 200 of 300 rows announcing
-    // itself as the whole exact result, with no table holding the rest.
+    // Registering the 300-row set on the session canvas fails after the canvas was
+    // acquired, so the staging layer returns undefined and the handler falls back to
+    // the inline page. The probe fetches max(limit, 50) rows, so at the default
+    // limit the page length equals the reported total — the row comparison alone
+    // cannot see the shortfall, and without the totalIsExact trigger this returned
+    // 200 of 300 rows announcing itself as the whole exact result, with no table
+    // holding the rest.
     const total = await syncDomain(300, 0);
     expect(total).toBe(300);
+    const registerTable = failNextRegisterTable();
 
     const ctx = createMockContext({
       tenantId: 'spill-canvas-fail',
       errors: queryObservationsTool.errors,
     });
-    const input = queryObservationsTool.input.parse({
-      domain: FIXTURE_DOMAIN,
-      item_codes: [15],
-      element_codes: [5510],
-      year_start: 2020,
-      year_end: 2020,
-      include_aggregates: true,
-      canvas_id: 'zzzzzzzzzz',
-    });
+    const input = queryObservationsTool.input.parse(WHEAT_2020);
 
     const result = await queryObservationsTool.handler(input, ctx);
 
+    expect(registerTable).toHaveBeenCalledTimes(1);
     expect(result.observations).toHaveLength(200);
     expect(result.spilled).toBe(false);
     expect(result.table_name).toBeUndefined();
@@ -292,6 +400,106 @@ describe('faostat_query_observations spillover dead band', () => {
     expect(notice).toMatch(/more than 200/);
     expect(notice).toMatch(/failed/i);
     expect(notice).toMatch(/raise limit/i);
+  });
+
+  it('keeps the staging-failed fallback neutral on content[] — no canvas advice, no canvas pointer (#31)', async () => {
+    // The fall-through #31 fixed in faostat_commodity_profile: this tool's format()
+    // line is already neutral, and its notice names the failure itself. The caller
+    // names a live canvas, which resolves; the failure comes after (#35), so it
+    // still degrades rather than failing the call.
+    await syncDomain(300, 0);
+    const tenantId = 'spill-canvas-fail-wire';
+    const live = await canvas.acquire(undefined, createMockContext({ tenantId }));
+    const registerTable = failNextRegisterTable();
+    const wire = await queryWire(tenantId, { ...WHEAT_2020, canvas_id: live.canvasId });
+
+    expect(registerTable).toHaveBeenCalledTimes(1);
+    expect(wire.structured.canvas_id).toBeUndefined();
+    expect(wire.notice).toMatch(/staging the full set to a canvas table failed/i);
+    expect(wire.text).toContain(`> ${wire.notice}`);
+    expect(wire.formatted).toContain('no canvas table was staged for this result');
+    expect(wire.text).not.toMatch(/CANVAS_PROVIDER_TYPE/);
+    expect(wire.text).not.toMatch(/faostat_dataframe_(describe|query)/);
+  });
+
+  it('fails an unknown canvas_id with canvas_not_found and the declared recovery on both surfaces (#35)', async () => {
+    // Well-formed, so it passes CanvasIdSchema and reaches the staging layer.
+    await syncDomain(300, 0);
+    const { error, text } = await queryWireError('spill-unknown-canvas', {
+      ...WHEAT_2020,
+      canvas_id: 'zzzzzzzzzz',
+    });
+
+    expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+    expect(error.data.reason).toBe('canvas_not_found');
+    expect(error.data.canvasId).toBe('zzzzzzzzzz');
+    const recovery = declaredCanvasNotFoundRecovery();
+    expect((error.data.recovery as { hint: string }).hint).toBe(recovery);
+    expect(text).toContain(recovery);
+    // The framework's own hint sends the caller back to a producer that cannot help.
+    expect(text).not.toMatch(/Re-run the tool that produced this canvas_id/);
+  });
+
+  it('fails a canvas_id whose canvas has expired with canvas_not_found (#35)', async () => {
+    await syncDomain(300, 0);
+    const tenantId = 'spill-expired-canvas';
+    const ctx = createMockContext({ tenantId });
+    const gone = await canvas.acquire(undefined, ctx);
+    expect(await canvas.drop(gone.canvasId, ctx)).toBe(true);
+
+    const { error, text } = await queryWireError(tenantId, {
+      ...WHEAT_2020,
+      canvas_id: gone.canvasId,
+    });
+
+    expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+    expect(error.data.reason).toBe('canvas_not_found');
+    expect(text).toContain(declaredCanvasNotFoundRecovery());
+  });
+
+  it('stages onto the canvas the caller names when it resolves (#35)', async () => {
+    await syncDomain(300, 0);
+    const tenantId = 'spill-explicit-live';
+    const live = await canvas.acquire(undefined, createMockContext({ tenantId }));
+    const wire = await queryWire(tenantId, { ...WHEAT_2020, canvas_id: live.canvasId });
+
+    expect(wire.structured.spilled).toBe(true);
+    expect(wire.structured.canvas_id).toBe(live.canvasId);
+    expect(wire.structured.staged_row_count).toBe(300);
+  });
+
+  it('answers an inline-sized match without consulting the canvas_id (#35)', async () => {
+    // The id names where to stage; a match within the inline budget stages
+    // nothing, so a dead id does not fail a complete answer.
+    await syncDomain(50, 0);
+    const wire = await queryWire('spill-unknown-canvas-inline', {
+      ...WHEAT_2020,
+      canvas_id: 'zzzzzzzzzz',
+    });
+
+    expect(wire.structured.spilled).toBe(false);
+    expect(wire.structured.canvas_id).toBeUndefined();
+    expect(wire.structured.observations).toHaveLength(50);
+  });
+
+  it('replaces a dead session canvas silently when canvas_id is omitted (#35)', async () => {
+    await syncDomain(300, 0);
+    const ctx = createMockContext({
+      tenantId: 'spill-dead-session-canvas',
+      errors: queryObservationsTool.errors,
+    });
+    // The session remembers a canvas that no longer exists.
+    await ctx.state.set('canvas-id', 'deadcanvas');
+
+    const result = await queryObservationsTool.handler(
+      queryObservationsTool.input.parse(WHEAT_2020),
+      ctx,
+    );
+
+    expect(result.spilled).toBe(true);
+    expect(result.canvas_id).toBeDefined();
+    expect(result.canvas_id).not.toBe('deadcanvas');
+    expect(await ctx.state.get<string>('canvas-id')).toBe(result.canvas_id);
   });
 
   it('matches the issue repro shape: mid-size with aggregates included, every row reachable', async () => {
@@ -375,6 +583,48 @@ describe('faostat_query_observations spillover dead band', () => {
     expect(Number(counted.rows[0]?.n)).toBe(1200);
   });
 
+  it('points a char-budget spill at describe-then-query on both surfaces (#23)', async () => {
+    await syncDomain(1200, 0);
+    const wire = await queryWire('spill-char-pointer', WHEAT_2020);
+
+    expect(wire.structured.spilled).toBe(true);
+    expect(wire.structured.truncated).toBe(false);
+    expect(wire.structured.staged_row_count).toBe(1200);
+    expectDescribeThenQuery(wire);
+    expect(wire.formatted).toContain(String(wire.structured.table_name));
+  });
+
+  it('hands faostat_dataframe_describe a name and canvas_id that return exactly the staged table (#23)', async () => {
+    await syncDomain(1200, 0);
+    // Both contracts on one context: describe reads the session state staging wrote.
+    const ctx = createMockContext({
+      tenantId: 'spill-describe-roundtrip',
+      errors: [...(queryObservationsTool.errors ?? []), ...(dataframeDescribeTool.errors ?? [])],
+    });
+    const result = await queryObservationsTool.handler(
+      queryObservationsTool.input.parse(WHEAT_2020),
+      ctx,
+    );
+    const notice = getEnrichment(ctx).notice as string;
+    const pointer = /faostat_dataframe_describe \(name (\S+), canvas_id ([\w-]+)\)/.exec(notice);
+    expect(pointer).not.toBeNull();
+    const [, name, canvasId] = pointer as RegExpExecArray;
+    expect(name).toBe(result.table_name);
+    expect(canvasId).toBe(result.canvas_id);
+
+    const described = await dataframeDescribeTool.handler(
+      dataframeDescribeTool.input.parse({ name, canvas_id: canvasId }),
+      ctx,
+    );
+    expect(described.tables).toHaveLength(1);
+    expect(described.tables[0]).toMatchObject({
+      name: result.table_name,
+      source_tool: 'faostat_query_observations',
+      row_count: 1200,
+      truncated: false,
+    });
+  });
+
   it('discloses truncation honestly when the staged set hits the 50k cap (never "complete") (#9)', async () => {
     // 260 countries × 200 years = 52,000 country rows (codes < 5000, so none are
     // excluded as aggregates) — past STAGE_MAX_ROWS (50k). The spill helper caps the
@@ -384,17 +634,12 @@ describe('faostat_query_observations spillover dead band', () => {
     expect(total).toBe(52_000);
     expect(total).toBeGreaterThan(STAGE_MAX_ROWS);
 
-    const ctx = createMockContext({
-      tenantId: 'spill-trunc',
-      errors: queryObservationsTool.errors,
-    });
-    const input = queryObservationsTool.input.parse({
+    const wire = await queryWire('spill-trunc', {
       domain: FIXTURE_DOMAIN,
       item_codes: [15],
       element_codes: [5510],
     });
-
-    const result = await queryObservationsTool.handler(input, ctx);
+    const result = wire.structured;
 
     // The staged table is a capped prefix — and the output says so.
     expect(result.spilled).toBe(true);
@@ -404,26 +649,46 @@ describe('faostat_query_observations spillover dead band', () => {
     expect(result.table_name).toBeDefined();
 
     // structuredContent notice discloses the cap + actionable recovery, and never
-    // claims completeness.
-    const notice = getEnrichment(ctx).notice as string;
+    // claims completeness — keeping the PREFIX wording (#9) while pointing at the
+    // staged table, describe first (#23).
+    const notice = wire.notice as string;
     expect(notice).toMatch(/staging cap|only the first/i);
     expect(notice).toMatch(/partition|year_start|narrower/i);
+    expect(notice).toMatch(/the staged set is a PREFIX/);
     expect(notice).not.toMatch(/complete set/i);
     expect(notice).not.toMatch(/over the full set/i);
+    expectDescribeThenQuery(wire);
 
     // content[] twin agrees — INCOMPLETE, never "the complete set".
-    const text = (queryObservationsTool.format?.(result) ?? [])
-      .map((c) => (c.type === 'text' ? c.text : ''))
-      .join('\n');
-    expect(text).toMatch(/INCOMPLETE|Partial result/i);
-    expect(text).not.toMatch(/query the table for the complete set/i);
+    expect(wire.formatted).toMatch(/INCOMPLETE|Partial result/i);
+    expect(wire.formatted).not.toMatch(/query the table for the complete set/i);
 
     // The staged table really is capped at STAGE_MAX_ROWS (not the full 52k match).
-    const instance = await canvas.acquire(result.canvas_id, ctx);
+    const ctx = createMockContext({ tenantId: 'spill-trunc' });
+    const instance = await canvas.acquire(result.canvas_id as string, ctx);
     const counted = await instance.query(`SELECT COUNT(*) AS n FROM ${result.table_name}`, {
       rowLimit: 1,
       denySystemCatalogs: true,
     });
     expect(Number(counted.rows[0]?.n)).toBe(STAGE_MAX_ROWS);
   }, 30_000);
+});
+
+describe('faostat_query_observations canvas pointers in the definition (#23)', () => {
+  it('names both dataframe tools, describe first, wherever a canvas handle is described', () => {
+    const shape = queryObservationsTool.output.shape;
+    for (const field of [shape.canvas_id, shape.table_name]) {
+      expect(field.description).toMatch(/faostat_dataframe_describe[\s\S]*faostat_dataframe_query/);
+    }
+    expect(queryObservationsTool.description).toMatch(
+      /spill to a DataCanvas table[^.]*faostat_dataframe_describe[^.]*faostat_dataframe_query/,
+    );
+  });
+
+  it('never abbreviates the describe tool to the non-callable `/ _describe` shorthand', () => {
+    const surface = `${queryObservationsTool.description}${JSON.stringify(
+      z.toJSONSchema(queryObservationsTool.output),
+    )}`;
+    expect(surface).not.toContain('/ _describe');
+  });
 });

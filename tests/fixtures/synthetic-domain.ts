@@ -137,16 +137,24 @@ function buildVocabDataRows(vocab: DomainVocab): string[] {
  * country-only production path in commodity_profile and the default
  * aggregate-excluding query both require to reach truncation. Returns the ZIP plus
  * the exact row counts (`total = (countryCount + aggregateCount) * years`).
+ *
+ * `value` overrides a country row's value per `(areaCode, year)` — `null` emits an
+ * empty Value cell, which the ingester stores as NULL. Rows stream `ORDER BY year`,
+ * so a function that keeps early years whole (or empty) and makes later years
+ * fractional reproduces a preview window unlike the rows past it. Defaults to
+ * `1000 + areaCode` in every year.
  */
 export function buildMidSizeDomainZip(opts: {
   domain?: string;
   countryCount: number;
   aggregateCount?: number;
   years?: number;
+  value?: (areaCode: number, year: number) => number | null;
 }): { zip: Uint8Array; total: number; countryCount: number; aggregateCount: number } {
   const domain = opts.domain ?? FIXTURE_DOMAIN;
   const aggregateCount = opts.aggregateCount ?? 0;
   const years = opts.years ?? 1;
+  const valueFor = opts.value ?? ((areaCode: number) => 1000 + areaCode);
   const base = `Production_Crops_Livestock_${domain}`;
 
   const dataRows: string[] = [];
@@ -154,12 +162,12 @@ export function buildMidSizeDomainZip(opts: {
   for (let i = 1; i <= opts.countryCount; i++) {
     const m49 = String(i).padStart(3, '0');
     const name = `Country ${i}`;
-    const value = (1000 + i).toFixed(6);
     const flag = i % 3 === 0 ? 'I' : i % 3 === 1 ? 'A' : 'E';
     for (let y = 0; y < years; y++) {
       const year = 2020 + y;
+      const value = valueFor(i, year);
       dataRows.push(
-        `${i},'${m49},${name},15,Wheat,5510,Production,${year},${year},t,${value},${flag},Synth`,
+        `${i},'${m49},${name},15,Wheat,5510,Production,${year},${year},t,${value === null ? '' : value.toFixed(6)},${flag},Synth`,
       );
     }
     areaRows.push(`${i},'${m49},${name}`);

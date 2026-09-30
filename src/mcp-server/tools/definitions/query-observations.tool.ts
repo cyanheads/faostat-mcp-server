@@ -11,7 +11,13 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { canvasEnabled, STAGE_MAX_ROWS, stageObservations } from '@/services/canvas-staging.js';
+import { markdownCell } from '@/mcp-server/tools/markdown-cell.js';
+import {
+  canvasEnabled,
+  OBSERVATION_TABLE_SCHEMA,
+  STAGE_MAX_ROWS,
+  stageObservations,
+} from '@/services/canvas-staging.js';
 import type { ObservationRow } from '@/services/faostat-mirror/index.js';
 import { getFaostatMirror } from '@/services/faostat-mirror/index.js';
 
@@ -37,7 +43,7 @@ function toObservation({
 export const queryObservationsTool = tool('faostat_query_observations', {
   title: 'faostat-mcp-server: query observations',
   description:
-    "Query a FAOSTAT domain's data cube by area(s), item(s), element(s), and year range, returning observations (area, item, element, year, value, unit, and the data-quality flag). Resolve codes first with faostat_resolve_codes — the cube is unqueryable without them. Aggregate regions (World, continents, economic groupings) are EXCLUDED by default so a naive SUM does not double-count a region with its member countries; set include_aggregates=true to get the regional roll-ups, or pass explicit area_codes to query exactly what you name. Small result sets return inline; large ones spill to a DataCanvas table (returned canvas_id + table_name) for GROUP BY / ranking / time-series analysis via faostat_dataframe_query. Every row carries its flag — commonly A=Official, B=time-series break, E=Estimated, I=Imputed, M=Missing (value cannot exist), T=Unofficial, X=from an international organization, plus others FAOSTAT defines per domain — so honor it, treat any unrecognized flag as informational, and never assume an estimated, imputed, or unrecognized value is official.",
+    "Query a FAOSTAT domain's data cube by area(s), item(s), element(s), and year range, returning observations (area, item, element, year, value, unit, and the data-quality flag). Resolve codes first with faostat_resolve_codes — the cube is unqueryable without them. Aggregate regions (World, continents, economic groupings) are EXCLUDED by default so a naive SUM does not double-count a region with its member countries; set include_aggregates=true to get the regional roll-ups, or pass explicit area_codes to query exactly what you name. Small result sets return inline; large ones spill to a DataCanvas table (returned canvas_id + table_name) — call faostat_dataframe_describe for its columns, then faostat_dataframe_query for GROUP BY / ranking / time-series analysis. Every row carries its flag — commonly A=Official, B=time-series break, E=Estimated, I=Imputed, M=Missing (value cannot exist), T=Unofficial, X=from an international organization, plus others FAOSTAT defines per domain — so honor it, treat any unrecognized flag as informational, and never assume an estimated, imputed, or unrecognized value is official.",
   annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: false },
 
   enrichment: {
@@ -75,12 +81,31 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       recovery:
         'Set CANVAS_PROVIDER_TYPE=duckdb to enable SQL on large result sets, or narrow the query.',
     },
+    // Raised by the staging layer when it resolves the caller's canvas_id.
+    {
+      reason: 'canvas_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      thrownBy: 'service',
+      when: 'The result is large enough to stage and canvas_id does not resolve to a live canvas — unknown, expired, or owned by another tenant. A result that fits inline stages nothing and never consults canvas_id.',
+      recovery:
+        'Omit canvas_id to stage onto this session’s canvas, or pass a canvas_id returned within the 2-hour table TTL by an earlier faostat_query_observations / faostat_commodity_profile call.',
+    },
     {
       reason: 'invalid_year_range',
       code: JsonRpcErrorCode.InvalidParams,
       when: 'year_start is greater than year_end — a self-contradictory range that can never match.',
       recovery:
         'Pass year_start ≤ year_end, or omit one bound to leave that side of the range open.',
+    },
+    // Raised by the mirror read pool when the call's ceiling fires.
+    {
+      reason: 'query_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      thrownBy: 'service',
+      retryable: true,
+      when: "The call's mirror reads — time queued behind other calls plus execution — ran past the 45-second per-call ceiling.",
+      recovery:
+        'Retry, or narrow the query with item_codes, element_codes, or a tighter year range so it reads fewer rows.',
     },
   ],
 
@@ -160,12 +185,14 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       .string()
       .optional()
       .describe(
-        'Canvas ID holding the staged result — pass to faostat_dataframe_query / _describe.',
+        'Canvas ID holding the staged table (present when spilled) — pass it with table_name to faostat_dataframe_describe for the columns and types, then to faostat_dataframe_query for SQL.',
       ),
     table_name: z
       .string()
       .optional()
-      .describe('Canvas table name holding the full result set (present when spilled).'),
+      .describe(
+        'Canvas table holding the staged result set (present when spilled; a PREFIX of the match when truncated) — pass it as name to faostat_dataframe_describe, then reference it in faostat_dataframe_query SQL.',
+      ),
     staged_row_count: z
       .number()
       .optional()
@@ -183,15 +210,10 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       throw ctx.fail(
         'domain_not_indexed',
         `Domain "${code}" is not in the local mirror selection.`,
-        ctx.recoveryFor('domain_not_indexed'),
       );
     }
     if (!(await mirror.ready(code))) {
-      throw ctx.fail(
-        'index_not_ready',
-        `The ${code} mirror has not completed its initial sync.`,
-        ctx.recoveryFor('index_not_ready'),
-      );
+      throw ctx.fail('index_not_ready', `The ${code} mirror has not completed its initial sync.`);
     }
 
     // A reversed year range is a contradiction the mirror would silently treat as
@@ -204,7 +226,6 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       throw ctx.fail(
         'invalid_year_range',
         `year_start (${input.year_start}) is after year_end (${input.year_end}).`,
-        ctx.recoveryFor('invalid_year_range'),
       );
     }
 
@@ -238,15 +259,18 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       includeAggregates: input.include_aggregates,
     };
 
+    // One ceiling for the call, across both the probe and the staging stream.
+    const signal = mirror.readSignal(ctx.signal);
+
     // Overflow probe (not a COUNT): fetch just past the inline budget so the spill
     // decision never scans the whole cube. Widen the fetch to at least
     // INLINE_PREVIEW_ROWS so the probe can always tell "exceeds the inline budget"
     // even when a small input.limit was requested; the display slice caps at limit.
-    const { rows, total, totalIsExact } = await mirror.queryObservations(code, {
-      ...filters,
-      limit: Math.max(input.limit, INLINE_PREVIEW_ROWS),
-      offset: 0,
-    });
+    const { rows, total, totalIsExact } = await mirror.queryObservations(
+      code,
+      { ...filters, limit: Math.max(input.limit, INLINE_PREVIEW_ROWS), offset: 0 },
+      signal,
+    );
 
     if (total === 0) {
       ctx.enrich.total(0);
@@ -263,16 +287,16 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       throw ctx.fail(
         'canvas_disabled',
         `Result exceeds the ${INLINE_PREVIEW_ROWS}-row inline budget but DataCanvas is disabled.`,
-        ctx.recoveryFor('canvas_disabled'),
       );
     }
 
     if (shouldSpill) {
       const staged = await stageObservations(
         ctx,
-        mirror.streamObservations(code, filters, STAGE_MAX_ROWS + 1),
+        mirror.streamObservations(code, filters, STAGE_MAX_ROWS + 1, signal),
         {
           sourceTool: 'faostat_query_observations',
+          schema: OBSERVATION_TABLE_SCHEMA,
           // Spill on the caller's inline budget as well as the char budget, so a
           // result that drains under the char budget but exceeds `limit` still
           // lands on a table instead of forcing a choice between ignoring `limit`
@@ -304,13 +328,16 @@ export const queryObservationsTool = tool('faostat_query_observations', {
         // size of an inline-fit set), or the cap (a floor) when truncated.
         ctx.enrich.total(staged.rowCount);
         if (staged.spilled) {
+          // The pointer travels with the id: describe by name (a canvas_id alone
+          // lists every table on the canvas), then query.
+          const describe = `faostat_dataframe_describe (name ${staged.tableName}, canvas_id ${staged.canvasId})`;
           if (staged.truncated) {
             ctx.enrich.notice(
-              `Matched more than ${STAGE_MAX_ROWS} observations — only the first ${staged.rowCount} were staged on canvas table ${staged.tableName} (staging cap ${STAGE_MAX_ROWS}) — the staged set is a PREFIX, not the complete result. To capture the rest, re-call faostat_query_observations partitioned by year (year_start/year_end) or with narrower area_codes/item_codes/element_codes so each partition stays under the cap, then query each with faostat_dataframe_query (canvas_id ${staged.canvasId}).`,
+              `Matched more than ${STAGE_MAX_ROWS} observations — only the first ${staged.rowCount} were staged on canvas table ${staged.tableName} (staging cap ${STAGE_MAX_ROWS}) — the staged set is a PREFIX, not the complete result. Call ${describe} for its columns and types, then faostat_dataframe_query to analyze the staged rows. To capture the rest, re-call faostat_query_observations partitioned by year (year_start/year_end) or with narrower area_codes/item_codes/element_codes so each partition stays under the cap, then query each with faostat_dataframe_query (canvas_id ${staged.canvasId}).`,
             );
           } else {
             ctx.enrich.notice(
-              `Result of ${staged.rowCount} observations staged on canvas table ${staged.tableName}; the first ${observations.length} are shown inline. Use faostat_dataframe_query (canvas_id ${staged.canvasId}) for GROUP BY, ranking, and time-series analysis over the full set.`,
+              `Result of ${staged.rowCount} observations staged on canvas table ${staged.tableName} (canvas_id ${staged.canvasId}); the first ${observations.length} are shown inline. Call ${describe} for its columns and types, then faostat_dataframe_query for GROUP BY, ranking, and time-series analysis over the full set.`,
             );
           }
           return {
@@ -377,7 +404,7 @@ export const queryObservationsTool = tool('faostat_query_observations', {
     lines.push('| --- | --- | --- | --- | --- | --- | --- |');
     for (const o of result.observations) {
       lines.push(
-        `| ${o.area} (${o.area_code}) | ${o.item} (${o.item_code}) | ${o.element} (${o.element_code}) | ${o.year} | ${o.value ?? ''} | ${o.unit ?? ''} | ${o.flag ?? ''} |`,
+        `| ${markdownCell(o.area)} (${o.area_code}) | ${markdownCell(o.item)} (${o.item_code}) | ${markdownCell(o.element)} (${o.element_code}) | ${o.year} | ${o.value ?? ''} | ${markdownCell(o.unit)} | ${markdownCell(o.flag)} |`,
       );
     }
     return [{ type: 'text', text: lines.join('\n') }];
