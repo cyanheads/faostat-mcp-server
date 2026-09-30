@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/faostat-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/faostat-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.1.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/faostat-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/faostat-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 [![Install in Claude Desktop](https://img.shields.io/badge/Install_in-Claude_Desktop-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://github.com/cyanheads/faostat-mcp-server/releases/latest/download/faostat-mcp-server.mcpb) [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=faostat-mcp-server&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBjeWFuaGVhZHMvZmFvc3RhdC1tY3Atc2VydmVyIl19) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22faostat-mcp-server%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40cyanheads%2Ffaostat-mcp-server%22%5D%7D)
 
@@ -55,7 +55,7 @@ Global food and agriculture statistics from the UN FAOSTAT bulk-download corpus 
 - Item/element matches are scoped to codes present in the given `domain`'s cube; area codes are shared across domains
 - Every area match is flagged `country` or `aggregate` (codes ≥ 5000, plus curated sub-threshold roll-ups such as China=351)
 - `limit` (max 200, default 50) + `offset` page the match set
-- Typed errors: `unknown_domain`, `index_not_ready`
+- Typed errors: `unknown_domain`, `index_not_ready`, `query_timeout`
 
 ---
 
@@ -63,9 +63,9 @@ Global food and agriculture statistics from the UN FAOSTAT bulk-download corpus 
 
 - Filters by `area_codes` / `item_codes` / `element_codes` and an inclusive `year_start` / `year_end` range
 - Aggregate regions excluded by default (`include_aggregates: false`); explicit `area_codes` bypass the exclusion
-- `limit` caps the inline page (default 200, max 1000); a match that exceeds it spills in full to a DataCanvas table (50,000-row staging cap) for SQL via `faostat_dataframe_query`
+- `limit` caps the inline page (default 200, max 1000); a match that exceeds it spills in full to a DataCanvas table (50,000-row staging cap) — `faostat_dataframe_describe` for its columns, then SQL via `faostat_dataframe_query`
 - Every row carries its data-quality `flag` (`A`/`E`/`I`/`B`/`M`/`T`/`X`, others per domain) — never dropped
-- Typed errors: `domain_not_indexed`, `index_not_ready`, `canvas_disabled`, `invalid_year_range`
+- Typed errors: `domain_not_indexed`, `index_not_ready`, `canvas_disabled`, `canvas_not_found`, `invalid_year_range`, `query_timeout`
 
 ---
 
@@ -74,8 +74,9 @@ Global food and agriculture statistics from the UN FAOSTAT bulk-download corpus 
 - Resolves `item_query` to up to 5 item codes, then ranks top producers/exporters/importers and returns an annual production trend in one call
 - Rankings are per-country sums grouped by unit, each country at its own latest reporting year; countries only (aggregates excluded)
 - Returns a partial, production-only profile with a notice — rather than failing — when the trade domain (TCL) isn't indexed or still syncing
-- `top_n` caps each ranked list (max 50); the merged observation set spills to a DataCanvas table for further SQL
-- Typed errors: `no_match`, `index_not_ready`, `invalid_year_range`
+- `top_n` caps each ranked list (max 50); when the merged observation set is too large to inline it spills to a DataCanvas table — `faostat_dataframe_describe` for its columns, then `faostat_dataframe_query` for further SQL
+- Every staging outcome is stated in the notice: the staged table, a set that fit inline, a staging failure, or a disabled canvas
+- Typed errors: `no_match`, `domain_not_indexed`, `index_not_ready`, `invalid_year_range`, `canvas_not_found`, `query_timeout`
 
 ---
 
@@ -233,11 +234,13 @@ The corpus is not bundled. Before the data tools can answer queries, sync the se
 
 ```sh
 bun run mirror:init      # one-time bootstrap — downloads and indexes the FAOSTAT_DOMAINS set
-bun run mirror:refresh   # re-sync domains whose upstream update date has advanced
+bun run mirror:refresh   # re-sync domains whose upstream update date has advanced; build missing planner statistics
 bun run mirror:verify    # report sync status, local row counts, and sample reads
 ```
 
 `mirror:init` is idempotent and resumable per domain — re-running after an interrupt re-streams only the unfinished domain ZIP. `FAOSTAT_DOMAINS` selects which domains are indexed; everything else in the catalog shows in `faostat_list_domains` with `indexed: false` until added and re-synced. On HTTP transport, set `FAOSTAT_REFRESH_CRON` to refresh in-process on a schedule; on stdio, run `mirror:refresh` out-of-band. The read tools return `index_not_ready` until the first sync completes.
+
+`mirror:refresh` also builds query-planner statistics (`ANALYZE`) for any selected domain that has none, even when its data is unchanged upstream — a mirror synced by an older release, or one whose last build failed. Otherwise the server builds them itself, in the background on a worker thread, the first time a data read touches that domain, and keeps answering meanwhile.
 
 ## Configuration
 
@@ -277,7 +280,7 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 
   ```sh
   bun run devcheck   # Lint, format, typecheck, security
-  bun run test       # Vitest test suite
+  bun run test       # Vitest suite under Bun, then under Node
   bun run lint:mcp   # Validate MCP definitions against spec
   ```
 
@@ -288,12 +291,12 @@ docker build -t faostat-mcp-server .
 docker run --rm -p 3010:3010 -v faostat-mirror:/usr/src/app/.faostat-mirror faostat-mcp-server
 ```
 
-The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `/var/log/faostat-mcp-server`. The build stage compiles the native dependencies (`@duckdb/node-api`, `better-sqlite3`) and the production stage reuses the prebuilt `node_modules`, so the slim runtime image carries no build toolchain. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them. Mount a volume at the mirror path to persist the corpus across container recreations, and bootstrap it inside the container:
+The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `/var/log/faostat-mcp-server`. A dedicated dependency stage installs the production tree for the target platform (DuckDB's prebuilt native binding included), so the slim runtime image carries no build toolchain and a multi-arch build never runs Bun under emulation. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them. Mount a volume at the mirror path to persist the corpus across container recreations, and bootstrap it inside the container:
 
 ```sh
 docker exec <container> bun run mirror:init      # one-time bootstrap
 docker exec <container> bun run mirror:verify    # sync status + sample reads
-docker exec <container> bun run mirror:refresh   # re-sync when FAO has updated a domain
+docker exec <container> bun run mirror:refresh   # re-sync updated domains; build missing planner statistics
 ```
 
 ## Project structure
@@ -303,7 +306,7 @@ docker exec <container> bun run mirror:refresh   # re-sync when FAO has updated 
 | `src/index.ts` | `createApp()` entry point — registers the six tools, wires the mirror and canvas in `setup()`, schedules the HTTP refresh. |
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools/definitions` | Tool definitions (`*.tool.ts`). |
-| `src/services/faostat-mirror` | The bulk-download mirror service — manifest discovery, streaming ZIP ingester, CSV parsing, dimension store, SQLite-backed `MirrorService` wiring. |
+| `src/services/faostat-mirror` | The bulk-download mirror service — manifest discovery, streaming ZIP ingester, CSV parsing, dimension store, SQLite-backed `MirrorService` wiring, and the two-worker read pool (`read-pool.ts`, `read-worker.ts`) that runs cube reads and statistics builds off the main thread. |
 | `src/services/canvas-accessor.ts`, `canvas-staging.ts` | DataCanvas accessor and the spill/query/describe staging layer. |
 | `scripts/faostat-mirror-*.ts` | `mirror:init` / `mirror:refresh` / `mirror:verify` CLIs. |
 | `tests/` | Unit and integration tests mirroring `src/`. |

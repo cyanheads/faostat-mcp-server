@@ -1,6 +1,6 @@
 # faostat-mcp-server - Directory Structure
 
-Generated on: 2026-09-19 16:58:49
+Generated on: 2026-09-30 16:17:14
 
 ```text
 faostat-mcp-server/
@@ -131,10 +131,12 @@ faostat-mcp-server/
 │   ├── faostat-mirror-init.ts
 │   ├── faostat-mirror-refresh.ts
 │   ├── faostat-mirror-verify.ts
+│   ├── install-otel.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
 │   ├── release-github.ts
+│   ├── test-node.ts
 │   └── tree.ts
 ├── src/
 │   ├── config/
@@ -145,13 +147,14 @@ faostat-mcp-server/
 │   │   ├── resources/
 │   │   │   └── definitions/
 │   │   └── tools/
-│   │       └── definitions/
-│   │           ├── commodity-profile.tool.ts
-│   │           ├── dataframe-describe.tool.ts
-│   │           ├── dataframe-query.tool.ts
-│   │           ├── list-domains.tool.ts
-│   │           ├── query-observations.tool.ts
-│   │           └── resolve-codes.tool.ts
+│   │       ├── definitions/
+│   │       │   ├── commodity-profile.tool.ts
+│   │       │   ├── dataframe-describe.tool.ts
+│   │       │   ├── dataframe-query.tool.ts
+│   │       │   ├── list-domains.tool.ts
+│   │       │   ├── query-observations.tool.ts
+│   │       │   └── resolve-codes.tool.ts
+│   │       └── markdown-cell.ts
 │   ├── services/
 │   │   ├── faostat-mirror/
 │   │   │   ├── csv.ts
@@ -161,21 +164,31 @@ faostat-mcp-server/
 │   │   │   ├── index.ts
 │   │   │   ├── ingester.ts
 │   │   │   ├── manifest.ts
+│   │   │   ├── read-pool.ts
+│   │   │   ├── read-worker.ts
 │   │   │   └── types.ts
 │   │   ├── canvas-accessor.ts
 │   │   └── canvas-staging.ts
 │   └── index.ts
 ├── tests/
 │   ├── fixtures/
+│   │   ├── crash-read-worker.mjs
 │   │   └── synthetic-domain.ts
+│   ├── helpers/
+│   │   └── markdown-table.ts
 │   ├── prompts/
 │   ├── resources/
+│   ├── scripts/
+│   │   ├── mirror-context.test.ts
+│   │   └── test-node.test.ts
 │   ├── services/
 │   │   ├── csv.test.ts
 │   │   ├── faostat-mirror-index.test.ts
+│   │   ├── faostat-mirror-off-thread.test.ts
 │   │   ├── faostat-mirror.test.ts
 │   │   ├── http-headers.test.ts
 │   │   ├── ingester-parse.test.ts
+│   │   ├── ingester-status.test.ts
 │   │   └── manifest.test.ts
 │   └── tools/
 │       ├── commodity-profile-aggregation.test.ts
@@ -188,10 +201,13 @@ faostat-mcp-server/
 │       ├── dataframe-query-reasons.test.ts
 │       ├── error-contract.test.ts
 │       ├── list-domains-pagination.test.ts
+│       ├── list-domains-upstream-errors.test.ts
+│       ├── observation-table-format.test.ts
 │       ├── query-observations-spillover.test.ts
 │       ├── query-observations-validation.test.ts
 │       ├── resolve-codes-domain-scope.test.ts
-│       └── resolve-codes-pagination.test.ts
+│       ├── resolve-codes-pagination.test.ts
+│       └── staged-value-type.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes

@@ -2,9 +2,9 @@
 
 **Server:** faostat-mcp-server
 **Version:** 0.2.4
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.6`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.10`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.0.0 (via the framework)
+**MCP SDK:** `@modelcontextprotocol/server` ^2.1.0 (via the framework)
 **Zod:** ^4.6.5
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -87,10 +87,9 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
   async handler(input, ctx) {
     const mirror = getFaostatMirror();
     if (!mirror.isSelected(input.domain)) {
-      throw ctx.fail('unknown_domain', `Domain "${input.domain}" is not indexed.`,
-        ctx.recoveryFor('unknown_domain'));
+      throw ctx.fail('unknown_domain', `Domain "${input.domain}" is not indexed.`);
     }
-    const { matches, total } = await mirror.resolve(input.dimension, { /* … */ });
+    const { matches, total } = await mirror.resolve(input.domain, input.dimension, { /* … */ });
     ctx.enrich({ totalMatches: total, truncated: total > matches.length });
     return { domain: input.domain.toUpperCase(), dimension: input.dimension, matches };
   },
@@ -104,17 +103,23 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
 
 ### Analytical tools — DataCanvas staging
 
-`faostat_query_observations` and `faostat_commodity_profile` inline a small preview and **spill** large result sets to a DuckDB-backed canvas table via the staging helpers in `src/services/canvas-staging.ts`. The returned `canvas_id` + `table_name` are then queried by the mandatory `faostat_dataframe_query` / `faostat_dataframe_describe` pair — without that pair the spilled token is dead output. Guard with `canvasEnabled()` and surface `canvas_disabled` when staging is off.
+`faostat_query_observations` and `faostat_commodity_profile` inline a small preview and **spill** large result sets to a DuckDB-backed canvas table via the staging helpers in `src/services/canvas-staging.ts`. The returned `canvas_id` + `table_name` are then read through the mandatory `faostat_dataframe_describe` / `faostat_dataframe_query` pair — without that pair the spilled token is dead output. Guard with `canvasEnabled()` and surface `canvas_disabled` when staging is off.
+
+`schema` is required: pass `OBSERVATION_TABLE_SCHEMA` (the ten `streamObservations` columns) or `PROFILE_TABLE_SCHEMA` (those plus `domain`). The staged types are declared, never inferred from the preview rows — inference types `value` from whatever the preview window holds, and a whole-number window truncates every later fractional value.
 
 ```ts
-import { canvasEnabled, stageObservations } from '@/services/canvas-staging.js';
+import {
+  canvasEnabled, OBSERVATION_TABLE_SCHEMA, STAGE_MAX_ROWS, stageObservations,
+} from '@/services/canvas-staging.js';
 
+// One per call, before its first mirror read: the call's signal plus the 45 s query_timeout ceiling.
+const signal = mirror.readSignal(ctx.signal);
 if (shouldSpill && !canvasEnabled()) {
-  throw ctx.fail('canvas_disabled', `Result has ${total} rows — too large to inline.`,
-    ctx.recoveryFor('canvas_disabled'));
+  throw ctx.fail('canvas_disabled', `Result has ${total} rows — too large to inline.`);
 }
-const staged = await stageObservations(ctx, mirror.streamObservations(code, filters), {
+const staged = await stageObservations(ctx, mirror.streamObservations(code, filters, STAGE_MAX_ROWS + 1, signal), {
   sourceTool: 'faostat_query_observations',
+  schema: OBSERVATION_TABLE_SCHEMA,
   queryParams: { domain: code, /* … */ },
 });
 // staged.spilled, staged.canvasId, staged.tableName, staged.previewRows
@@ -191,12 +196,12 @@ Handlers receive a unified `ctx` object. Key properties:
 | Property | Description |
 |:---------|:------------|
 | `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. Dual-sink: Pino **and** `notifications/message` to the client, so treat it as client-visible. |
-| `ctx.state` | Tenant-scoped KV — `.get(key)`, `.set(key, value, { ttl? })`, `.delete(key)`, `.getMany(keys)`, `.list(prefix, { cursor, limit })`. The canvas staging layer resolves the session canvas from here. |
+| `ctx.state` | Tenant-scoped KV — `.get(key)`, `.set(key, value, { ttl? })`, `.delete(key)`, `.getMany(keys)`, `.list(prefix, { cursor, limit })`. Accepts any JSON-serializable value; reads return its JSON form (a `Date` comes back as an ISO string). The canvas staging layer resolves the session canvas from here. |
 | `ctx.enrich` | Attach enrichment fields (declared in `enrichment`) to both client surfaces — `ctx.enrich({ … })`, plus `.total(n)` and `.notice(msg)` shorthands for the common count/guidance fields. |
-| `ctx.fail` | Throw a typed contract error — `ctx.fail(reason, message, recovery?)`, with `reason` checked against the tool's `errors[]` union. Pair with `ctx.recoveryFor(reason)`. |
+| `ctx.fail` | Throw a typed contract error — `ctx.fail(reason, message, recovery?)`, with `reason` checked against the tool's `errors[]` union. The declared `recovery` reaches the wire on its own; pass `recovery` only to override it. |
 | `ctx.signal` | `AbortSignal` for cancellation — threaded into manifest/ZIP fetches. |
-| `ctx.requestId` | Unique request ID. |
-| `ctx.tenantId` | Tenant ID from JWT or `'default'` for stdio. |
+| `ctx.requestId` | Request ID — the one every log record of the call carries and its error envelope returns as `data.requestId`. |
+| `ctx.tenantId` | Tenant ID from JWT; `'default'` for stdio or HTTP with auth off. |
 
 `ctx.requestInput` / `ctx.inputs` aren't used — every tool is read-only and non-interactive, which is why `createApp()` declares `sessionMode: 'stateless'` (and `.env.example` plus the Docker image set `MCP_SESSION_MODE=stateless` to match). A handler that ever does need a value the caller didn't supply must `return ctx.requestInput({ inputRequests: { key: inputRequired.elicit({ message, requestedSchema }) } })` and read `ctx.inputs.accepted(key, schema)` on re-entry — never `await` for user input mid-handler.
 
@@ -206,7 +211,7 @@ Handlers receive a unified `ctx` object. Key properties:
 
 Handlers throw — the framework catches, classifies, and formats.
 
-**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, severity?, thrownBy? }]` on `tool()` / `resource()` to receive `ctx.fail(reason, …)` typed against the reason union. TypeScript catches typos at compile time, `data.reason` is auto-populated for observability, linter enforces conformance against the handler body. `recovery` is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. Pass `ctx.recoveryFor('reason')` as the throw's data to put it on the wire (`data.recovery.hint`, mirrored into `content[]` text unless the message already contains it verbatim); override with an explicit `{ recovery: { hint: '...' } }` when dynamic runtime context matters. Forwarding it is lint-enforced per throw site (`error-contract-recovery-unforwarded`). Mark an entry the service layer throws with `thrownBy: 'service'` so `error-contract-unthrown` skips it — lint-only metadata, nothing at runtime reads it. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
+**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, severity?, thrownBy? }]` on `tool()` / `resource()` to receive `ctx.fail(reason, …)` typed against the reason union. TypeScript catches typos at compile time, `data.reason` is auto-populated for observability, linter enforces conformance against the handler body. `recovery` is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. The framework puts it on the wire whenever a failure carrying that `reason` arrives without a hint — a bare `ctx.fail('reason')` or a service throw with `data: { reason }` — as `data.recovery.hint`, mirrored into `content[]` text unless the message already contains it verbatim; override with an explicit `{ recovery: { hint: '...' } }` when dynamic runtime context matters. Every error envelope also carries `data.requestId`, the id the server's log records for that call carry, and `content[]` closes with `(reason … · request <id>)`. Mark an entry the service layer throws with `thrownBy: 'service'` so `error-contract-unthrown` skips it — lint-only metadata, nothing at runtime reads it. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
 
 ```ts
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
@@ -259,13 +264,17 @@ src/
     faostat-mirror/
       index.ts                          # initFaostatMirror() / getFaostatMirror() accessor + barrel
       faostat-mirror.ts                 # FaostatMirror — per-domain MirrorService + dimension store
+      read-pool.ts                      # ReadPool — cube reads + statistics builds on 2 worker threads, per-call query_timeout ceiling
+      read-worker.ts                    # Worker entry — runs a read or an ANALYZE; self-contained (package + node: imports only)
       ingester.ts                       # Streaming bulk-ZIP → SQLite ingester
       manifest.ts                       # Bulk manifest fetch/parse (datasets_E.json)
       csv.ts, dimensions-store.ts, http.ts, types.ts
   mcp-server/
-    tools/definitions/
-      list-domains.tool.ts  resolve-codes.tool.ts  query-observations.tool.ts
-      commodity-profile.tool.ts  dataframe-query.tool.ts  dataframe-describe.tool.ts
+    tools/
+      markdown-cell.ts                  # markdownCell() — table-cell escaping shared by the format()s
+      definitions/
+        list-domains.tool.ts  resolve-codes.tool.ts  query-observations.tool.ts
+        commodity-profile.tool.ts  dataframe-query.tool.ts  dataframe-describe.tool.ts
 scripts/
   faostat-mirror-init.ts  faostat-mirror-refresh.ts  faostat-mirror-verify.ts  _mirror-context.ts
 ```
@@ -308,10 +317,9 @@ Available skills:
 | `tool-defs-analysis` | Read-only audit of MCP definition language across the surface — voice, leaks, defaults, recovery hints, output descriptions |
 | `security-pass` | Audit server for MCP-flavored security gaps: output injection, scope blast radius, input sinks, tenant isolation |
 | `code-simplifier` | Post-session cleanup against `git diff` — modernize syntax, consolidate duplication, align with the codebase |
-| `devcheck` | Lint, format, typecheck, audit |
 | `polish-docs-meta` | Finalize docs, README, metadata, and agent protocol for shipping |
-| `git-wrapup` | Land working-tree changes as a versioned commit + annotated tag — version bump, changelog, verify, tag. Local only. |
-| `release-and-publish` | Push + npm + MCP Registry + GH Release + Docker. Picks up from `git-wrapup` |
+| `git-wrapup` | Land working-tree changes as a commit stack — version bump, changelog, verify, commit by concern, release commit on top. No tag, no push to main; opens the release PR when the project declares release PR mode |
+| `release-and-publish` | Fast-forward merge (release PR mode) + tag + push + npm + MCP Registry + GH Release + Docker. Picks up from `git-wrapup` |
 | `release-pr-review` | Review pass on an open release PR — simplifier + correctness review, fixes as ordinary commits on top of the stack, PR body kept in sync. Release PR mode only |
 | `maintenance` | Investigate changelogs, adopt upstream changes, sync skills to agent dirs |
 | `techniques` | Catalog of response/data-shaping techniques — overflow handling, payload shaping, retrieval patterns |
@@ -347,22 +355,26 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run rebuild` | Clean + build |
 | `bun run clean` | Remove build artifacts |
 | `bun run devcheck` | Lint + format + typecheck + security + changelog sync |
-| `bun run audit:refresh` | Delete `bun.lock`, reinstall, and re-run `bun audit`. Use when `devcheck` flags a transitive advisory — Bun's `update` is sticky on transitive resolutions, so the advisory may be a stale-lockfile false positive. If it survives the refresh, it's real. |
+| `bun run audit:fix` | `bun audit fix` — upgrade vulnerable packages to the lowest safe version within existing ranges (`--dry-run` previews, `--latest` rewrites ranges). First response when `devcheck` flags a transitive advisory; then `bun update <name>`, then `bun dedupe` |
+| `bun run audit:refresh` | Delete `bun.lock` and reinstall. Last resort after `audit:fix`, `bun update <name>`, and `bun dedupe` — re-resolves every ranged dep (the framework pin included) and rewrites the lockfile as `lockfileVersion: 2` |
 | `bun run list-skills` | Print the skill registry |
 | `bun run tree` | Generate directory structure doc |
 | `bun run format` | Auto-fix formatting (safe fixes only) |
 | `bun run format:unsafe` | Also apply Biome's unsafe autofixes — review the diff; they can change behavior |
-| `bun run test` | Run tests (Vitest — use `bun run test`, not `bun test`) |
+| `bun run test` | Run tests (Vitest — use `bun run test`, not `bun test`) under Bun (`bun:sqlite`), then under real Node (`better-sqlite3`) — the runtime the npm bin and `.mcpb` use. `[run] bun = true` makes `node` inside `bun run` Bun's alias, so the Node lane finds a real `node` on PATH and fails if there is none |
+| `bun run test:node` | Only the Node lane. Extra arguments go to Vitest (`bun run test:node tests/tools/x.test.ts`) |
 | `bun run start:stdio` | Production mode (stdio) |
 | `bun run start:http` | Production mode (HTTP) |
 | `bun run mirror:init` | One-time bootstrap — download and index the `FAOSTAT_DOMAINS` set into the local mirror. Idempotent, resumable per domain. Required before the data tools answer queries. |
-| `bun run mirror:refresh` | Re-sync domains whose upstream `DateUpdate` has advanced (skips unchanged). Run out-of-band on stdio; HTTP transport schedules it via `FAOSTAT_REFRESH_CRON`. |
+| `bun run mirror:refresh` | Re-sync domains whose upstream `DateUpdate` has advanced (skips unchanged), and build query-planner statistics (`ANALYZE`) for any domain that has none, unchanged ones included. Run out-of-band on stdio; HTTP transport schedules it via `FAOSTAT_REFRESH_CRON`. |
 | `bun run mirror:verify` | Report per-domain sync status, local row counts, and sample reads against the mirror. |
 | `bun run lint:mcp` | Validate MCP tool definitions against the spec (format-parity, schema shape, naming). Rule catalog: `api-linter` skill. |
 | `bun run lint:packaging` | Validate `manifest.json` ↔ `server.json` env-var consistency (run by devcheck). |
 | `bun run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/*.md` |
 | `bun run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
 | `bun run bundle` | Build, pack, and clean a `.mcpb` for one-click Claude Desktop install |
+
+**CI is one file.** `.github/workflows/codeql.yml` (scaffolded) is the only GitHub Actions workflow: CodeQL is GitHub-owned end to end, and the file runs only while the repo's CodeQL *default setup* is turned off. Verification — `devcheck`, tests, the release gates — runs locally; don't add a workflow that re-runs it.
 
 ---
 
