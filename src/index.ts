@@ -111,11 +111,13 @@ await createApp({
   },
 
   /**
-   * Counterpart to `setup()`. The mirror holds a SQLite handle per selected
-   * domain plus the shared dimension database, opened lazily on the read path
-   * and held until closed — nothing else calls `close()`, so without this the
-   * files stay open until the process dies. The framework already stops the
-   * refresh cron via `schedulerService.destroyAll()`.
+   * Counterpart to `setup()`. `mirror.close()` first shuts down the read-worker
+   * pool — rejecting queued and running reads, and closing idle workers and their
+   * handles — then closes the SQLite handle per selected domain plus the shared
+   * dimension database, opened lazily on the read path and held until closed.
+   * Nothing else calls `close()`, so without this the files stay open until the
+   * process dies. The framework already stops the refresh cron via
+   * `schedulerService.destroyAll()`.
    */
   async teardown() {
     await mirror?.close();
