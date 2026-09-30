@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.5](changelog/0.2.x/0.2.5.md) — 2026-09-30
+
+Mirror reads and query-planner statistics builds move off the serving thread onto a two-worker pool bounded by a retryable 45 s query_timeout, plus fixes across canvas staging, commodity_profile, and resolve_codes under Node.
+
 ## [0.2.4](changelog/0.2.x/0.2.4.md) — 2026-09-19 · 🛡️ Security
 
 Fixes a markdown-escaping CodeQL finding, validates canvas_id at the schema, declares stateless session mode in code, and bumps mcp-ts-core to ^0.13.6.

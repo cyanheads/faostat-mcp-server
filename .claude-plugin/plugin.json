@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "faostat-mcp-server",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Global food & agriculture statistics from the UN FAOSTAT bulk-download corpus, served from a local SQLite mirror with a DataCanvas SQL surface, over MCP. STDIO & Streamable HTTP.",
   "author": {
     "name": "cyanheads",
