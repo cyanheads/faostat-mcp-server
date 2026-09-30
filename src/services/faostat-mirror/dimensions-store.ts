@@ -235,10 +235,11 @@ export class DimensionsStore {
    * `domainCodes` scopes item/element resolution to the codes actually present in
    * a domain's cube (issue #8): the dimension vocabulary is a union across every
    * indexed domain, so an unscoped resolve can surface a code absent from the
-   * requested domain. When set, the scope is applied as a SQL predicate INSIDE
-   * each branch — before any LIMIT/offset windowing — so `total` and the paged
-   * slice reflect the domain-scoped set, not the global one (this composes with
-   * the `offset`/`limit` window layered on top; issue #7). Undefined means no
+   * requested domain. When set, the scope is applied INSIDE each branch — before
+   * any LIMIT/offset windowing — so `total` and the paged slice reflect the
+   * domain-scoped set, not the global one (this composes with the `offset`/`limit`
+   * window layered on top; issue #7). The LIKE and list-all branches scope with a
+   * SQL predicate; the FTS branch filters its ranked matches (#36). Undefined means no
    * scoping (areas, whose vocabularies legitimately overlap domains); an empty
    * array is a real scope (the domain has no codes in this dimension) and matches
    * nothing.
@@ -263,10 +264,8 @@ export class DimensionsStore {
     // invalid empty `IN ()` predicate.
     if (domainCodes && domainCodes.length === 0) return { matches: [], total: 0 };
 
-    // The domain-membership predicate reused across the query/LIKE/list-all
-    // branches. In the external-content FTS table the code is `rowid`; the other
-    // branches filter on the code column. `domainParams` is empty (no-op spread)
-    // when unscoped.
+    // The domain-membership predicate the LIKE and list-all branches filter the code
+    // column with. `domainParams` is empty (no-op spread) when unscoped.
     const domainPlaceholders = domainCodes?.map(() => '?').join(', ');
     const domainParams = domainCodes ?? [];
 
@@ -277,21 +276,26 @@ export class DimensionsStore {
       return { matches: row ? [row] : [], total: row ? 1 : 0 };
     }
 
-    // FTS relevance match. Every matching (domain-scoped) rowid is fetched — no SQL
-    // LIMIT — so `total` is the exact scoped count and the offset/limit window is a
-    // JS slice. `ORDER BY rank, rowid`: rank alone has no tiebreaker, so rowid
-    // stabilizes the order across paged calls.
+    // FTS relevance match. Every matching rowid is fetched — no SQL LIMIT — and the
+    // domain scope filters that list, so `total` is the exact scoped count and the
+    // offset/limit window is a JS slice. `ORDER BY rank, rowid`: rank alone has no
+    // tiebreaker, so rowid stabilizes the order across paged calls.
+    //
+    // The scope never reaches FTS5 as a `rowid` constraint beside MATCH (#36). FTS5
+    // claims `rowid = ?` so the core never re-checks it, then honors the bound value
+    // only when it is INTEGER. better-sqlite3 binds every JS number as REAL, and a
+    // one-code `rowid IN (?)` is rewritten to `rowid = ?`, so under Node the scope
+    // was silently dropped and every match came back.
     const ftsMatch = opts.query ? toFtsMatch(opts.query) : undefined;
     if (ftsMatch) {
-      const where = domainPlaceholders
-        ? `${cfg.ftsTable} MATCH ? AND rowid IN (${domainPlaceholders})`
-        : `${cfg.ftsTable} MATCH ?`;
+      const scope = domainCodes && new Set(domainCodes);
       const ids = h
         .prepare<{ rowid: number }>(
-          `SELECT rowid FROM ${cfg.ftsTable} WHERE ${where} ORDER BY rank, rowid`,
+          `SELECT rowid FROM ${cfg.ftsTable} WHERE ${cfg.ftsTable} MATCH ? ORDER BY rank, rowid`,
         )
-        .all(ftsMatch, ...domainParams)
-        .map((r) => r.rowid);
+        .all(ftsMatch)
+        .map((r) => r.rowid)
+        .filter((id) => !scope || scope.has(id));
       const total = ids.length;
       const matches = ids
         .slice(offset, offset + opts.limit)
