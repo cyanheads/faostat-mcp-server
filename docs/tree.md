@@ -1,6 +1,6 @@
 # faostat-mcp-server - Directory Structure
 
-Generated on: 2026-09-30 16:17:14
+Generated on: 2026-10-04 06:42:03
 
 ```text
 faostat-mcp-server/
@@ -26,6 +26,7 @@ faostat-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
+│   ├── 0.3.x/
 │   └── template.md
 ├── docs/
 │   └── design.md
@@ -135,6 +136,7 @@ faostat-mcp-server/
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   ├── test-node.ts
 │   └── tree.ts
@@ -150,6 +152,7 @@ faostat-mcp-server/
 │   │       ├── definitions/
 │   │       │   ├── commodity-profile.tool.ts
 │   │       │   ├── dataframe-describe.tool.ts
+│   │       │   ├── dataframe-drop.tool.ts
 │   │       │   ├── dataframe-query.tool.ts
 │   │       │   ├── list-domains.tool.ts
 │   │       │   ├── query-observations.tool.ts
@@ -171,6 +174,9 @@ faostat-mcp-server/
 │   │   └── canvas-staging.ts
 │   └── index.ts
 ├── tests/
+│   ├── config/
+│   │   ├── server-config.test.ts
+│   │   └── startup-config-error.test.ts
 │   ├── fixtures/
 │   │   ├── crash-read-worker.mjs
 │   │   └── synthetic-domain.ts
@@ -197,6 +203,8 @@ faostat-mcp-server/
 │       ├── dataframe-canvas-id-optional.test.ts
 │       ├── dataframe-describe-pagination.test.ts
 │       ├── dataframe-describe-provenance.test.ts
+│       ├── dataframe-drop-registration.test.ts
+│       ├── dataframe-drop.test.ts
 │       ├── dataframe-query-format.test.ts
 │       ├── dataframe-query-reasons.test.ts
 │       ├── error-contract.test.ts
