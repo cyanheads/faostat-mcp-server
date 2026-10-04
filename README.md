@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/faostat-mcp-server</h1>
   <p><b>Global food & agriculture statistics from the UN FAOSTAT bulk-download corpus, served from a local SQLite mirror with a DataCanvas SQL surface, over MCP. STDIO & Streamable HTTP.</b>
-  <div>6 Tools • 0 Resources • 0 Prompts</div>
+  <div>7 Tools • 0 Resources • 0 Prompts</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.5-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.1.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/faostat-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/faostat-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.5-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/faostat-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/faostat-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 [![Install in Claude Desktop](https://img.shields.io/badge/Install_in-Claude_Desktop-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://github.com/cyanheads/faostat-mcp-server/releases/latest/download/faostat-mcp-server.mcpb) [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=faostat-mcp-server&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBjeWFuaGVhZHMvZmFvc3RhdC1tY3Atc2VydmVyIl19) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22faostat-mcp-server%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40cyanheads%2Ffaostat-mcp-server%22%5D%7D)
 
@@ -37,6 +37,7 @@ Global food and agriculture statistics from the UN FAOSTAT bulk-download corpus 
 | `faostat_commodity_profile` | Workflow: assemble top producers, the production trend, and trade flows for one commodity from the production and trade domains in a single call. |
 | `faostat_dataframe_query` | Run a read-only SQL `SELECT` against the canvas tables staged by the analytical tools. |
 | `faostat_dataframe_describe` | List the canvas tables staged this session, each with provenance, row count, and column schema. |
+| `faostat_dataframe_drop` | Drop one staged canvas table before its 2-hour TTL. Opt-in — callable only with `FAOSTAT_DATAFRAME_DROP_ENABLED=true`. |
 
 ## Capability reference
 
@@ -94,6 +95,15 @@ Global food and agriculture statistics from the UN FAOSTAT bulk-download corpus 
 - Lists staged tables with source tool, query params, row count, column schema, and creation/expiry (2-hour sliding TTL)
 - `name` describes one table outright; otherwise `offset` + `limit` (max 100, default 20) page the listing newest-first
 - Typed errors: `canvas_disabled`, `canvas_not_found`, `missing_table`
+
+---
+
+### `faostat_dataframe_drop` <sub>tool</sub>
+
+- Opt-in: registered disabled — listed on the landing page with its enable hint, absent from `tools/list` — unless `FAOSTAT_DATAFRAME_DROP_ENABLED=true`
+- Drops one staged `faostat_xxxxxxxx` table and its provenance from the session canvas, or from the canvas a `canvas_id` names
+- Idempotent: a name not staged on that canvas returns `dropped: false` with a notice and changes nothing
+- Typed errors: `canvas_disabled`, `canvas_not_found`
 
 ## Features
 
@@ -198,7 +208,7 @@ No API key is required — the FAOSTAT bulk-download service is public and keyle
 
 ### Prerequisites
 
-- [Bun v1.3.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
 - Disk for the local mirror. The default domain set (`QCL,TCL,FBS,FS,RL,GLE,RFN,QV`, ∼37M rows) needs a few GB; `TCL` (∼17M rows) dominates and can be dropped from `FAOSTAT_DOMAINS` on a constrained host.
 
 ### Installation
@@ -251,6 +261,7 @@ bun run mirror:verify    # report sync status, local row counts, and sample read
 | `FAOSTAT_BULK_BASE_URL` | FAOSTAT bulk-download service base URL (manifest + per-domain ZIPs). | `https://bulks-faostat.fao.org/production` |
 | `FAOSTAT_REFRESH_CRON` | Cron for the in-process incremental refresh (HTTP transport only). Omit to disable and run `mirror:refresh` out-of-band. | — |
 | `CANVAS_PROVIDER_TYPE` | DataCanvas engine. `duckdb` enables the SQL surface; set `none` to disable analytical staging (the `dataframe_*` tools then report `canvas_disabled` and large queries refuse to spill). | `duckdb` |
+| `FAOSTAT_DATAFRAME_DROP_ENABLED` | Set `true` to make `faostat_dataframe_drop` callable. Off, the tool is registered disabled: absent from `tools/list`, shown on the landing page with this hint. | `false` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_SESSION_MODE` | HTTP session mode: `stateless`, `stateful`, or `auto` (resolves to `stateful`). The server declares `stateless` in `src/index.ts` — no tool asks the caller for input mid-handler — and setting this overrides that declaration. | `stateless` |
 | `MCP_HTTP_PORT` | Port for the HTTP server. | `3010` |
@@ -303,11 +314,11 @@ docker exec <container> bun run mirror:refresh   # re-sync updated domains; buil
 
 | Directory | Purpose |
 |:----------|:--------|
-| `src/index.ts` | `createApp()` entry point — registers the six tools, wires the mirror and canvas in `setup()`, schedules the HTTP refresh. |
+| `src/index.ts` | `createApp()` entry point — registers the seven tools (`faostat_dataframe_drop` behind its opt-in flag), wires the mirror and canvas in `setup()`, schedules the HTTP refresh. |
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools/definitions` | Tool definitions (`*.tool.ts`). |
 | `src/services/faostat-mirror` | The bulk-download mirror service — manifest discovery, streaming ZIP ingester, CSV parsing, dimension store, SQLite-backed `MirrorService` wiring, and the two-worker read pool (`read-pool.ts`, `read-worker.ts`) that runs cube reads and statistics builds off the main thread. |
-| `src/services/canvas-accessor.ts`, `canvas-staging.ts` | DataCanvas accessor and the spill/query/describe staging layer. |
+| `src/services/canvas-accessor.ts`, `canvas-staging.ts` | DataCanvas accessor and the spill/query/describe/drop staging layer. |
 | `scripts/faostat-mirror-*.ts` | `mirror:init` / `mirror:refresh` / `mirror:verify` CLIs. |
 | `tests/` | Unit and integration tests mirroring `src/`. |
 

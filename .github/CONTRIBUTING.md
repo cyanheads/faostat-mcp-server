@@ -2,9 +2,7 @@
 
 Thanks for using `faostat-mcp-server`. Bugs, feature requests, and documentation gaps all belong in an issue — that's where they get read and picked up.
 
-Open one from the [Issues tab](https://github.com/cyanheads/faostat-mcp-server/issues/new/choose) and pick the **Bug Report** or **Feature Request** form. Both are structured, and filling in the fields is what makes an issue actionable.
-
-PRs are welcome; open an issue first for anything larger than a typo.
+Open one from the [Issues tab](https://github.com/cyanheads/faostat-mcp-server/issues/new/choose) and pick the **Bug Report** or **Feature Request** form. Both are structured, and filling in the fields is what makes an issue actionable. Anything that fits neither can be a plain issue — a half-formed idea in your own words is fine.
 
 ## Server bug or framework bug?
 

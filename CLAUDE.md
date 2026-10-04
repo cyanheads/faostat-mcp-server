@@ -2,9 +2,9 @@
 
 **Server:** faostat-mcp-server
 **Version:** 0.2.5
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.10`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.11`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.1.0 (via the framework)
+**MCP SDK:** `@modelcontextprotocol/server` ^2.2.0 (via the framework)
 **Zod:** ^4.6.5
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -42,11 +42,11 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ## Patterns
 
-This server is **tools-only** — six tools, no resources, no prompts (the data behind every resource candidate is already reachable through the tools, and the one workflow worth structuring ships as `faostat_commodity_profile`). All definitions live in `src/mcp-server/tools/definitions/`.
+This server is **tools-only** — seven tools (`faostat_dataframe_drop` opt-in via `FAOSTAT_DATAFRAME_DROP_ENABLED`), no resources, no prompts (the data behind every resource candidate is already reachable through the tools, and the one workflow worth structuring ships as `faostat_commodity_profile`). All definitions live in `src/mcp-server/tools/definitions/`.
 
 ### Tool
 
-Real definitions: `list-domains`, `resolve-codes`, `query-observations`, `commodity-profile`, `dataframe-query`, `dataframe-describe`. The shape below — typed `errors[]` contract, `ctx.fail()`, `ctx.enrich`, and a `format()` that renders every field — is shared across them.
+Real definitions: `list-domains`, `resolve-codes`, `query-observations`, `commodity-profile`, `dataframe-query`, `dataframe-describe`, `dataframe-drop`. The shape below — typed `errors[]` contract, `ctx.fail()`, `ctx.enrich`, and a `format()` that renders every field — is shared across them.
 
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
@@ -103,7 +103,7 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
 
 ### Analytical tools — DataCanvas staging
 
-`faostat_query_observations` and `faostat_commodity_profile` inline a small preview and **spill** large result sets to a DuckDB-backed canvas table via the staging helpers in `src/services/canvas-staging.ts`. The returned `canvas_id` + `table_name` are then read through the mandatory `faostat_dataframe_describe` / `faostat_dataframe_query` pair — without that pair the spilled token is dead output. Guard with `canvasEnabled()` and surface `canvas_disabled` when staging is off.
+`faostat_query_observations` and `faostat_commodity_profile` inline a small preview and **spill** large result sets to a DuckDB-backed canvas table via the staging helpers in `src/services/canvas-staging.ts`. The returned `canvas_id` + `table_name` are then read through the mandatory `faostat_dataframe_describe` / `faostat_dataframe_query` pair — without that pair the spilled token is dead output. `faostat_dataframe_drop` removes one staged table ahead of its TTL; it is opt-in, so `src/index.ts` registers it through `dataframeDropRegistration()`, which wraps it in `disabledTool()` unless `FAOSTAT_DATAFRAME_DROP_ENABLED=true`, and the server `instructions` name it only when it is live. Guard with `canvasEnabled()` and surface `canvas_disabled` when staging is off.
 
 `schema` is required: pass `OBSERVATION_TABLE_SCHEMA` (the ten `streamObservations` columns) or `PROFILE_TABLE_SCHEMA` (those plus `domain`). The staged types are declared, never inferred from the preview rows — inference types `value` from whatever the preview window holds, and a whole-number window truncates every later fractional value.
 
@@ -145,6 +145,8 @@ const ServerConfigSchema = z.object({
     .describe('Directory holding the per-domain SQLite mirrors + shared dimension DB.'),
   refreshCron: z.string().optional()
     .describe('Cron for the in-process incremental refresh (HTTP transport only).'),
+  dataframeDropEnabled: z.stringbool().default(false)
+    .describe('Register faostat_dataframe_drop live; otherwise it is registered disabled.'),
 });
 
 let _config: z.infer<typeof ServerConfigSchema> | undefined;
@@ -154,10 +156,13 @@ export function getServerConfig() {
     domains: 'FAOSTAT_DOMAINS',
     mirrorPath: 'FAOSTAT_MIRROR_PATH',
     refreshCron: 'FAOSTAT_REFRESH_CRON',
+    dataframeDropEnabled: 'FAOSTAT_DATAFRAME_DROP_ENABLED',
   });
   return _config;
 }
 ```
+
+`src/index.ts` loads `./.env` and reads the drop flag with `dataframeDropRequested()` before `createApp()`, since the flag decides how a tool registers. That read never throws; the full config is validated by `getServerConfig()` in `setup()`, so a bad value fails behind the framework's startup banner.
 
 `parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`FAOSTAT_DOMAINS`) not the path (`domains`). Throws `ConfigurationError`, which the framework prints as a clean startup banner. `CANVAS_PROVIDER_TYPE` is a core var (already in `AppConfig`), not part of this schema; `src/index.ts` defaults it to `duckdb`.
 
@@ -175,7 +180,8 @@ await createApp({
   title: 'faostat-mcp-server',
   sessionMode: 'stateless',
   tools: [listDomainsTool, resolveCodesTool, queryObservationsTool,
-          commodityProfileTool, dataframeQueryTool, dataframeDescribeTool],
+          commodityProfileTool, dataframeQueryTool, dataframeDescribeTool,
+          dataframeDropRegistration(dataframeDropEnabled)],
   instructions: 'Global food & agriculture statistics from the UN FAOSTAT … Workflow: ' +
     'faostat_list_domains → faostat_resolve_codes → faostat_query_observations …',
   setup(core) { /* wire canvas + mirror, schedule HTTP refresh */ },
@@ -260,7 +266,7 @@ src/
     server-config.ts                    # Server-specific env vars (Zod schema, parseEnvConfig)
   services/
     canvas-accessor.ts                  # Module-level getCanvas()/setCanvas() (core.canvas, wired in setup())
-    canvas-staging.ts                   # spill / query / describe staging over the DataCanvas
+    canvas-staging.ts                   # spill / query / describe / drop staging over the DataCanvas
     faostat-mirror/
       index.ts                          # initFaostatMirror() / getFaostatMirror() accessor + barrel
       faostat-mirror.ts                 # FaostatMirror — per-domain MirrorService + dimension store
@@ -275,6 +281,7 @@ src/
       definitions/
         list-domains.tool.ts  resolve-codes.tool.ts  query-observations.tool.ts
         commodity-profile.tool.ts  dataframe-query.tool.ts  dataframe-describe.tool.ts
+        dataframe-drop.tool.ts
 scripts/
   faostat-mirror-init.ts  faostat-mirror-refresh.ts  faostat-mirror-verify.ts  _mirror-context.ts
 ```
@@ -369,7 +376,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run mirror:refresh` | Re-sync domains whose upstream `DateUpdate` has advanced (skips unchanged), and build query-planner statistics (`ANALYZE`) for any domain that has none, unchanged ones included. Run out-of-band on stdio; HTTP transport schedules it via `FAOSTAT_REFRESH_CRON`. |
 | `bun run mirror:verify` | Report per-domain sync status, local row counts, and sample reads against the mirror. |
 | `bun run lint:mcp` | Validate MCP tool definitions against the spec (format-parity, schema shape, naming). Rule catalog: `api-linter` skill. |
-| `bun run lint:packaging` | Validate `manifest.json` ↔ `server.json` env-var consistency (run by devcheck). |
+| `bun run lint:packaging` | Packaging surface checks — `server.json`/`manifest.json` env-var parity and the `server.json` npm entries' shape (run by devcheck). |
 | `bun run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/*.md` |
 | `bun run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
 | `bun run bundle` | Build, pack, and clean a `.mcpb` for one-click Claude Desktop install |
