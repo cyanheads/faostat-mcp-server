@@ -8,10 +8,11 @@
  * a connection that has loaded its schema keeps the planner statistics it read
  * then, so the main thread bumps the epoch after each successful `ANALYZE`.
  *
- * Opening retries on `SQLITE_BUSY`: `openSqliteHandle` switches the connection to
- * WAL before it sets `busy_timeout`, so that first statement fails at once — with
- * no wait — while another connection in the process holds a lock it needs, such
- * as one recovering the WAL index after other workers' connections were released.
+ * An open that meets another connection's lock — one recovering the WAL index
+ * after other workers' connections were released, say — waits it out inside
+ * `openSqliteHandle`, which sets `busy_timeout` before its first read of the file.
+ * A failed open rejects as `DatabaseError`, the driver's error on `cause`, and
+ * reaches the main thread as that `McpError` code.
  *
  * The file must load as-is from `src/` (Node type-stripping, Bun, Vitest) and from
  * `dist/`: package and `node:` imports only — no `@/` alias, no relative runtime
@@ -19,13 +20,8 @@
  * @module services/faostat-mirror/read-worker
  */
 
-import { setTimeout as sleep } from 'node:timers/promises';
 import { parentPort } from 'node:worker_threads';
 import { openSqliteHandle, type SqliteHandle, type SqlValue } from '@cyanheads/mcp-ts-core/mirror';
-
-/** How long an open keeps retrying `SQLITE_BUSY` — the handle's own `busy_timeout`. */
-const OPEN_BUSY_WAIT_MS = 5000;
-const OPEN_RETRY_INTERVAL_MS = 10;
 
 /** Run `sql` against `file` and reply with every row. */
 export interface ReadRequest {
@@ -73,31 +69,12 @@ if (!port) throw new Error('read-worker runs only as a worker thread.');
 
 const handles = new Map<string, { epoch: number; handle: SqliteHandle }>();
 
-/**
- * `openSqliteHandle`, retried on any `SQLITE_BUSY*` code (`SQLITE_BUSY_RECOVERY`
- * is the one seen: another connection recovering the WAL index) for as long as
- * `busy_timeout` would wait.
- */
-async function open(file: string): Promise<SqliteHandle> {
-  const deadline = Date.now() + OPEN_BUSY_WAIT_MS;
-  for (;;) {
-    try {
-      return await openSqliteHandle(file);
-    } catch (error) {
-      const { code } = error as { code?: unknown };
-      const busy = typeof code === 'string' && code.startsWith('SQLITE_BUSY');
-      if (!busy || Date.now() >= deadline) throw error;
-      await sleep(OPEN_RETRY_INTERVAL_MS);
-    }
-  }
-}
-
 async function handleFor(file: string, epoch: number): Promise<SqliteHandle> {
   const cached = handles.get(file);
   if (cached?.epoch === epoch) return cached.handle;
   cached?.handle.close();
   handles.delete(file);
-  const handle = await open(file);
+  const handle = await openSqliteHandle(file);
   handles.set(file, { epoch, handle });
   return handle;
 }

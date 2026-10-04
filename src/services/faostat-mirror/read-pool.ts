@@ -183,8 +183,9 @@ export class ReadPool {
    * Build `table`'s planner statistics in `file` on a worker, and resolve with how
    * long the `ANALYZE` statement ran, in ms. Takes no signal, so it is never cut off:
    * it rejects only with the driver's error (a writer holding the lock past
-   * `busy_timeout`, a read-only file), or when the pool closes first. The caller
-   * reports success to the other workers with {@link invalidate}.
+   * `busy_timeout`, a read-only file), with `DatabaseError` when the worker cannot
+   * open the file, or when the pool closes first. The caller reports success to the
+   * other workers with {@link invalidate}.
    */
   analyze(file: string, table: string): Promise<number> {
     if (this.closed) {

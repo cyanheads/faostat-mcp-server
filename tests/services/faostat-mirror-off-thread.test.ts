@@ -32,7 +32,7 @@
  * @module tests/services/faostat-mirror-off-thread
  */
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -440,6 +440,45 @@ describe('ReadPool', () => {
     const pool = track(new ReadPool());
     await expect(pool.analyze(spinFile, 'missing_table')).rejects.toThrow(/no such table/);
     expect(pool.stats()).toMatchObject({ building: 0, busy: 0, live: 1, retired: 0 });
+  });
+
+  it("opens a file behind another connection's lock once the lock is released", async () => {
+    const file = await analyzable('locked.db');
+    // An exclusive-mode connection keeps its lock after the transaction ends, so the
+    // worker's first open of the file finds it locked until the holder closes.
+    const holder = await openSqliteHandle(file);
+    holder.exec('PRAGMA locking_mode = EXCLUSIVE');
+    holder.exec('BEGIN EXCLUSIVE');
+    holder.exec('COMMIT');
+    let held = true;
+    const releaseLock = () => {
+      if (held) holder.close();
+      held = false;
+    };
+    const release = setTimeout(releaseLock, 300);
+    try {
+      const pool = track(new ReadPool());
+      const start = performance.now();
+      await expect(
+        pool.all({ file, sql: 'SELECT COUNT(*) AS n FROM t', params: [] }),
+      ).resolves.toEqual([{ n: 500 }]);
+      // Answered only after the holder let go, not around the lock.
+      expect(performance.now() - start).toBeGreaterThanOrEqual(250);
+    } finally {
+      clearTimeout(release);
+      releaseLock();
+    }
+  });
+
+  it('rejects a read whose file cannot be opened as DatabaseError and keeps the worker', async () => {
+    const file = join(dir, 'not-a-database.db');
+    writeFileSync(file, 'plain text, not a SQLite database file'.repeat(32));
+    const pool = track(new ReadPool());
+    await expect(pool.all({ file, sql: 'SELECT 1', params: [] })).rejects.toMatchObject({
+      code: JsonRpcErrorCode.DatabaseError,
+    });
+    await expect(pool.all(quick(3))).resolves.toEqual([{ n: 3 }]);
+    expect(pool.stats()).toMatchObject({ busy: 0, live: 1, retired: 0 });
   });
 
   it('never gives both workers to builds: a second build waits while reads pass it (#24)', async () => {
