@@ -18,18 +18,8 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/faostat-mcp-server",
-      "runtimeHint": "node",
+      "runtimeHint": "npx",
       "version": "0.2.5",
-      "packageArguments": [
-        {
-          "type": "positional",
-          "value": "run"
-        },
-        {
-          "type": "positional",
-          "value": "start:stdio"
-        }
-      ],
       "environmentVariables": [
         {
           "name": "FAOSTAT_DOMAINS",
@@ -60,6 +50,13 @@
           "default": "duckdb"
         },
         {
+          "name": "FAOSTAT_DATAFRAME_DROP_ENABLED",
+          "description": "Set to 'true' to make faostat_dataframe_drop callable, so a staged table can be dropped before its 2-hour TTL. Off by default: the tool is registered disabled.",
+          "format": "boolean",
+          "isRequired": false,
+          "default": "false"
+        },
+        {
           "name": "MCP_LOG_LEVEL",
           "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
           "format": "string",
@@ -75,19 +72,15 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/faostat-mcp-server",
-      "runtimeHint": "node",
+      "runtimeHint": "npx",
       "version": "0.2.5",
-      "packageArguments": [
-        {
-          "type": "positional",
-          "value": "run"
-        },
-        {
-          "type": "positional",
-          "value": "start:http"
-        }
-      ],
       "environmentVariables": [
+        {
+          "name": "MCP_TRANSPORT_TYPE",
+          "description": "Selects the HTTP transport.",
+          "format": "string",
+          "value": "http"
+        },
         {
           "name": "MCP_HTTP_HOST",
           "description": "The hostname for the HTTP server.",
@@ -149,6 +142,13 @@
           "format": "string",
           "isRequired": false,
           "default": "duckdb"
+        },
+        {
+          "name": "FAOSTAT_DATAFRAME_DROP_ENABLED",
+          "description": "Set to 'true' to make faostat_dataframe_drop callable, so a staged table can be dropped before its 2-hour TTL. Off by default: the tool is registered disabled.",
+          "format": "boolean",
+          "isRequired": false,
+          "default": "false"
         },
         {
           "name": "MCP_LOG_LEVEL",

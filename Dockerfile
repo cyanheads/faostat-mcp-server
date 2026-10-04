@@ -22,8 +22,10 @@ COPY package.json bun.lock ./
 # --ignore-scripts skips dependency postinstalls: @duckdb/node-api ships prebuilt
 # platform binaries (no build step) and better-sqlite3's node-gyp build is unused
 # under Bun (the runtime uses bun:sqlite), so skipping them avoids an exit-127
-# abort without losing anything the image needs.
-RUN bun install --frozen-lockfile --ignore-scripts
+# abort without losing anything the image needs. The BuildKit cache mount
+# persists Bun's global package cache across builds.
+RUN --mount=type=cache,target=/root/.bun/install/cache \
+    bun install --frozen-lockfile --ignore-scripts
 
 # Copy the rest of the source code
 COPY . .
@@ -37,10 +39,10 @@ RUN bun run build
 #
 # Installs the production dependency tree for the target platform. Every step
 # here can run JavaScript — bunfig.toml's security scanner runs as a Bun
-# program, and so does the OTel script — so the stage runs on $BUILDPLATFORM
-# and cross-installs with `--os`/`--cpu`, which pick each platform-specific
-# optional dependency (DuckDB's native binding) for the target. Only
-# `node_modules` leaves this stage.
+# program, and so do the OTel and musl-prune scripts — so the stage runs on
+# $BUILDPLATFORM and cross-installs with `--os`/`--cpu`, which pick each
+# platform-specific optional dependency (DuckDB's native binding) for the
+# target. Only `node_modules` leaves this stage.
 #
 # A clean image rather than `FROM build`: the build stage's node_modules holds
 # devDependencies.
@@ -91,6 +93,14 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
     if [ "$OTEL_ENABLED" = "true" ]; then \
       bun scripts/install-otel.ts --os="$TARGETOS" --cpu="$(cat .bun-cpu)"; \
     fi
+
+# `--os`/`--cpu` have no libc counterpart, so a native dependency published in
+# glibc and musl variants (DuckDB's bindings, for one) installs both. The
+# runtime image is Debian (glibc) and never loads the musl copy; the script
+# deletes every package whose own `libc` admits only musl. It follows every
+# install, since a later `bun install` restores what it removes.
+COPY scripts/prune-musl-packages.ts ./scripts/
+RUN bun scripts/prune-musl-packages.ts
 
 # The seeded scanner served only the installs above; keep it out of the image.
 RUN rm -rf node_modules/@socketsecurity/bun-security-scanner
