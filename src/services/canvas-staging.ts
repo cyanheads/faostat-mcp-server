@@ -2,10 +2,11 @@
  * @fileoverview Thin staging layer between the FAOSTAT analytical tools and the
  * framework DataCanvas. Holds one shared canvas per tenant (id persisted in
  * `ctx.state`), spills an observation stream to a `faostat_<id>` table with a
- * per-table TTL + provenance metadata, and runs read-only SQL across staged
- * tables. Best-effort: a canvas failure logs and returns a degraded result so
- * the caller's inline answer still lands — except a caller-named canvas that
- * does not resolve, which fails the call. Mirrors the secedgar canvas-bridge
+ * per-table TTL + provenance metadata, runs read-only SQL across staged tables,
+ * and drops one ahead of its TTL on request. Spilling is best-effort: a canvas
+ * failure logs and returns a degraded result so the caller's inline answer still
+ * lands — except a caller-named canvas that does not resolve, which fails the
+ * call. Mirrors the secedgar canvas-bridge
  * shape, scoped to FAOSTAT's per-query spillover (tables are ephemeral working
  * slices, not the durable corpus — that lives in the mirror).
  * @module services/canvas-staging
@@ -336,6 +337,33 @@ export async function describeStaged(
     cursor = page.cursor;
   } while (cursor);
   return entries.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+/**
+ * Drop one staged table and its provenance ahead of its TTL; resolves `true` when a
+ * table by that name existed on the resolved canvas. An explicit `canvasId` resolves
+ * that canvas — throwing `canvas_not_found` for an unknown/other-tenant id, which the
+ * tool's declared recovery completes (see {@link acquireExplicit}); omitted uses the
+ * session's shared canvas. Only that canvas's table is dropped and only metadata
+ * recorded for it is cleared, so a valid-but-different `canvas_id` reaches nothing
+ * staged elsewhere.
+ */
+export async function dropStaged(
+  ctx: Context,
+  tableName: string,
+  opts: { canvasId?: string } = {},
+): Promise<boolean> {
+  const canvas = getCanvas();
+  if (!canvas) throw new Error('DataCanvas is not enabled. Set CANVAS_PROVIDER_TYPE=duckdb.');
+  await sweepExpired(ctx);
+  const instance = opts.canvasId
+    ? await acquireExplicit(canvas, opts.canvasId, ctx)
+    : await acquireShared(ctx);
+  const dropped = await instance.drop(tableName);
+  const metaKey = `${META_PREFIX}${tableName}`;
+  const meta = await ctx.state.get<StagedTableMeta>(metaKey);
+  if (meta?.canvasId === instance.canvasId) await ctx.state.delete(metaKey);
+  return dropped;
 }
 
 /**

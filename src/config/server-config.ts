@@ -35,6 +35,12 @@ const ServerConfigSchema = z.object({
     .describe(
       'Cron expression for the in-process incremental refresh (HTTP transport only). Omit to disable scheduled refresh and run `bun run mirror:refresh` out-of-band instead. Recommended "0 6 * * *" (daily off-peak).',
     ),
+  dataframeDropEnabled: z
+    .stringbool()
+    .default(false)
+    .describe(
+      'Set to "true" to register faostat_dataframe_drop live; otherwise it is registered disabled, with the enable hint, and is absent from tools/list.',
+    ),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
@@ -48,8 +54,22 @@ export function getServerConfig(): ServerConfig {
     domains: 'FAOSTAT_DOMAINS',
     mirrorPath: 'FAOSTAT_MIRROR_PATH',
     refreshCron: 'FAOSTAT_REFRESH_CRON',
+    dataframeDropEnabled: 'FAOSTAT_DATAFRAME_DROP_ENABLED',
   });
   return _config;
+}
+
+/**
+ * Whether `faostat_dataframe_drop` registers live, read before `createApp()` fixes the
+ * tool list. Never throws: a value that does not parse reads as off here, and
+ * `getServerConfig()` in `setup()` then rejects it behind the framework's startup
+ * banner — the full config is validated only there.
+ */
+export function dataframeDropRequested(): boolean {
+  const parsed = ServerConfigSchema.shape.dataframeDropEnabled.safeParse(
+    process.env.FAOSTAT_DATAFRAME_DROP_ENABLED,
+  );
+  return parsed.success && parsed.data;
 }
 
 /** Parse `FAOSTAT_DOMAINS` into a normalized, de-duplicated, upper-cased code list. */

@@ -22,6 +22,7 @@ import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testi
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { commodityProfileTool } from '@/mcp-server/tools/definitions/commodity-profile.tool.js';
 import { dataframeDescribeTool } from '@/mcp-server/tools/definitions/dataframe-describe.tool.js';
+import { dataframeDropTool } from '@/mcp-server/tools/definitions/dataframe-drop.tool.js';
 import { dataframeQueryTool } from '@/mcp-server/tools/definitions/dataframe-query.tool.js';
 import { queryObservationsTool } from '@/mcp-server/tools/definitions/query-observations.tool.js';
 import { setCanvas } from '@/services/canvas-accessor.js';
@@ -77,6 +78,10 @@ describe('canvas_id input shape', () => {
     [
       'faostat_dataframe_query',
       (v: string) => dataframeQueryTool.input.parse({ sql: 'SELECT 1', canvas_id: v }),
+    ],
+    [
+      'faostat_dataframe_drop',
+      (v: string) => dataframeDropTool.input.parse({ name: 'faostat_ab12cd34', canvas_id: v }),
     ],
     [
       'faostat_query_observations',

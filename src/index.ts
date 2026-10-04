@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 /**
  * @fileoverview faostat-mcp-server entry point. Wires the FAOSTAT bulk-download
- * mirror service + the DataCanvas accessor in `setup()`, registers the six tools,
- * and (on HTTP transport) schedules the incremental mirror refresh.
+ * mirror service + the DataCanvas accessor in `setup()`, registers the seven
+ * tools (`faostat_dataframe_drop` disabled unless FAOSTAT_DATAFRAME_DROP_ENABLED
+ * is on), and (on HTTP transport) schedules the incremental mirror refresh.
  * @module index
  */
 
@@ -14,9 +15,14 @@ import {
   runtimeCaps,
   schedulerService,
 } from '@cyanheads/mcp-ts-core/utils';
-import { getServerConfig, selectedDomainCodes } from '@/config/server-config.js';
+import {
+  dataframeDropRequested,
+  getServerConfig,
+  selectedDomainCodes,
+} from '@/config/server-config.js';
 import { commodityProfileTool } from '@/mcp-server/tools/definitions/commodity-profile.tool.js';
 import { dataframeDescribeTool } from '@/mcp-server/tools/definitions/dataframe-describe.tool.js';
+import { dataframeDropRegistration } from '@/mcp-server/tools/definitions/dataframe-drop.tool.js';
 import { dataframeQueryTool } from '@/mcp-server/tools/definitions/dataframe-query.tool.js';
 import { listDomainsTool } from '@/mcp-server/tools/definitions/list-domains.tool.js';
 import { queryObservationsTool } from '@/mcp-server/tools/definitions/query-observations.tool.js';
@@ -24,11 +30,27 @@ import { resolveCodesTool } from '@/mcp-server/tools/definitions/resolve-codes.t
 import { setCanvas } from '@/services/canvas-accessor.js';
 import { type FaostatMirror, initFaostatMirror } from '@/services/faostat-mirror/index.js';
 
+/**
+ * The canvas default and the drop gate below read the environment before
+ * createApp(), so load ./.env here rather than depend on when the framework's own
+ * load runs. Variables already set keep their values, as in the framework's load.
+ */
+try {
+  process.loadEnvFile();
+} catch (err) {
+  if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+}
+
 // DuckDB is the only canvas engine and ships as a direct dependency, so enable
 // the canvas by default. Set CANVAS_PROVIDER_TYPE=none to turn it off (e.g. on a
 // memory-constrained deployment); the analytical tools then degrade to inline-
 // only and refuse to stage large result sets with a clear canvas_disabled error.
 process.env.CANVAS_PROVIDER_TYPE ??= 'duckdb';
+
+// Read before createApp(): it decides how the drop tool registers and whether the
+// instructions name it. The full config is validated in setup(), where a bad value
+// fails behind the framework's startup banner.
+const dataframeDropEnabled = dataframeDropRequested();
 
 /**
  * Adapts the framework logger to the mirror's duck-typed `MirrorLogger`. Sync
@@ -68,9 +90,11 @@ await createApp({
     commodityProfileTool,
     dataframeQueryTool,
     dataframeDescribeTool,
+    dataframeDropRegistration(dataframeDropEnabled),
   ],
-  instructions:
-    'Global food & agriculture statistics from the UN FAOSTAT bulk-download corpus, served from a local SQLite mirror (the public REST API is auth-gated). Workflow: faostat_list_domains to find a domain code → faostat_resolve_codes to turn commodity/country/metric names into the integer codes the cube needs → faostat_query_observations for the data. Aggregate regions (World, continents) are excluded by default so sums are not double-counted — set include_aggregates=true for roll-ups. Large results spill to a DataCanvas table; query it with faostat_dataframe_query (discover table/column names via faostat_dataframe_describe). faostat_commodity_profile bundles producers + trend + trade for one commodity in a single call. Every observation carries a data-quality flag — commonly A=Official, B=time-series break, E=Estimated, I=Imputed, M=Missing (value cannot exist), T=Unofficial, X=from an international organization, plus others FAOSTAT defines per domain — honor it, and treat any unrecognized flag as informational (never assume official).',
+  // A disabled tool is absent from tools/list, so the drop sentence rides only
+  // when the tool is callable.
+  instructions: `Global food & agriculture statistics from the UN FAOSTAT bulk-download corpus, served from a local SQLite mirror (the public REST API is auth-gated). Workflow: faostat_list_domains to find a domain code → faostat_resolve_codes to turn commodity/country/metric names into the integer codes the cube needs → faostat_query_observations for the data. Aggregate regions (World, continents) are excluded by default so sums are not double-counted — set include_aggregates=true for roll-ups. Large results spill to a DataCanvas table; query it with faostat_dataframe_query (discover table/column names via faostat_dataframe_describe).${dataframeDropEnabled ? ' faostat_dataframe_drop removes a staged table before its 2-hour TTL once an analysis with it is finished.' : ''} faostat_commodity_profile bundles producers + trend + trade for one commodity in a single call. Every observation carries a data-quality flag — commonly A=Official, B=time-series break, E=Estimated, I=Imputed, M=Missing (value cannot exist), T=Unofficial, X=from an international organization, plus others FAOSTAT defines per domain — honor it, and treat any unrecognized flag as informational (never assume official).`,
   setup(core) {
     const cfg = getServerConfig();
     const domains = selectedDomainCodes(cfg);
