@@ -10,8 +10,11 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { FaostatMirror } from '@/services/faostat-mirror/faostat-mirror.js';
+import { queryObservationsTool } from '@/mcp-server/tools/definitions/query-observations.tool.js';
+import { resolveCodesTool } from '@/mcp-server/tools/definitions/resolve-codes.tool.js';
+import { type FaostatMirror, initFaostatMirror } from '@/services/faostat-mirror/faostat-mirror.js';
 import {
   buildDomainZip,
   chunkedResponse,
@@ -32,7 +35,7 @@ describe('FaostatMirror end-to-end', () => {
       'fetch',
       vi.fn(async () => chunkedResponse(zip, 64)),
     );
-    mirror = new FaostatMirror({ dir, domains: [FIXTURE_DOMAIN] });
+    mirror = initFaostatMirror({ dir, domains: [FIXTURE_DOMAIN] });
     await mirror.runDomainSync(FIXTURE_DOMAIN, 'init', {
       signal: new AbortController().signal,
       dataset: fixtureDataset(),
@@ -81,6 +84,134 @@ describe('FaostatMirror end-to-end', () => {
     const { matches } = await mirror.resolve(FIXTURE_DOMAIN, 'area', { code: 351, limit: 10 });
     expect(matches).toEqual([{ code: 351, name: 'China', kind: 'aggregate' }]);
   });
+
+  it('preserves historical reporting entities as countries', async () => {
+    const codes = [15, 51, 62, 151, 164, 186, 206, 228, 248];
+    await mirror.dimensions.upsertAreas(
+      codes.map((code) => ({
+        area_code: code,
+        area: `Historical ${code}`,
+        area_m49: null,
+        kind: 'country' as const,
+      })),
+    );
+    for (const code of codes) {
+      const result = await mirror.dimensions.resolve('area', { code, limit: 1 });
+      expect(result.matches[0]?.kind).toBe('country');
+    }
+  });
+
+  it.each([261, 266, 268, 269, 420])(
+    'reclassifies legacy roll-up %i across all read paths (#40)',
+    async (code) => {
+      await mirror.dimensions.upsertAreas([
+        {
+          area_code: code,
+          area: `Roll-up ${code}`,
+          area_m49: null,
+          kind: 'country',
+        },
+      ]);
+      const handle = await mirror.getMirror(FIXTURE_DOMAIN)!.raw();
+      handle
+        .prepare(`INSERT INTO obs_QCL
+      SELECT ? || '|' || id, ?, area_m49, ?, item_code, item, element_code, element,
+        year, unit, value, flag, note FROM obs_QCL WHERE area_code = 2`)
+        .run(String(code), code, `Roll-up ${code}`);
+      const classified = await mirror.resolve(FIXTURE_DOMAIN, 'area', { code, limit: 1 });
+      expect(classified.matches[0]?.kind).toBe('aggregate');
+      const resolved = await resolveCodesTool.handler(
+        resolveCodesTool.input.parse({
+          domain: FIXTURE_DOMAIN,
+          dimension: 'area',
+          code,
+        }),
+        createMockContext({ errors: resolveCodesTool.errors }),
+      );
+      expect(resolved.matches[0]).toMatchObject({ code, kind: 'aggregate' });
+      expect(resolveCodesTool.format!(resolved)).toEqual([
+        {
+          type: 'text',
+          text: expect.stringContaining(`**${code}** — Roll-up ${code} [aggregate]`),
+        },
+      ]);
+      const output = await queryObservationsTool.handler(
+        queryObservationsTool.input.parse({
+          domain: FIXTURE_DOMAIN,
+        }),
+        createMockContext({ errors: queryObservationsTool.errors }),
+      );
+      expect(output.observations.map((row) => row.area_code)).toEqual([2, 2]);
+      expect(JSON.stringify(queryObservationsTool.format!(output))).toContain('Afghanistan');
+      expect(JSON.stringify(queryObservationsTool.format!(output))).not.toContain(
+        `Roll-up ${code}`,
+      );
+      expect(
+        queryObservationsTool.input.safeParse({ domain: FIXTURE_DOMAIN, offset: -1 }).success,
+      ).toBe(false);
+      const filters = { includeAggregates: false };
+      const page = await mirror.queryObservations(FIXTURE_DOMAIN, {
+        ...filters,
+        limit: 100,
+        offset: 0,
+      });
+      expect(page.rows.map((row) => row.area_code)).toEqual([2, 2]);
+      const stream = [];
+      for await (const row of mirror.streamObservations(FIXTURE_DOMAIN, filters, 100))
+        stream.push(row);
+      expect(stream.map((row) => row.area_code)).toEqual([2, 2]);
+      expect(
+        (await mirror.rankAreaTotals(FIXTURE_DOMAIN, filters, 100)).map((row) => row.area_code),
+      ).toEqual([2]);
+      expect((await mirror.sumByYear(FIXTURE_DOMAIN, filters)).map((row) => row.value)).toEqual([
+        5000, 5200,
+      ]);
+      for (const override of [
+        { areaCodes: [code], includeAggregates: false },
+        { includeAggregates: true },
+      ]) {
+        const included = await mirror.queryObservations(FIXTURE_DOMAIN, {
+          ...override,
+          limit: 100,
+          offset: 0,
+        });
+        expect(included.rows.some((row) => row.area_code === code)).toBe(true);
+        expect(
+          (await mirror.rankAreaTotals(FIXTURE_DOMAIN, override, 100)).some(
+            (row) => row.area_code === code,
+          ),
+        ).toBe(true);
+        const streamed = [];
+        for await (const row of mirror.streamObservations(FIXTURE_DOMAIN, override, 100))
+          streamed.push(row);
+        expect(streamed.some((row) => row.area_code === code)).toBe(true);
+        const trend = await mirror.sumByYear(FIXTURE_DOMAIN, override);
+        expect(trend.map((row) => row.value)).toEqual(
+          override.includeAggregates ? [904250, 917350] : [5000, 5200],
+        );
+      }
+      const explicit = await queryObservationsTool.handler(
+        queryObservationsTool.input.parse({ domain: FIXTURE_DOMAIN, area_codes: [code] }),
+        createMockContext({ errors: queryObservationsTool.errors }),
+      );
+      expect(explicit.observations).toHaveLength(2);
+      expect(explicit.observations.every((row) => row.area_code === code)).toBe(true);
+      expect(JSON.stringify(queryObservationsTool.format!(explicit))).toContain(`Roll-up ${code}`);
+      const empty = await mirror.queryObservations(FIXTURE_DOMAIN, {
+        ...filters,
+        limit: 100,
+        offset: 2,
+      });
+      expect(empty.rows).toEqual([]);
+      const capped = await mirror.queryObservations(FIXTURE_DOMAIN, {
+        ...filters,
+        limit: 1,
+        offset: 0,
+      });
+      expect(capped.rows).toHaveLength(1);
+      expect(capped.totalIsExact).toBe(false);
+    },
+  );
 
   it('excludes aggregate regions by default in observation queries', async () => {
     const { rows, total } = await mirror.queryObservations(FIXTURE_DOMAIN, {

@@ -1,5 +1,5 @@
 /**
- * @fileoverview Vitest config for the consumer server. Uses Vitest 4 `projects`
+ * @fileoverview Vitest config for the consumer server. Uses Vitest `projects`
  * so you can split suites (unit/smoke/integration/fuzz) and run each with
  * `--project <name>` as the surface grows. Extends the framework's base config
  * for shared `resolve`, `ssr`, and coverage settings.
@@ -17,6 +17,15 @@ export default mergeConfig(
   defineConfig({
     resolve: { alias },
     test: {
+      coverage: {
+        /**
+         * Native workers load outside Vitest's transform graph. Their behavior
+         * remains mandatory in the real Bun and Node worker integration tests.
+         * test:coverage runs serially because parallel instrumented database
+         * fixtures exceed hook deadlines under concurrent build load.
+         */
+        exclude: ['src/services/faostat-mirror/read-worker.ts'],
+      },
       projects: [
         {
           extends: true,

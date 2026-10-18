@@ -177,10 +177,12 @@ describe('faostat_commodity_profile production-domain availability (#37)', () =>
 
   it('declares only reachable reasons', () => {
     expect(declaredReasons(commodityProfileTool.errors)).toEqual([
+      'ambiguous_item',
       'canvas_not_found',
       'domain_not_indexed',
       'index_not_ready',
       'invalid_year_range',
+      'missing_item',
       'no_match',
       'query_timeout',
     ]);

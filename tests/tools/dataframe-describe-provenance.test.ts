@@ -308,6 +308,7 @@ describe('faostat_commodity_profile provenance names (#32)', () => {
     });
     expect(params).toEqual({
       item_query: 'wheat',
+      item_code: 15,
       item_codes: [15],
       year_start: 2020,
       year_end: 2022,
@@ -319,12 +320,17 @@ describe('faostat_commodity_profile provenance names (#32)', () => {
 
   it('records only the bound that was supplied', async () => {
     const { params } = await describeProfile('profile-year-start', { year_start: 2021 });
-    expect(params).toEqual({ item_query: 'wheat', item_codes: [15], year_start: 2021 });
+    expect(params).toEqual({
+      item_query: 'wheat',
+      item_code: 15,
+      item_codes: [15],
+      year_start: 2021,
+    });
   }, 30_000);
 
   it('omits both year keys when the call had no year bound', async () => {
     const { params } = await describeProfile('profile-no-years', {});
-    expect(params).toEqual({ item_query: 'wheat', item_codes: [15] });
+    expect(params).toEqual({ item_query: 'wheat', item_code: 15, item_codes: [15] });
   }, 30_000);
 });
 

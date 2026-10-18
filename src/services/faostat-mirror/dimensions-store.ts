@@ -227,7 +227,8 @@ export class DimensionsStore {
 
   /**
    * Resolve codes within a dimension. Precedence: an exact `code` lookup wins;
-   * otherwise an FTS `query` match (relevance-ranked); otherwise a `name_contains`
+   * otherwise a normalized exact label when `preferExact` is set and one or more
+   * labels match; otherwise an FTS `query` match (relevance-ranked); otherwise a `name_contains`
    * substring filter; otherwise list the whole dimension. Returns up to `limit`
    * rows starting at `offset` plus the true total of matches (for truncation
    * disclosure and pagination).
@@ -249,6 +250,8 @@ export class DimensionsStore {
     opts: {
       code?: number;
       query?: string;
+      /** Prefer normalized exact labels across the complete scoped vocabulary. */
+      preferExact?: boolean;
       nameContains?: string;
       limit: number;
       offset?: number;
@@ -274,6 +277,28 @@ export class DimensionsStore {
       const inDomain = !domainCodes || domainCodes.includes(opts.code);
       const row = inDomain ? this.selectByCode(h, dimension, opts.code) : undefined;
       return { matches: row ? [row] : [], total: row ? 1 : 0 };
+    }
+
+    if (opts.preferExact && opts.query) {
+      const normalize = (name: string) => name.trim().split(/\s+/u).join(' ').toLowerCase();
+      const query = normalize(opts.query);
+      const scope = domainCodes && new Set(domainCodes);
+      const exact = h
+        .prepare<Record<string, unknown>>(`SELECT * FROM ${cfg.table} ORDER BY ${cfg.codeColumn}`)
+        .all()
+        .filter(
+          (row) =>
+            (!scope || scope.has(Number(row[cfg.codeColumn]))) &&
+            normalize(String(row[cfg.labelColumn])) === query,
+        );
+      if (exact.length > 0) {
+        return {
+          matches: exact
+            .slice(offset, offset + opts.limit)
+            .map((row) => this.toResolved(dimension, row)),
+          total: exact.length,
+        };
+      }
     }
 
     // FTS relevance match. Every matching rowid is fetched — no SQL LIMIT — and the

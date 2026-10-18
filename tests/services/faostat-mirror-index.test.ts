@@ -106,6 +106,30 @@ describe('FaostatMirror index + overflow probe (#3)', () => {
     expect(names).toContain(`obs_${FIXTURE_DOMAIN}_item_code_element_code_year_idx`);
   });
 
+  it('keeps multi-area reads globally ordered by year', async () => {
+    const result = await mirror.queryObservations(FIXTURE_DOMAIN, {
+      areaCodes: [1, 2],
+      includeAggregates: false,
+      limit: 100,
+      offset: 0,
+    });
+    expect(result.rows).toHaveLength(YEARS * 2);
+    expect(result.rows.map((row) => row.year)).toEqual(
+      result.rows.map((row) => row.year).sort((a, b) => a - b),
+    );
+  });
+
+  it('serves a single-area page without sorting its full match (#34)', async () => {
+    const handle = await mirror.getMirror(FIXTURE_DOMAIN)!.raw();
+    const detail = readPlan(
+      handle,
+      { areaCodes: [1], includeAggregates: false },
+      { kind: 'page', limit: 2, offset: 0 },
+    );
+    expect(detail).toMatch(/USING INDEX obs_QCL_area_code_year_idx/);
+    expect(detail).not.toMatch(/USE TEMP B-TREE FOR ORDER BY/);
+  });
+
   it('serves the element-filter + ORDER BY year shape from an index, no temp-b-tree sort', async () => {
     const m = mirror.getMirror(FIXTURE_DOMAIN);
     if (!m) throw new Error('mirror not found');
@@ -324,9 +348,11 @@ describe('FaostatMirror query-planner statistics (#3, #24)', () => {
     const analyze = target.reads.analyze.bind(target.reads);
     let attempts = 0;
     let obstructed = true;
-    vi.spyOn(target.reads, 'analyze').mockImplementation((file, table) => {
+    vi.spyOn(target.reads, 'analyze').mockImplementation((file, table, areaYearIndex) => {
       attempts += 1;
-      return obstructed ? Promise.reject(new Error('database is locked')) : analyze(file, table);
+      return obstructed
+        ? Promise.reject(new Error('database is locked'))
+        : analyze(file, table, areaYearIndex);
     });
     return {
       attempts: () => attempts,
@@ -375,6 +401,38 @@ describe('FaostatMirror query-planner statistics (#3, #24)', () => {
     // Every stat string opens with the table's row count — the cardinality the
     // optimizer lacked (60 countries + 4 aggregates, 2 years each).
     for (const row of rows) expect(row.stat.split(' ')[0]).toBe('128');
+  });
+
+  it('upgrades an existing analyzed mirror in the background without re-sync (#34)', async () => {
+    const handle = await mirror.getMirror(FIXTURE_DOMAIN)!.raw();
+    handle.exec(`DROP INDEX IF EXISTS ${TABLE}_area_code_year_idx`);
+    expect((await statRows(mirror)).length).toBeGreaterThan(0);
+    await mirror.close();
+    mirror = openMirror();
+    const reopenedHandle = await mirror.getMirror(FIXTURE_DOMAIN)!.raw();
+    expect(
+      reopenedHandle
+        .prepare(`SELECT name FROM sqlite_master WHERE name = ?`)
+        .all(`${TABLE}_area_code_year_idx`),
+    ).toEqual([]);
+    const analyze = vi.spyOn(mirror.reads, 'analyze');
+    const invalidate = vi.spyOn(mirror.reads, 'invalidate');
+    const release = await holdWriteLock();
+    const beat = heartbeat();
+    try {
+      expect((await readCube(mirror)).rows.length).toBeGreaterThan(0);
+      expect(outcomes).toEqual([]);
+      expect(analyze).toHaveBeenCalledWith(join(dir, `domain-${FIXTURE_DOMAIN}.db`), TABLE, true);
+      expect(mirror.reads.stats().building).toBe(1);
+      expect(beat.stop()).toBeLessThan(500);
+    } finally {
+      beat.stop();
+      release();
+    }
+    await statisticsLand(mirror);
+    expect((await statRows(mirror)).map((row) => row.idx)).toContain(`${TABLE}_area_code_year_idx`);
+    expect(invalidate).toHaveBeenCalledWith(join(dir, `domain-${FIXTURE_DOMAIN}.db`));
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
   });
 
   it('answers the first data read of a domain without statistics without waiting for the build (#24)', async () => {
@@ -529,10 +587,10 @@ describe('FaostatMirror query-planner statistics (#3, #24)', () => {
     const gate = new Promise<void>((resolve) => {
       open = resolve;
     });
-    vi.spyOn(reopened.reads, 'analyze').mockImplementation(async (file, table) => {
+    vi.spyOn(reopened.reads, 'analyze').mockImplementation(async (file, table, areaYearIndex) => {
       events.push('build start');
       await gate;
-      const durationMs = await analyze(file, table);
+      const durationMs = await analyze(file, table, areaYearIndex);
       events.push('build end');
       return durationMs;
     });

@@ -33,8 +33,10 @@ export interface ReadRequest {
   sql: string;
 }
 
-/** Build `table`'s planner statistics — `ANALYZE`, which holds the file's write lock throughout. */
+/** Install a requested cube index and build `table`'s planner statistics on the worker. */
 export interface AnalyzeRequest {
+  /** Install the cube's area/year index before refreshing planner statistics. */
+  areaYearIndex?: boolean;
   epoch: number;
   file: string;
   id: number;
@@ -101,6 +103,11 @@ port.on('message', async (request: WorkerRequest) => {
     const handle = await handleFor(request.file, request.epoch);
     if (request.op === 'analyze') {
       const start = performance.now();
+      if (request.areaYearIndex) {
+        handle.exec(
+          `CREATE INDEX IF NOT EXISTS ${request.table}_area_code_year_idx ON ${request.table}(area_code, year)`,
+        );
+      }
       handle.exec(`ANALYZE ${request.table}`);
       reply = { id: request.id, durationMs: Math.round(performance.now() - start) };
     } else {

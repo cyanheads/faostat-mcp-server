@@ -5,7 +5,7 @@
  * production (QCL) and trade (TCL) domains. Convenience over chaining
  * faostat_resolve_codes + several faostat_query_observations calls. Rankings and
  * the trend are SQL aggregates over the full filtered match — summed per country
- * across the resolved items, each country taken at its own latest year with data.
+ * for the selected item, each country taken at its own latest year with data.
  * Returns a production-only result with a notice when the trade domain isn't
  * indexed; fails when the production domain isn't.
  * @module mcp-server/tools/definitions/commodity-profile
@@ -32,8 +32,8 @@ const TCL = 'TCL';
 const ELEMENT_EXPORT_QTY = 5910;
 const ELEMENT_IMPORT_QTY = 5610;
 
-/** Item codes the commodity name is allowed to fold into one profile. */
-const MAX_PROFILE_ITEMS = 5;
+/** Maximum candidate identities shown when the caller must select an item. */
+const MAX_ITEM_CANDIDATES = 5;
 
 /**
  * Whether the trade domain (TCL) contributed to the profile, and — when it did
@@ -58,9 +58,7 @@ function rankedAreas(valueDescription: string, entryDescription: string, listDes
           value: z.number().describe(valueDescription),
           observations: z
             .number()
-            .describe(
-              'Observations summed into value — one per resolved item reporting that year.',
-            ),
+            .describe('Observations summed into value for the selected item and reporting year.'),
           unit: z
             .string()
             .nullable()
@@ -82,26 +80,22 @@ function rankedAreas(valueDescription: string, entryDescription: string, listDes
 export const commodityProfileTool = tool('faostat_commodity_profile', {
   title: 'faostat-mcp-server: commodity profile',
   description:
-    "Assemble a global profile for one commodity in a single call: top-producing countries, the annual production trend, and trade flows (top exporters and importers). Accepts a commodity name, resolves it to item codes, then queries the production (QCL) and trade (TCL) domains and merges the results. Each ranking is a per-country sum across the resolved items, taken at that country's own latest year with data and grouped by unit so incomparable quantities are never added. The trend is returned inline as year/value points. Country-level only (aggregates excluded). The production domain (QCL) is required. When the trade domain (TCL) is not indexed locally, returns a production-only profile with a notice naming the gap rather than failing. When the merged observation set is too large to inline, it spills to a DataCanvas table (canvas_id + table_name) — call faostat_dataframe_describe for its columns, then faostat_dataframe_query for deeper SQL.",
+    "Assemble a global profile for one QCL item in a single call: top-producing countries, the annual production trend, and trade flows (top exporters and importers). Supply item_code or item_query; code wins when both are supplied. A query selects a unique normalized exact label, otherwise a unique relevance match; ambiguous queries require an explicit code. Each ranking uses the selected item at each country's own latest year with data, grouped by unit. The trend is returned inline as year/value points. Country-level only (aggregates excluded). QCL is required; unavailable TCL yields a production-only profile with a notice. When the merged observation set is too large to inline, it spills to a DataCanvas table (canvas_id + table_name) — call faostat_dataframe_describe for its columns, then faostat_dataframe_query for deeper SQL.",
   annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: false },
 
   enrichment: {
     resolvedItemCodes: z.array(z.number()).describe('Item codes the commodity query resolved to.'),
     resolvedItemMatches: z
       .number()
-      .describe(
-        `Total items the commodity query matched in QCL, before the ${MAX_PROFILE_ITEMS}-item profile cap.`,
-      ),
+      .describe('Number of selected QCL items; always one for a successful profile.'),
     itemsTruncated: z
       .boolean()
-      .describe(
-        'True when the commodity name matched more items than the profile folded in — the profile then covers only the most relevant few.',
-      ),
+      .describe('Always false: successful profiles select one item without truncating selection.'),
     notice: z
       .string()
       .optional()
       .describe(
-        'States where the observation set went — the canvas table it was staged on (with the describe-then-query pointer), fit inline, a staging failure, or a disabled canvas — plus a trade domain (TCL) that was not indexed, item-resolution truncation, mixed units in the rankings, or other partial-result context.',
+        'States where the observation set went — the canvas table, inline result, staging failure, or disabled canvas — plus unavailable trade data, mixed units, or other partial-result context.',
       ),
   },
 
@@ -113,10 +107,24 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
 
   errors: [
     {
+      reason: 'missing_item',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'Neither item_code nor item_query was supplied.',
+      recovery: 'Supply item_code or item_query to select one QCL item.',
+    },
+    {
+      reason: 'ambiguous_item',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'The query matches more than one QCL item without a unique exact label.',
+      recovery:
+        'Call faostat_resolve_codes with domain QCL, dimension item and the same query, then call faostat_commodity_profile with the selected item_code.',
+    },
+    {
       reason: 'no_match',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The item query resolved to no commodity code.',
-      recovery: 'Try faostat_resolve_codes with dimension=item to find the commodity code.',
+      when: 'The query matched no item, or item_code is absent from QCL.',
+      recovery:
+        'Call faostat_resolve_codes with domain QCL and dimension item, then pass a returned code as item_code.',
     },
     {
       reason: 'domain_not_indexed',
@@ -162,11 +170,20 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
   ],
 
   input: z.object({
+    item_code: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe(
+        'Exact item code present in QCL; takes precedence over item_query. Obtain it from faostat_resolve_codes with domain QCL and dimension item.',
+      ),
     item_query: z
       .string()
       .min(1)
+      .optional()
       .describe(
-        `Commodity name to profile (e.g. "maize", "wheat", "coffee green"). Matched by relevance; the ${MAX_PROFILE_ITEMS} best-matching items are folded into one profile, so a broad name such as "milk" is narrowed — the response discloses how many items matched in total.`,
+        'Commodity label or search term (e.g. "Wheat"). A unique normalized exact QCL label wins, otherwise the relevance search must match exactly one item. Broad queries such as "maize" or "milk" require item_code. Supply this or item_code.',
       ),
     year_start: z
       .number()
@@ -187,7 +204,9 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
   }),
 
   output: z.object({
-    item_query: z.string().describe('The commodity query echoed back.'),
+    item_query: z
+      .string()
+      .describe('Supplied query echoed back, or the canonical selected label for code-only calls.'),
     resolved_items: z
       .array(
         z
@@ -197,19 +216,19 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
           })
           .describe('One resolved commodity.'),
       )
-      .describe('Commodities the query resolved to (the profile aggregates across all of them).'),
+      .describe('The single selected QCL item and its canonical label.'),
     top_producers: rankedAreas(
-      'Production summed across the resolved items for this country, in its latest reporting year.',
+      'Production for the selected item and country in its latest reporting year.',
       'One top-producing country.',
       'Top producers by summed production (countries only).',
     ),
     top_exporters: rankedAreas(
-      'Export quantity summed across the resolved items for this country, in its latest reporting year.',
+      'Export quantity for the selected item and country in its latest reporting year.',
       'One top-exporting country.',
       'Top exporters by summed export quantity (empty when trade is not indexed).',
     ),
     top_importers: rankedAreas(
-      'Import quantity summed across the resolved items for this country, in its latest reporting year.',
+      'Import quantity for the selected item and country in its latest reporting year.',
       'One top-importing country.',
       'Top importers by summed import quantity (empty when trade is not indexed).',
     ),
@@ -221,7 +240,7 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
             value: z
               .number()
               .describe(
-                'Production summed across every country and resolved item reporting that year.',
+                'Selected item production summed across every country reporting that year.',
               ),
             observations: z
               .number()
@@ -239,7 +258,7 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
           .describe('One annual trend point.'),
       )
       .describe(
-        'The annual production series for the resolved commodity, summed over countries and items per year and ordered oldest-first. Aggregated in SQL over the complete filtered match, so it is not affected by the canvas staging cap.',
+        'The annual production series for the selected item, summed over countries per year and ordered oldest-first. Aggregated in SQL over the complete filtered match, so it is not affected by the canvas staging cap.',
       ),
     trend_points: z
       .number()
@@ -308,23 +327,38 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
 
     // One ceiling for the call, across every mirror read below.
     const signal = mirror.readSignal(ctx.signal);
+    if (input.item_code === undefined && input.item_query === undefined) {
+      throw ctx.fail('missing_item', 'Supply item_code or item_query.');
+    }
 
-    // 1. Resolve the commodity to item code(s), scoped to QCL — the profile's
-    // production backbone — so a resolved item is one QCL actually carries.
+    // Resolve one identity before any ranking or staging; never add related products.
     const resolved = await mirror.resolve(QCL, 'item', {
-      query: input.item_query,
-      limit: MAX_PROFILE_ITEMS,
+      ...(input.item_code !== undefined ? { code: input.item_code } : {}),
+      ...(input.item_query !== undefined ? { query: input.item_query } : {}),
+      preferExact: true,
+      limit: MAX_ITEM_CANDIDATES,
       signal,
     });
-    if (resolved.matches.length === 0) {
-      throw ctx.fail('no_match', `No commodity matched "${input.item_query}".`);
+    const selected = resolved.matches[0];
+    if (!selected) {
+      throw ctx.fail(
+        'no_match',
+        `No QCL item matched ${input.item_code ?? `"${input.item_query}"`}.`,
+      );
     }
-    const itemCodes = resolved.matches.map((m) => m.code);
-    const itemsTruncated = resolved.total > resolved.matches.length;
+    if (resolved.total > 1) {
+      const candidates = resolved.matches.map((item) => `${item.code}: ${item.name}`).join('; ');
+      throw ctx.fail(
+        'ambiguous_item',
+        `${resolved.total} QCL items match "${input.item_query}". Candidates${resolved.total > resolved.matches.length ? ` (showing ${resolved.matches.length} of ${resolved.total}; truncated)` : ''}: ${candidates}.`,
+      );
+    }
+    const itemQuery = input.item_query ?? selected.name;
+    const itemCodes = [selected.code];
     ctx.enrich({
       resolvedItemCodes: itemCodes,
       resolvedItemMatches: resolved.total,
-      itemsTruncated,
+      itemsTruncated: false,
     });
 
     const yearRange = {
@@ -394,10 +428,13 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
         {
           sourceTool: 'faostat_commodity_profile',
           schema: PROFILE_TABLE_SCHEMA,
-          // Provenance records the caller's input names; the staging write site
-          // drops an unsupplied bound.
+          /**
+           * Record the selected code, supplied query (or canonical label for
+           * code-only calls), and caller-named year bounds; staging drops undefined bounds.
+           */
           queryParams: {
-            item_query: input.item_query,
+            item_query: itemQuery,
+            item_code: selected.code,
             item_codes: itemCodes,
             year_start: input.year_start,
             year_end: input.year_end,
@@ -419,17 +456,12 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
     // ctx.enrich.notice is last-wins, so every condition worth disclosing is
     // collected here and emitted as one call.
     const noticeParts: string[] = [];
-    if (itemsTruncated) {
-      noticeParts.push(
-        `"${input.item_query}" matched ${resolved.total} items in QCL; the profile folded in the ${resolved.matches.length} best-matching (codes ${itemCodes.join(', ')}) and every figure above covers only those. Use a more specific item_query, or call faostat_resolve_codes (domain QCL, dimension=item) to see the full list and query the item you want directly.`,
-      );
-    }
     const units = new Set(
       [...topProducers, ...exporters, ...importers, ...trend].map((r) => r.unit),
     );
     if (units.size > 1) {
       noticeParts.push(
-        `The resolved items report in more than one unit (${[...units].map((u) => u ?? 'unspecified').join(', ')}). Rows are grouped by unit rather than summed across them, so a country or year can appear once per unit and values are comparable only within the same unit.`,
+        `The selected item reports in more than one unit (${[...units].map((u) => u ?? 'unspecified').join(', ')}). Rows are grouped by unit rather than summed across them, so a country or year can appear once per unit and values are comparable only within the same unit.`,
       );
     }
     if (tradeStatus === 'not_selected') {
@@ -482,7 +514,7 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
     ctx.enrich.notice(noticeParts.join(' '));
 
     return {
-      item_query: input.item_query,
+      item_query: itemQuery,
       resolved_items: resolved.matches.map((m) => ({ code: m.code, name: m.name })),
       top_producers: topProducers,
       top_exporters: exporters,

@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/faostat-mcp-server</h1>
-  <p><b>Global food & agriculture statistics from the UN FAOSTAT bulk-download corpus, served from a local SQLite mirror with a DataCanvas SQL surface, over MCP. STDIO & Streamable HTTP.</b>
+  <p><b>Global food & agriculture statistics from the UN FAOSTAT bulk-download corpus, served from a local SQLite mirror with a DataCanvas SQL surface, via MCP. STDIO or Streamable HTTP.</b>
   <div>7 Tools • 0 Resources • 0 Prompts</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/faostat-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/faostat-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/faostat-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/faostat-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 [![Install in Claude Desktop](https://img.shields.io/badge/Install_in-Claude_Desktop-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://github.com/cyanheads/faostat-mcp-server/releases/latest/download/faostat-mcp-server.mcpb) [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=faostat-mcp-server&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBjeWFuaGVhZHMvZmFvc3RhdC1tY3Atc2VydmVyIl19) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22faostat-mcp-server%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40cyanheads%2Ffaostat-mcp-server%22%5D%7D)
 
@@ -25,7 +25,7 @@
 
 ## Overview
 
-Global food and agriculture statistics from the UN FAOSTAT bulk-download corpus — crop and livestock production, agricultural trade, food balances, food security and nutrition, land use, fertilizer use, and agrifood-systems emissions for 245+ countries and territories from 1961 to the present. Discover a domain, resolve area/item/element codes, then query the cube; large or merged result sets spill to a DataCanvas SQL surface for `GROUP BY`, ranking, and time-series analysis. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+Global food and agriculture statistics from the UN's FAOSTAT: production, trade, food balances, food security, land use, fertilizer, and emissions for 245+ countries and territories since 1961. Resolve commodity and country codes, query the data, and run SQL over large results.
 
 ### Tools
 
@@ -72,12 +72,13 @@ Global food and agriculture statistics from the UN FAOSTAT bulk-download corpus 
 
 ### `faostat_commodity_profile` <sub>tool</sub>
 
-- Resolves `item_query` to up to 5 item codes, then ranks top producers/exporters/importers and returns an annual production trend in one call
+- Selects one QCL item with `item_code` or `item_query` (code takes precedence), then ranks top producers/exporters/importers and returns an annual production trend
+- Query selection prefers a unique exact label after trimming, collapsing whitespace, and case folding; otherwise requires a unique relevance match. For ambiguous terms such as `maize` or `milk`, call `faostat_resolve_codes` with `domain: "QCL"`, `dimension: "item"`, and the query, then pass the selected `item_code` (e.g. `56` for maize grain)
 - Rankings are per-country sums grouped by unit, each country at its own latest reporting year; countries only (aggregates excluded)
 - Returns a partial, production-only profile with a notice — rather than failing — when the trade domain (TCL) isn't indexed or still syncing
 - `top_n` caps each ranked list (max 50); when the merged observation set is too large to inline it spills to a DataCanvas table — `faostat_dataframe_describe` for its columns, then `faostat_dataframe_query` for further SQL
 - Every staging outcome is stated in the notice: the staged table, a set that fit inline, a staging failure, or a disabled canvas
-- Typed errors: `no_match`, `domain_not_indexed`, `index_not_ready`, `invalid_year_range`, `canvas_not_found`, `query_timeout`
+- Typed errors: `missing_item`, `ambiguous_item`, `no_match`, `domain_not_indexed`, `index_not_ready`, `invalid_year_range`, `canvas_not_found`, `query_timeout`
 
 ---
 
@@ -85,6 +86,7 @@ Global food and agriculture statistics from the UN FAOSTAT bulk-download corpus 
 
 - Single-statement read-only `SELECT` over staged `faostat_xxxxxxxx` tables — joins, aggregates, window functions, and CTEs all work
 - Writes, DDL, `DROP`, `COPY`, `PRAGMA`, `ATTACH`, external-file functions, and system catalogs (`information_schema`, `sqlite_master`, `duckdb_*`) are rejected
+- Engine-setting introspection, `query_table`, dynamic `query()` SQL, and file table references are rejected; `query()` with a single literal read-only `SELECT` remains supported
 - `row_limit` caps the response (default 1000, max 10000); `truncated` means more rows exist, with no exact total computed on this path
 - Typed errors: `canvas_disabled`, `canvas_not_found`, `missing_table`, `system_catalog_access`, `invalid_sql`
 

@@ -341,13 +341,14 @@ describe('faostat_commodity_profile stages value as DOUBLE under both domains (#
     expect(production?.value).toBe(1007.25);
 
     // Every fractional row under each domain survived. The profile is country-only,
-    // so QCL's two sub-threshold roll-up codes (265, 351) are not on the table.
+    // so its seven sub-threshold roll-ups (261, 265, 266, 268, 269, 351, 420)
+    // are not on the table.
     const fractional = await sql(
       ctx,
       `SELECT domain, COUNT(*) AS n FROM ${result.table_name} WHERE value <> FLOOR(value) GROUP BY domain ORDER BY domain`,
     );
     expect(fractional.map((r) => [r.domain, Number(r.n)])).toEqual([
-      ['QCL', (COUNTRIES - 2) * (2020 + YEARS - FIRST_LATE_YEAR)],
+      ['QCL', (COUNTRIES - 7) * (2020 + YEARS - FIRST_LATE_YEAR)],
       ['TCL', TRADE.length],
     ]);
   }, 30_000);

@@ -22,6 +22,31 @@ const HEADER = headerIndex(
 );
 
 describe('dataRowToObservation', () => {
+  it('preserves sparse observations as null without inventing labels', () => {
+    const header = headerIndex(['Area Code', 'Item Code', 'Element Code', 'Year Code', 'Value']);
+    expect(dataRowToObservation(['2', '15', '5510', '2020', 'not-a-number'], header)).toEqual({
+      id: '2|15|5510|2020',
+      area_code: 2,
+      area_m49: null,
+      area: '',
+      item_code: 15,
+      item: '',
+      element_code: 5510,
+      element: '',
+      year: 2020,
+      unit: null,
+      value: null,
+      flag: null,
+      note: null,
+    });
+    expect(dataRowToObservation(['2', '15', '5510', '2020'], header)?.value).toBeNull();
+  });
+
+  it.each(['Item Code', 'Element Code', 'Year'])('skips a non-numeric %s', (name) => {
+    const fields = parseCsvLine(`2,'004,Afghanistan,15,Wheat,5510,Production,2020,2020,t,1,A,`);
+    fields[HEADER.get(name) as number] = 'invalid';
+    expect(dataRowToObservation(fields, HEADER)).toBeNull();
+  });
   it('maps a standard cube row, stripping the M49 apostrophe and storing Year', () => {
     const fields = parseCsvLine(
       `2,'004,Afghanistan,15,Wheat,5510,Production,2020,2020,t,5000.000000,A,Official data`,
@@ -70,6 +95,28 @@ describe('dataRowToObservation', () => {
 });
 
 describe('dimension code-list parsers', () => {
+  it.each([
+    ['areas', parseAreaCodes],
+    ['items', parseItemCodes],
+    ['elements', parseElementCodes],
+    ['flags', parseFlags],
+  ] as const)('returns no %s for empty input or an unrelated header', (_name, parse) => {
+    expect(parse('')).toEqual([]);
+    expect(parse('Other\ninvalid')).toEqual([]);
+  });
+
+  it('skips invalid numeric codes and preserves missing optional crosswalks', () => {
+    expect(parseAreaCodes('Area Code,Area\nx,Invalid\n2,Afghanistan')).toEqual([
+      { area_code: 2, area_m49: null, area: 'Afghanistan', kind: 'country' },
+    ]);
+    expect(parseItemCodes('Item Code,Item\nx,Invalid\n15,Wheat')).toEqual([
+      { item_code: 15, cpc_code: null, item: 'Wheat' },
+    ]);
+    expect(parseElementCodes('Element Code,Element\nx,Invalid\n5510,Production')).toEqual([
+      { element_code: 5510, element: 'Production' },
+    ]);
+    expect(parseFlags('Flag\n \nA')).toEqual([{ flag: 'A', description: '' }]);
+  });
   it('parses AreaCodes and classifies country vs aggregate at the ≥5000 boundary', () => {
     const areas = parseAreaCodes("Area Code,M49 Code,Area\n2,'004,Afghanistan\n5000,'001,World");
     expect(areas).toEqual([

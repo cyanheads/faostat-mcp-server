@@ -16,12 +16,17 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listDomainsTool } from '@/mcp-server/tools/definitions/list-domains.tool.js';
 import { type FaostatMirror, initFaostatMirror } from '@/services/faostat-mirror/index.js';
 import type { ManifestDataset } from '@/services/faostat-mirror/types.js';
-import { fixtureManifestResponse } from '../fixtures/synthetic-domain.js';
+import {
+  buildDomainZip,
+  chunkedResponse,
+  fixtureDataset,
+  fixtureManifestResponse,
+} from '../fixtures/synthetic-domain.js';
 
 /** Catalog codes, deliberately out of sort order so the tool's own sort is exercised. */
 const CATALOG = [
@@ -195,5 +200,81 @@ describe('faostat_list_domains bounded retrieval (#16)', () => {
     for (const code of SORTED_CODES.slice(3)) {
       expect(text).not.toContain(`### ${code} —`);
     }
+  });
+
+  it('reports sparse catalog metadata honestly on both public surfaces', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        Response.json(
+          fixtureManifestResponse([
+            {
+              DatasetCode: 'RL',
+              DatasetName: 'Land use',
+              DateUpdate: '2025-12-31T00:00:00',
+              FileLocation: 'https://bulk.example.test/RL.zip',
+            },
+          ]),
+        ),
+      ),
+    );
+    const wire = await runToolContract(listDomainsTool, {});
+    expect(wire.isError).not.toBe(true);
+    expect(wire.structuredContent).toMatchObject({
+      domains: [{ code: 'RL', indexed: false, index_ready: false }],
+    });
+    const text = wire.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+    expect(text).toContain('ZIP size: unknown');
+    expect(text).not.toContain('Topic:');
+    expect(text).not.toContain('Upstream rows:');
+    expect(text).toContain('Add to FAOSTAT_DOMAINS');
+  });
+
+  it('combines empty retrieval and unconfigured-index guidance', async () => {
+    await mirror.close();
+    mirror = initFaostatMirror({ dir, domains: [] });
+    for (const input of [{ indexed_only: true }, { topic: 'no-such-topic' }]) {
+      const wire = await runToolContract(listDomainsTool, input);
+      expect(wire.isError).not.toBe(true);
+      expect(wire.structuredContent).toMatchObject({
+        domains: [],
+        totalMatches: 0,
+        indexedCount: 0,
+      });
+      const text = wire.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+      expect(text).toContain('No matching domains');
+      expect(text).toContain('No domains are indexed yet');
+      expect(text).toContain('No domains matched');
+    }
+  });
+
+  it('includes completed local sync status in the catalog and render', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => chunkedResponse(buildDomainZip(), 64)),
+    );
+    await mirror.runDomainSync('QCL', 'init', {
+      signal: new AbortController().signal,
+      dataset: fixtureDataset(),
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => Response.json(fixtureManifestResponse(catalogDatasets()))),
+    );
+    const wire = await runToolContract(listDomainsTool, { code: 'QCL' });
+    expect(wire.isError).not.toBe(true);
+    expect(wire.structuredContent).toMatchObject({
+      domains: [
+        {
+          code: 'QCL',
+          index_ready: true,
+          indexed_row_count: 6,
+          indexed_last_sync: expect.any(String),
+        },
+      ],
+    });
+    const text = wire.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+    expect(text).toContain('Local rows: 6 (synced ');
+    expect(text).toContain('Index ready: yes');
   });
 });

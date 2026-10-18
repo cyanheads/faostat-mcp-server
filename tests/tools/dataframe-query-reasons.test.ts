@@ -24,7 +24,7 @@
 import { createCanvasService, type DataCanvas } from '@cyanheads/mcp-ts-core/canvas';
 import { parseConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { dataframeQueryTool } from '@/mcp-server/tools/definitions/dataframe-query.tool.js';
 import { setCanvas } from '@/services/canvas-accessor.js';
@@ -154,6 +154,26 @@ describe('faostat_dataframe_query error-contract reasons', () => {
     const result = await run(`SELECT area_code, value FROM ${tableName} ORDER BY area_code`);
     expect(result.row_count).toBe(5);
     expect(result.rows).toHaveLength(5);
+  });
+
+  it('returns an empty SQL page with filter guidance on both public surfaces', async () => {
+    const canvasId = await ctx.state.get<string>('canvas-id');
+    if (!canvasId) throw new Error('Expected a staged session canvas');
+    const tenantId = ctx.tenantId;
+    if (!tenantId) throw new Error('Expected the fixture tenant');
+    const wire = await runToolContract(
+      dataframeQueryTool,
+      {
+        sql: `SELECT area_code, flag FROM ${tableName} ORDER BY area_code LIMIT 2 OFFSET 5`,
+        canvas_id: canvasId,
+      },
+      { context: { tenantId } },
+    );
+    expect(wire.isError).not.toBe(true);
+    expect(wire.structuredContent).toMatchObject({ rows: [], row_count: 0, truncated: false });
+    const text = wire.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
+    expect(text).toContain('_No rows._');
+    expect(text).toContain('Query returned 0 rows');
   });
 
   // #10 — row_limit truncation disclosure. The staged table holds 5 rows.

@@ -11,7 +11,7 @@
 # this stage fails outright on an arm64 host. Building natively also removes
 # emulation from the slowest stage of a multi-arch build.
 # ==============================================================================
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.2 AS build
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.3 AS build
 
 WORKDIR /usr/src/app
 
@@ -47,7 +47,7 @@ RUN bun run build
 # A clean image rather than `FROM build`: the build stage's node_modules holds
 # devDependencies.
 # ==============================================================================
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.2 AS deps
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.3 AS deps
 
 WORKDIR /usr/src/app
 
@@ -114,7 +114,7 @@ RUN rm -rf node_modules/@socketsecurity/bun-security-scanner
 # dependencies and build artifacts. Its only Bun invocations are HEALTHCHECK
 # and CMD, which run on the real target at container start.
 # ==============================================================================
-FROM oven/bun:1.4.2-slim AS production
+FROM oven/bun:1.4.3-slim AS production
 
 WORKDIR /usr/src/app
 

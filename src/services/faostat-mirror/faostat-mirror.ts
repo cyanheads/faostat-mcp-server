@@ -383,7 +383,7 @@ export class FaostatMirror {
    * chosen (#3).
    *
    * The `sqlite_stat1` probe is the guard: statistics persist inside the `.db`
-   * file, so an already-analyzed mirror (the steady state, since a sync builds them)
+   * file, so an already-analyzed mirror with its area/year index (the steady state)
    * pays one sub-millisecond lookup per domain per process. A domain without them —
    * synced before statistics shipped and unchanged upstream since, or whose last
    * build failed — gets one background build on the read pool
@@ -435,16 +435,16 @@ export class FaostatMirror {
     }
   }
 
-  /** True when `sqlite_stat1` exists and carries a row for `table`. */
+  /** True when planner statistics include the worker-installed area/year index. */
   private hasStatistics(handle: SqliteHandle, table: string): boolean {
     const statTable = handle
       .prepare(`SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'`)
       .get();
     if (!statTable) return false;
     const stat = handle
-      .prepare(`SELECT 1 AS ok FROM sqlite_stat1 WHERE tbl = ? LIMIT 1`)
-      .get(table);
-    return stat !== undefined;
+      .prepare(`SELECT 1 AS ok FROM sqlite_stat1 WHERE tbl = ? AND idx = ? LIMIT 1`)
+      .get(table, `${table}_area_code_year_idx`);
+    return Boolean(stat);
   }
 
   /**
@@ -459,7 +459,7 @@ export class FaostatMirror {
     const inFlight = this.builds.get(code);
     if (inFlight) return inFlight;
     const table = cubeTable(code);
-    const build = this.reads.analyze(this.domainFile(code), table).then(
+    const build = this.reads.analyze(this.domainFile(code), table, true).then(
       (durationMs) => {
         this.builds.delete(code);
         this.log?.info?.(`Query-planner statistics updated for ${table}`, { durationMs });
@@ -668,6 +668,8 @@ export class FaostatMirror {
     opts: {
       code?: number;
       query?: string;
+      /** Prefer normalized exact labels before relevance matching. */
+      preferExact?: boolean;
       nameContains?: string;
       limit: number;
       offset?: number;

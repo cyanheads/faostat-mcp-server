@@ -1,8 +1,7 @@
 /**
  * @fileoverview `faostat_commodity_profile` ranking/trend correctness regressions
- * (#5). Covers the repairs that changed what the tool reports: per-country
- * aggregation across the resolved items, a latest year computed per country
- * rather than once globally, disclosure of item-resolution truncation, the
+ * (#5/#41). Covers selection of one commodity, latest year computed per country
+ * rather than once globally, disclosure of ambiguous candidate truncation, the
  * inline annual trend on both client surfaces, and empty ranking sections
  * rendered explicitly instead of omitted.
  * @module tests/tools/commodity-profile-aggregation
@@ -35,7 +34,7 @@ let dir: string | undefined;
 /** Sync a mirror holding exactly `observations`, and return the tool's result. */
 async function profile(
   observations: ExplicitObservation[],
-  input: Record<string, unknown> = { item_query: 'milk' },
+  input: Record<string, unknown> = { item_query: 'Milk of cattle' },
 ) {
   dir = mkdtempSync(join(tmpdir(), 'faostat-profile-agg-'));
   const zip = buildExplicitDomainZip(observations);
@@ -62,12 +61,32 @@ afterEach(async () => {
 });
 
 describe('faostat_commodity_profile per-country aggregation (#5a)', () => {
-  it('sums each country across the resolved items instead of ranking rows', async () => {
-    /*
-     * Every row shares one year, so only the aggregation is under test. Ranking
-     * the raw rows puts Bravo's single 100 on top and lists each country twice;
-     * ranking per-country sums puts Alpha (115) above Bravo (105), once each.
-     */
+  it('characterizes exact single-item output, flags, and empty trade sections', async () => {
+    const { result } = await profile(
+      [{ ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2021, value: 60, flag: 'E' }],
+      { item_query: 'Milk of cattle' },
+    );
+    expect(result.resolved_items).toEqual([{ code: 100, name: 'Milk of cattle' }]);
+    expect(result.top_producers[0]).toMatchObject({ value: 60, year: 2021, flags: 'E' });
+    expect(result.production_trend[0]).toMatchObject({ value: 60, flags: 'E' });
+    expect(commodityProfileTool.format?.(result)).toEqual([
+      expect.objectContaining({ text: expect.stringContaining('### Top exporters\n_None._') }),
+    ]);
+  });
+
+  it('rejects related commodities instead of adding their production', async () => {
+    await expect(
+      profile(
+        [
+          { ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2022, value: 60 },
+          { ...ALPHA, ...GOATS, ...PRODUCTION, year: 2022, value: 55 },
+        ],
+        { item_query: 'milk' },
+      ),
+    ).rejects.toMatchObject({ data: { reason: 'ambiguous_item' } });
+  });
+  it('ranks only the selected item without adding related commodities', async () => {
+    /** Related commodities would invert the ranking if their values were added. */
     const { result } = await profile([
       { ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2022, value: 60, flag: 'A' },
       { ...ALPHA, ...GOATS, ...PRODUCTION, year: 2022, value: 55, flag: 'E' },
@@ -75,32 +94,31 @@ describe('faostat_commodity_profile per-country aggregation (#5a)', () => {
       { ...BRAVO, ...GOATS, ...PRODUCTION, year: 2022, value: 5, flag: 'A' },
     ]);
 
-    // Both items really are in play — otherwise the sum below proves nothing.
-    expect(result.resolved_items).toHaveLength(2);
+    expect(result.resolved_items).toHaveLength(1);
     expect(result.top_producers).toHaveLength(2);
     expect(result.top_producers[0]).toMatchObject({
-      area: 'Alpha',
-      area_code: 10,
-      value: 115,
-      observations: 2,
+      area: 'Bravo',
+      area_code: 20,
+      value: 100,
+      observations: 1,
       year: 2022,
       unit: 't',
     });
     expect(result.top_producers[1]).toMatchObject({
-      area: 'Bravo',
-      area_code: 20,
-      value: 105,
-      observations: 2,
+      area: 'Alpha',
+      area_code: 10,
+      value: 60,
+      observations: 1,
     });
-    // The data-quality flags of every summed observation survive aggregation.
-    expect(result.top_producers[0]?.flags).toBe('A, E');
+    // The unrelated goat estimate must not contaminate the cattle flag.
+    expect(result.top_producers[0]?.flags).toBe('A');
     expect(result.top_producers[1]?.flags).toBe('A');
   });
 
   it('keeps units apart rather than summing incomparable quantities', async () => {
     const { ctx, result } = await profile([
-      { ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2022, value: 60, unit: 't' },
-      { ...ALPHA, ...GOATS, ...PRODUCTION, year: 2022, value: 55, unit: 'No' },
+      { ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2021, value: 60, unit: 't' },
+      { ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2022, value: 55, unit: 'No' },
     ]);
 
     expect(result.top_producers.map((r) => [r.unit, r.value])).toEqual([
@@ -127,7 +145,7 @@ describe('faostat_commodity_profile per-country latest year (#5b, #5d)', () => {
       { ...BRAVO, ...CATTLE, ...PRODUCTION, year: 2021, value: 90 },
     ]);
 
-    expect(result.resolved_items).toHaveLength(2);
+    expect(result.resolved_items).toHaveLength(1);
     expect(result.top_producers).toHaveLength(2);
     expect(result.top_producers[0]).toMatchObject({ area: 'Bravo', value: 90, year: 2021 });
     expect(result.top_producers[1]).toMatchObject({
@@ -140,7 +158,7 @@ describe('faostat_commodity_profile per-country latest year (#5b, #5d)', () => {
 
   it('returns the annual trend on both client surfaces (#5e)', async () => {
     const { result } = await profile([
-      { ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2021, value: 10 },
+      { ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2021, value: 10, flag: 'E' },
       { ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2022, value: 30 },
       { ...ALPHA, ...GOATS, ...PRODUCTION, year: 2020, value: 1000 },
       { ...BRAVO, ...CATTLE, ...PRODUCTION, year: 2020, value: 100 },
@@ -148,24 +166,24 @@ describe('faostat_commodity_profile per-country latest year (#5b, #5d)', () => {
     ]);
 
     expect(result.production_trend).toEqual([
-      { year: 2020, value: 1100, observations: 2, unit: 't', flags: 'A' },
-      { year: 2021, value: 100, observations: 2, unit: 't', flags: 'A' },
+      { year: 2020, value: 100, observations: 1, unit: 't', flags: 'A' },
+      { year: 2021, value: 100, observations: 2, unit: 't', flags: 'A, E' },
       { year: 2022, value: 30, observations: 1, unit: 't', flags: 'A' },
     ]);
-    expect(result.trend_points).toBe(5);
+    expect(result.trend_points).toBe(4);
 
     // content[]-only clients must see the same year/value pairs, not just a count.
     const text = (commodityProfileTool.format?.(result) ?? [])
       .map((c) => (c.type === 'text' ? c.text : ''))
       .join('\n');
-    expect(text).toContain('| 2020 | 1,100 | t | 2 | A |');
-    expect(text).toContain('| 2021 | 100 | t | 2 | A |');
+    expect(text).toContain('| 2020 | 100 | t | 1 | A |');
+    expect(text).toContain('| 2021 | 100 | t | 2 | A, E |');
     expect(text).toContain('| 2022 | 30 | t | 1 | A |');
   });
 });
 
 describe('faostat_commodity_profile item-resolution disclosure (#5c)', () => {
-  it('reports how many items the commodity name matched beyond the profile cap', async () => {
+  it('discloses when ambiguity guidance cannot show every candidate', async () => {
     const observations: ExplicitObservation[] = [];
     for (let i = 0; i < 8; i++) {
       observations.push({
@@ -177,14 +195,10 @@ describe('faostat_commodity_profile item-resolution disclosure (#5c)', () => {
         value: 10 + i,
       });
     }
-    const { ctx, result } = await profile(observations);
-
-    const enrichment = getEnrichment(ctx);
-    expect(enrichment.resolvedItemMatches).toBe(8);
-    expect(enrichment.itemsTruncated).toBe(true);
-    expect(result.resolved_items).toHaveLength(5);
-    expect(enrichment.notice as string).toMatch(/matched 8 items/);
-    expect(enrichment.notice as string).toMatch(/faostat_resolve_codes/);
+    await expect(profile(observations, { item_query: 'milk' })).rejects.toMatchObject({
+      data: { reason: 'ambiguous_item' },
+      message: expect.stringContaining('showing 5 of 8; truncated'),
+    });
   });
 
   it('does not claim truncation when every match fits', async () => {
@@ -193,7 +207,7 @@ describe('faostat_commodity_profile item-resolution disclosure (#5c)', () => {
       { ...ALPHA, ...GOATS, ...PRODUCTION, year: 2022, value: 55 },
     ]);
     const enrichment = getEnrichment(ctx);
-    expect(enrichment.resolvedItemMatches).toBe(2);
+    expect(enrichment.resolvedItemMatches).toBe(1);
     expect(enrichment.itemsTruncated).toBe(false);
     expect((enrichment.notice as string | undefined) ?? '').not.toMatch(/matched 2 items/);
   });

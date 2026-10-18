@@ -30,6 +30,14 @@ afterEach(() => {
 });
 
 describe('getServerConfig', () => {
+  it('normalizes, deduplicates, and skips empty domain selections from cached config', async () => {
+    const getServerConfig = await configUnder({ FAOSTAT_DOMAINS: ' qcl, ,TCL,qCl, tcl,rl,' });
+    const { selectedDomainCodes } = await import('@/config/server-config.js');
+    expect(selectedDomainCodes()).toEqual(['QCL', 'TCL', 'RL']);
+    vi.stubEnv('FAOSTAT_DOMAINS', 'FBS');
+    expect(selectedDomainCodes()).toEqual(['QCL', 'TCL', 'RL']);
+    expect(selectedDomainCodes({ ...getServerConfig(), domains: ', ,' })).toEqual([]);
+  });
   it('applies the defaults when no FAOSTAT variable is set', async () => {
     const getServerConfig = await configUnder();
     expect(getServerConfig()).toEqual({

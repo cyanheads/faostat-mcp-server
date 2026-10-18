@@ -14,7 +14,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { resolveCodesTool } from '@/mcp-server/tools/definitions/resolve-codes.tool.js';
 import { type FaostatMirror, initFaostatMirror } from '@/services/faostat-mirror/index.js';
@@ -144,5 +144,61 @@ describe('faostat_resolve_codes pagination (#7)', () => {
     expect(result.matches).toEqual([{ code: 5, name: 'Country 5', kind: 'country' }]);
     expect(enrichment.truncated).toBe(false);
     expect(enrichment.nextOffset).toBeUndefined();
+  });
+
+  it.each([{ code: 999999 }, { name_contains: 'no-such-country' }, { offset: COUNTRY_COUNT }])(
+    'renders empty results and precise retrieval guidance on both surfaces: %j',
+    async (filter) => {
+      const wire = await runToolContract(resolveCodesTool, {
+        domain: FIXTURE_DOMAIN,
+        dimension: 'area',
+        ...filter,
+      });
+      expect(wire.isError).not.toBe(true);
+      expect(wire.structuredContent).toMatchObject({ matches: [], truncated: false });
+      const text = wire.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+      expect(text).toContain('No area codes matched in QCL');
+      expect(text).toContain('offset' in filter ? 'past the 7 area' : 'No area matched');
+      if ('code' in filter) expect(text).toContain('code 999999');
+      if ('name_contains' in filter) expect(text).toContain('name containing "no-such-country"');
+    },
+  );
+
+  it('formats country kinds and item CPC crosswalks without changing raw matches', async () => {
+    for (const dimension of ['area', 'item'] as const) {
+      const wire = await runToolContract(resolveCodesTool, { domain: FIXTURE_DOMAIN, dimension });
+      expect(wire.isError).not.toBe(true);
+      const { matches } = wire.structuredContent as {
+        matches: { code: number; name: string; kind: string | null; cpc_code?: string }[];
+      };
+      expect(matches.length).toBeGreaterThan(0);
+      const text = wire.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+      for (const match of matches) {
+        expect(text).toContain(`**${match.code}** — ${match.name}`);
+        if (dimension === 'area') expect(text).toContain('[country]');
+        else {
+          expect(match.kind).toBeNull();
+          expect(match.cpc_code).toBeDefined();
+          expect(text).toContain(`(CPC ${match.cpc_code})`);
+        }
+      }
+    }
+  });
+
+  it('returns the declared index-not-ready recovery before a first sync', async () => {
+    await mirror.close();
+    mirror = initFaostatMirror({ dir: join(dir, 'cold'), domains: [FIXTURE_DOMAIN] });
+    const wire = await runToolContract(resolveCodesTool, {
+      domain: FIXTURE_DOMAIN,
+      dimension: 'item',
+    });
+    expect(wire.isError).toBe(true);
+    expect(wire.structuredContent).toMatchObject({
+      error: { data: { reason: 'index_not_ready' } },
+    });
+    const text = wire.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+    expect(text).toContain(
+      resolveCodesTool.errors?.find((entry) => entry.reason === 'index_not_ready')?.recovery,
+    );
   });
 });

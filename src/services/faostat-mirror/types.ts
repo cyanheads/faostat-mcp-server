@@ -22,6 +22,8 @@ export const AGGREGATE_AREA_CODE_THRESHOLD = 5000;
  * them as countries and lets a naive sum double-count (issue #4):
  *   - `351` "China" = 41 mainland + 214 Taiwan + 96 Hong Kong + 128 Macao.
  *   - `265` "China (excluding intra-trade)" — a TCL trade roll-up.
+ *   - `261`, `266`, `268`, `269` — EU membership vintages excluding intra-trade.
+ *   - `420` "Sub-Saharan Africa" — a regional roll-up.
  * Curated, not data-derived: FAOSTAT exposes no roll-up signal in the bulk channel
  * this server mirrors — M49 codes don't discriminate aggregates from countries, no
  * country-group membership file ships in the domain ZIPs, and the definitions API
@@ -29,7 +31,9 @@ export const AGGREGATE_AREA_CODE_THRESHOLD = 5000;
  * Czechoslovakia, …) are deliberately excluded: single successor entities, not
  * member roll-ups, so they carry no double-count hazard.
  */
-export const AGGREGATE_AREA_CODES: ReadonlySet<number> = new Set([265, 351]);
+export const AGGREGATE_AREA_CODES: ReadonlySet<number> = new Set([
+  261, 265, 266, 268, 269, 351, 420,
+]);
 
 /**
  * True when an area code denotes an aggregate/roll-up region rather than an

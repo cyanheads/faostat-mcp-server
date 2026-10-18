@@ -186,13 +186,19 @@ export class ReadPool {
    * `busy_timeout`, a read-only file), with `DatabaseError` when the worker cannot
    * open the file, or when the pool closes first. The caller reports success to the
    * other workers with {@link invalidate}.
+   * When `areaYearIndex` is true, installs the cube's `(area_code, year)` index
+   * before ANALYZE in the same job, under the same single-build scheduling limit.
    */
-  analyze(file: string, table: string): Promise<number> {
+  analyze(file: string, table: string, areaYearIndex = false): Promise<number> {
     if (this.closed) {
       return Promise.reject(serviceUnavailable('The mirror read pool is closed.'));
     }
     return new Promise<number>((resolve, reject) => {
-      this.enqueue({ op: 'analyze', file, table }, resolve as (ms: unknown) => void, reject);
+      this.enqueue(
+        { op: 'analyze', file, table, areaYearIndex },
+        resolve as (ms: unknown) => void,
+        reject,
+      );
       this.pump();
     });
   }
