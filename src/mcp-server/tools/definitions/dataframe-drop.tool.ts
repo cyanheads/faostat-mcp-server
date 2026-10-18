@@ -9,7 +9,7 @@
 
 import { disabledTool, tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { canvasEnabled, dropStaged } from '@/services/canvas-staging.js';
 
 export const dataframeDropTool = tool('faostat_dataframe_drop', {
@@ -39,13 +39,11 @@ export const dataframeDropTool = tool('faostat_dataframe_drop', {
         'Staged tables are off in this deployment, so nothing is staged to drop; set CANVAS_PROVIDER_TYPE=duckdb in the server environment to enable them.',
     },
     {
-      // Raised by the framework canvas inside dropStaged, not by a ctx.fail here.
       reason: 'canvas_not_found',
       code: JsonRpcErrorCode.NotFound,
-      thrownBy: 'service',
       when: 'An explicit canvas_id does not resolve to a live canvas — unknown, expired, or owned by another tenant.',
       recovery:
-        'Verify the canvas_id was returned by a prior faostat_query_observations / faostat_commodity_profile call, or omit canvas_id to fall back to the shared session canvas.',
+        'This canvas no longer exists, so there is nothing left to drop. Use faostat_dataframe_describe without canvas_id to list tables still staged in this session.',
     },
   ],
 
@@ -81,7 +79,12 @@ export const dataframeDropTool = tool('faostat_dataframe_drop', {
       ctx,
       input.name,
       input.canvas_id ? { canvasId: input.canvas_id } : {},
-    );
+    ).catch((cause: unknown) => {
+      if (cause instanceof McpError && cause.data?.reason === 'canvas_not_found') {
+        throw ctx.fail('canvas_not_found', cause.message, {}, { cause });
+      }
+      throw cause;
+    });
     ctx.log.info('Dataframe drop', { name: input.name, dropped });
     if (!dropped) {
       ctx.enrich.notice(

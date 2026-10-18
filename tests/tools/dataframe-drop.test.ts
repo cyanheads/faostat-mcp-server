@@ -253,7 +253,7 @@ describe('faostat_dataframe_drop on a DuckDB canvas', () => {
     const declared = dataframeDropTool.errors?.find(
       (e) => e.reason === 'canvas_not_found',
     )?.recovery;
-    expect(declared).toMatch(/omit canvas_id/);
+    expect(declared).toContain('nothing left to drop');
 
     const wire = await runToolContract(
       dataframeDropTool,

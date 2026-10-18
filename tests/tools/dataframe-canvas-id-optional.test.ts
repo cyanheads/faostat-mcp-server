@@ -254,6 +254,24 @@ describe('dataframe tools: declared canvas_not_found recovery on the wire (#35)'
     await canvas.shutdown(createMockContext({ tenantId: 'teardown' }));
   });
 
+  it('drop explains that a missing canvas has nothing left to remove on both surfaces', async () => {
+    const wire = await runToolContract(
+      dataframeDropTool,
+      { name: 'faostat_ab12cd34', canvas_id: 'zzzzzzzzzz' },
+      { context: { tenantId: 'df-drop-missing' } },
+    );
+    expect(wire.isError).toBe(true);
+    const { error } = wire.structuredContent as {
+      error: { code: number; data: { reason: string; recovery: { hint: string } } };
+    };
+    expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+    expect(error.data.reason).toBe('canvas_not_found');
+    expect(error.data.recovery.hint).toContain('nothing left to drop');
+    const text = wire.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+    expect(text).toContain(error.data.recovery.hint);
+    expect(text).not.toMatch(/Re-run|re-stage/);
+  });
+
   it.each([
     ['faostat_dataframe_describe', dataframeDescribeTool, { canvas_id: 'zzzzzzzzzz' }],
     [
