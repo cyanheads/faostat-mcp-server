@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-10-17 · ⚠️ Breaking
+
+Select one commodity per profile and correct mirror query behavior.
+
 ## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-10-03
 
 Adds the opt-in faostat_dataframe_drop tool and moves to mcp-ts-core 0.13.11: ctx.log client notifications honor MCP_LOG_LEVEL, the registry HTTP entry starts the HTTP transport, and the Docker image drops DuckDB's musl binding.
