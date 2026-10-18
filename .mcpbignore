@@ -4,8 +4,15 @@
 /.claude/
 /.agents/
 /framework-skills/
-/docs/idea.md
+/docs/
+/.cache/
+/tests/
+/src/
+/scripts/
+/.github/
+/.vscode/
 /logs/
+/coverage/
 /Dockerfile
 /bun.lock
 /bunfig.toml

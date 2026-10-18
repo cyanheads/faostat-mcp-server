@@ -1,6 +1,6 @@
 # faostat-mcp-server - Directory Structure
 
-Generated on: 2026-10-04 06:42:03
+Generated on: 2026-10-18 05:59:54
 
 ```text
 faostat-mcp-server/
@@ -176,7 +176,8 @@ faostat-mcp-server/
 ├── tests/
 │   ├── config/
 │   │   ├── server-config.test.ts
-│   │   └── startup-config-error.test.ts
+│   │   ├── startup-config-error.test.ts
+│   │   └── startup-lifecycle.test.ts
 │   ├── fixtures/
 │   │   ├── crash-read-worker.mjs
 │   │   └── synthetic-domain.ts
@@ -188,6 +189,7 @@ faostat-mcp-server/
 │   │   ├── mirror-context.test.ts
 │   │   └── test-node.test.ts
 │   ├── services/
+│   │   ├── canvas-staging-lifecycle.test.ts
 │   │   ├── csv.test.ts
 │   │   ├── faostat-mirror-index.test.ts
 │   │   ├── faostat-mirror-off-thread.test.ts
@@ -199,6 +201,7 @@ faostat-mcp-server/
 │   └── tools/
 │       ├── commodity-profile-aggregation.test.ts
 │       ├── commodity-profile-notice.test.ts
+│       ├── commodity-profile-selection.test.ts
 │       ├── commodity-profile-year-range.test.ts
 │       ├── dataframe-canvas-id-optional.test.ts
 │       ├── dataframe-describe-pagination.test.ts
