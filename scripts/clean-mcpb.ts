@@ -55,9 +55,9 @@ export const AGENT_DOC_ENTRY =
  * then runs only on the platform it was packed on, contradicting the
  * cross-platform "Install in Claude Desktop" badge, and blows past the 25 MB
  * cap registries enforce. Stripping them keeps the bundle portable and small;
- * DuckDB is an optional peer loaded through `lazyImport`, so a server whose
- * canvas is disabled (`CANVAS_PROVIDER_TYPE=none`, the default) is unaffected
- * and one that enables it gets the helper's actionable install hint.
+ * DuckDB is an optional peer loaded through `lazyImport`, so a bundle whose
+ * canvas is disabled (`CANVAS_PROVIDER_TYPE=none`, which `manifest.json` pins)
+ * is unaffected and one that enables it gets the helper's actionable install hint.
  */
 export const NATIVE_BINDING_ENTRY = /^node_modules\/@duckdb\/node-bindings-[^/]+\//;
 

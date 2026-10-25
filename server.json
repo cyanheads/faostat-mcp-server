@@ -44,7 +44,7 @@
         },
         {
           "name": "CANVAS_PROVIDER_TYPE",
-          "description": "Set to 'duckdb' to enable the DataCanvas SQL surface (default), or 'none' to disable analytical staging.",
+          "description": "DataCanvas engine for SQL over large result sets. Defaults to 'duckdb'; set 'none' to disable analytical staging.",
           "format": "string",
           "isRequired": false,
           "default": "duckdb"
@@ -138,7 +138,7 @@
         },
         {
           "name": "CANVAS_PROVIDER_TYPE",
-          "description": "Set to 'duckdb' to enable the DataCanvas SQL surface (default), or 'none' to disable analytical staging.",
+          "description": "DataCanvas engine for SQL over large result sets. Defaults to 'duckdb'; set 'none' to disable analytical staging.",
           "format": "string",
           "isRequired": false,
           "default": "duckdb"

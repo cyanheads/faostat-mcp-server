@@ -123,6 +123,15 @@ describe('startup lifecycle', () => {
     expect(boundary.schedule).not.toHaveBeenCalled();
   });
 
+  it.each(['', '   ', `\${CANVAS_PROVIDER_TYPE}`, ` \${user_config.canvas_provider} `])(
+    'defaults an unset CANVAS_PROVIDER_TYPE spelling to duckdb: %j',
+    async (value) => {
+      vi.stubEnv('CANVAS_PROVIDER_TYPE', value);
+      await load();
+      expect(process.env.CANVAS_PROVIDER_TYPE).toBe('duckdb');
+    },
+  );
+
   it.each([
     { transport: 'http', cron: '0 6 * * *', node: true, scheduled: true },
     { transport: 'stdio', cron: '0 6 * * *', node: true, scheduled: false },

@@ -8,6 +8,7 @@
  */
 
 import { createApp } from '@cyanheads/mcp-ts-core';
+import { normalizeEnv } from '@cyanheads/mcp-ts-core/config';
 import type { MirrorLogger } from '@cyanheads/mcp-ts-core/mirror';
 import {
   logger,
@@ -41,11 +42,8 @@ try {
   if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
 }
 
-// DuckDB is the only canvas engine and ships as a direct dependency, so enable
-// the canvas by default. Set CANVAS_PROVIDER_TYPE=none to turn it off (e.g. on a
-// memory-constrained deployment); the analytical tools then degrade to inline-
-// only and refuse to stage large result sets with a clear canvas_disabled error.
-process.env.CANVAS_PROVIDER_TYPE ??= 'duckdb';
+// DataCanvas runs on DuckDB unless CANVAS_PROVIDER_TYPE=none disables it.
+process.env.CANVAS_PROVIDER_TYPE = normalizeEnv(process.env).CANVAS_PROVIDER_TYPE ?? 'duckdb';
 
 // Read before createApp(): it decides how the drop tool registers and whether the
 // instructions name it. The full config is validated in setup(), where a bad value

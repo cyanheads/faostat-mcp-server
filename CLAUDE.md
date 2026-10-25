@@ -2,7 +2,7 @@
 
 **Server:** faostat-mcp-server
 **Version:** 0.4.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.16`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.3.1 (via the framework)
 **Zod:** ^4.6.7
@@ -164,7 +164,7 @@ export function getServerConfig() {
 
 `src/index.ts` loads `./.env` and reads the drop flag with `dataframeDropRequested()` before `createApp()`, since the flag decides how a tool registers. That read never throws; the full config is validated by `getServerConfig()` in `setup()`, so a bad value fails behind the framework's startup banner.
 
-`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`FAOSTAT_DOMAINS`) not the path (`domains`). Throws `ConfigurationError`, which the framework prints as a clean startup banner. `CANVAS_PROVIDER_TYPE` is a core var (already in `AppConfig`), not part of this schema; `src/index.ts` defaults it to `duckdb`.
+`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`FAOSTAT_DOMAINS`) not the path (`domains`). Throws `ConfigurationError`, which the framework prints as a clean startup banner. `CANVAS_PROVIDER_TYPE` is a core var (already in `AppConfig`), not part of this schema; `src/index.ts` uses the framework's `normalizeEnv` to treat blank, whitespace-only, and unsubstituted placeholder values as unset before defaulting to `duckdb`.
 
 For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `z.stringbool()` parses `true/false/1/0/yes/no/on/off` and rejects anything else, so `=false` actually disables.
 
