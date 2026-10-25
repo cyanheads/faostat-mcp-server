@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-10-25
+
+Normalize unset canvas settings and adopt framework fixes.
+
 ## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-10-17 · ⚠️ Breaking
 
 Select one commodity per profile and correct mirror query behavior.
