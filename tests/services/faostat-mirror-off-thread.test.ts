@@ -35,6 +35,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Worker } from 'node:worker_threads';
 import {
   CanvasInstance,
   createCanvasService,
@@ -318,36 +319,55 @@ describe('ReadPool', () => {
 
   it('never holds more than four threads: past two retired workers, a replacement waits for one to exit', async () => {
     const pool = track(new ReadPool());
-    let maxThreads = 0;
-    const sample = setInterval(() => {
-      maxThreads = Math.max(maxThreads, pool.stats().threads);
-    }, 5);
+    const terminate = Worker.prototype.terminate;
+    const held: Worker[] = [];
+    /**
+     * A native statement may finish before the second pair retires. Hold exits
+     * explicitly so all four retired threads coexist regardless of machine load.
+     */
+    const termination = vi.spyOn(Worker.prototype, 'terminate').mockImplementation(function (
+      this: Worker,
+    ) {
+      held.push(this);
+      return new Promise<number>((resolve) => this.once('exit', resolve));
+    });
 
-    /** Two long reads on the two warm workers, both cut off at 100 ms. */
+    /** Cancel both dispatched reads before the main thread can receive their replies. */
     async function cutOffBoth(): Promise<void> {
       await Promise.all([pool.all(quick()), pool.all(quick())]);
-      const reads = [
-        pool.all(spinFor(3000), withQueryCeiling(undefined, 100)),
-        pool.all(spinFor(3000), withQueryCeiling(undefined, 100)),
-      ];
+      const controllers = [new AbortController(), new AbortController()];
+      const reads = controllers.map((controller) => pool.all(quick(), controller.signal));
+      expect(pool.stats()).toMatchObject({ busy: 2 });
+      for (const controller of controllers) controller.abort();
       const settled = await Promise.allSettled(reads);
-      expect(settled.map((s) => s.status)).toEqual(['rejected', 'rejected']);
+      for (const outcome of settled) {
+        expect(outcome).toMatchObject({
+          status: 'rejected',
+          reason: { code: JsonRpcErrorCode.RequestCancelled },
+        });
+      }
     }
 
-    await cutOffBoth();
-    expect(pool.stats()).toMatchObject({ live: 0, retired: 2, threads: 2 });
-    await cutOffBoth();
-    expect(pool.stats()).toMatchObject({ live: 0, retired: 4, threads: 4 });
+    try {
+      await cutOffBoth();
+      expect(pool.stats()).toMatchObject({ live: 0, retired: 2, threads: 2 });
+      await cutOffBoth();
+      expect(pool.stats()).toMatchObject({ live: 0, retired: 4, threads: 4 });
+      expect(held).toHaveLength(4);
 
-    // At the cap: the read waits in the queue — no fifth thread.
-    const next = pool.all(quick(9));
-    expect(pool.stats()).toMatchObject({ live: 0, queued: 1, threads: 4 });
-    await expect(next).resolves.toEqual([{ n: 9 }]);
-    // Served only once a retired worker had exited.
-    expect(pool.stats().retired).toBeLessThan(4);
-
-    clearInterval(sample);
-    expect(maxThreads).toBe(4);
+      // At the cap: the read waits in the queue — no fifth thread.
+      const next = pool.all(quick(9));
+      expect(pool.stats()).toMatchObject({ live: 0, queued: 1, threads: 4 });
+      const first = held.shift();
+      if (!first) throw new Error('Expected a retired worker to release');
+      await terminate.call(first);
+      await expect(next).resolves.toEqual([{ n: 9 }]);
+      // Exactly one exit freed exactly one replacement under the same cap.
+      expect(pool.stats()).toMatchObject({ live: 1, retired: 3, queued: 0, threads: 4 });
+    } finally {
+      termination.mockRestore();
+      await Promise.all(held.map((worker) => terminate.call(worker)));
+    }
   }, 30_000);
 
   it('fails a read whose worker dies with a retryable ServiceUnavailable, and respawns for the next', async () => {
