@@ -112,7 +112,7 @@ export const dataframeDescribeTool = tool('faostat_dataframe_describe', {
             created_at: z.string().describe('ISO 8601 creation timestamp.'),
             expires_at: z
               .string()
-              .describe('ISO 8601 expiry timestamp. Sliding TTL touched on every staged-table op.'),
+              .describe('ISO 8601 expiry timestamp recorded when this table was staged.'),
             row_count: z.number().describe('Rows staged in the table.'),
             truncated: z
               .boolean()

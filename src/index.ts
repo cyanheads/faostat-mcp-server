@@ -81,6 +81,7 @@ await createApp({
   // rather than left to a deployment's MCP_SESSION_MODE, which still wins when it
   // carries a meaningful value. No `require: 'stateful'`: nothing here needs it.
   sessionMode: 'stateless',
+  skills: 'skills',
   tools: [
     listDomainsTool,
     resolveCodesTool,

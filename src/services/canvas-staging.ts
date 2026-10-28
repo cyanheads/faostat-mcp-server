@@ -57,7 +57,7 @@ export interface StageResult {
 const META_PREFIX = 'df-meta/';
 const CANVAS_ID_KEY = 'canvas-id';
 const TABLE_CHARSET = 'abcdefghijklmnopqrstuvwxyz0123456789';
-/** Per-table TTL: canvas tables are ephemeral working slices (2h sliding). */
+/** Per-table TTL: canvas tables are ephemeral working slices. */
 const TABLE_TTL_MS = 2 * 60 * 60 * 1000;
 /** Inline preview character budget (≈25k tokens). */
 const PREVIEW_CHARS = 100_000;

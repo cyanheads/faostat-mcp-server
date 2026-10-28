@@ -30,6 +30,9 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 # Copy the rest of the source code
 COPY . .
 
+# Published agent skills are loaded from the application root at runtime.
+RUN mkdir -p skills
+
 # Build the application
 RUN bun run build
 
@@ -136,6 +139,7 @@ COPY --from=deps /usr/src/app/node_modules ./node_modules
 
 # Copy the compiled application code from the build stage
 COPY --from=build /usr/src/app/dist ./dist
+COPY --from=build /usr/src/app/skills ./skills
 
 # Mirror CLI scripts. `bun run mirror:init` / `mirror:refresh` / `mirror:verify`
 # invoke these directly (Bun runs `.ts` natively) — they must exist in the image
