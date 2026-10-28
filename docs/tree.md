@@ -1,6 +1,6 @@
 # faostat-mcp-server - Directory Structure
 
-Generated on: 2026-10-18 06:33:01
+Generated on: 2026-10-28 12:16:41
 
 ```text
 faostat-mcp-server/
@@ -28,6 +28,7 @@ faostat-mcp-server/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
+│   ├── 0.5.x/
 │   └── template.md
 ├── docs/
 │   └── design.md
@@ -39,6 +40,8 @@ faostat-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -190,6 +193,7 @@ faostat-mcp-server/
 │   ├── prompts/
 │   ├── resources/
 │   ├── scripts/
+│   │   ├── bundle-agent-docs.test.ts
 │   │   ├── mirror-context.test.ts
 │   │   └── test-node.test.ts
 │   ├── services/
@@ -239,7 +243,9 @@ faostat-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json
