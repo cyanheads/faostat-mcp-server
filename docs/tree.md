@@ -141,6 +141,9 @@ faostat-mcp-server/
 │   ├── release-github.ts
 │   ├── test-node.ts
 │   └── tree.ts
+├── skills/
+│   └── faostat-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "faostat-mcp-server",
+  "version": "0.4.1",
+  "description": "Global food & agriculture statistics from the UN FAOSTAT bulk-download corpus, served from a local SQLite mirror with a DataCanvas SQL surface, via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/faostat-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/faostat-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "faostat",
+    "fao",
+    "agriculture",
+    "food-security",
+    "agricultural-statistics",
+    "crop-production",
+    "agricultural-trade",
+    "food-balances",
+    "duckdb",
+    "sqlite",
+    "dataframe"
+  ]
+}

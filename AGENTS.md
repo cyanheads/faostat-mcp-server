@@ -2,9 +2,9 @@
 
 **Server:** faostat-mcp-server
 **Version:** 0.4.1
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.16`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1 (via the framework)
+**MCP SDK:** `@modelcontextprotocol/server` ^2.4.0 (via the framework)
 **Zod:** ^4.6.7
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -42,7 +42,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ## Patterns
 
-This server is **tools-only** — seven tools (`faostat_dataframe_drop` opt-in via `FAOSTAT_DATAFRAME_DROP_ENABLED`), no resources, no prompts (the data behind every resource candidate is already reachable through the tools, and the one workflow worth structuring ships as `faostat_commodity_profile`). All definitions live in `src/mcp-server/tools/definitions/`.
+This server exposes seven tools (`faostat_dataframe_drop` opt-in via `FAOSTAT_DATAFRAME_DROP_ENABLED`), one skill resource through the MCP Skills extension, and no prompts. Statistical data is reached through the tools; `skills/faostat-guide/SKILL.md` guides comparisons and staged SQL analysis. All tool definitions live in `src/mcp-server/tools/definitions/`.
 
 ### Tool
 
@@ -286,7 +286,7 @@ scripts/
   faostat-mirror-init.ts  faostat-mirror-refresh.ts  faostat-mirror-verify.ts  _mirror-context.ts
 ```
 
-No `resources/` or `prompts/` definitions — this server is tools-only.
+No hand-authored `resources/` or `prompts/` definitions. `createApp({ skills: 'skills' })` serves the root `skills/faostat-guide/SKILL.md` through the MCP Skills extension.
 
 ---
 
@@ -304,7 +304,7 @@ No `resources/` or `prompts/` definitions — this server is tools-only.
 
 ## Skills
 
-Skills are modular instructions in `framework-skills/` at the project root. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. The directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand these development skills to every agent that installs it. Keep `skills/` free for skills meant for those agents.
+Development skills live in `framework-skills/` at the project root. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. Root `skills/` is separate: it holds author-managed skills for agents installing this server, ships in npm, Docker and MCPB, and reaches MCP clients through `createApp({ skills: 'skills' })`. The maintenance sync never authors that tree; use `add-skill` deliberately.
 
 **Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
 
@@ -318,6 +318,7 @@ Available skills:
 | `add-app-tool` | Scaffold an MCP App tool + paired UI resource |
 | `add-resource` | Scaffold a new resource definition |
 | `add-prompt` | Scaffold a new prompt definition |
+| `add-skill` | Author a skill the server publishes in root `skills/` for the agents that use it — structure, validation, delivery |
 | `add-service` | Scaffold a new service integration |
 | `add-test` | Scaffold test file for a tool, resource, or service |
 | `field-test` | Exercise tools/resources/prompts with real inputs, verify behavior, report issues |
@@ -376,7 +377,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run mirror:refresh` | Re-sync domains whose upstream `DateUpdate` has advanced (skips unchanged), and build query-planner statistics (`ANALYZE`) for any domain that has none, unchanged ones included. Run out-of-band on stdio; HTTP transport schedules it via `FAOSTAT_REFRESH_CRON`. |
 | `bun run mirror:verify` | Report per-domain sync status, local row counts, and sample reads against the mirror. |
 | `bun run lint:mcp` | Validate MCP tool definitions against the spec (format-parity, schema shape, naming). Rule catalog: `api-linter` skill. |
-| `bun run lint:packaging` | Packaging surface checks — `server.json`/`manifest.json` env-var parity and the `server.json` npm entries' shape (run by devcheck). |
+| `bun run lint:packaging` | Packaging surface checks — registry/bundle env parity, npm launch shape, bundle exclusions, plugin manifests, and published `skills/` (run by devcheck). |
 | `bun run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/*.md` |
 | `bun run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
 | `bun run bundle` | Build, pack, and clean a `.mcpb` for one-click Claude Desktop install |
@@ -387,7 +388,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips two classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`) and platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
+`bun run bundle` produces a `.mcpb` extension bundle for Claude Desktop. Root development paths need root-anchored `.mcpbignore` lines; root `skills/` ships. The cleaner prunes dev dependencies and strips dependency-root agent docs, platform-specific DuckDB bindings, node-gyp generator/intermediate files, and build-only framework/SQLite package files. Nested SDK runtime `dist/ext/skills/` modules and compiled `*.node` addons stay. `manifest.json` disables canvas in the portable bundle; npm and Docker retain DuckDB. MCPB uses stdio.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match.
 
@@ -461,4 +462,5 @@ import { canvasEnabled, stageObservations } from '@/services/canvas-staging.js';
 - [ ] `.codex-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; `interface.displayName` = package name; `interface.shortDescription` from `package.json` description
 - [ ] `.codex-plugin/mcp.json` server name key matches `package.json` name (no API keys — FAOSTAT is keyless)
 - [ ] `.claude-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; inline `mcpServers` entry with the server name key
+- [ ] Root `plugin.json` and `mcp.json` follow Agent Plugins 1.0.0; unscoped display name, full npm install name, fixed env matching `.codex-plugin/mcp.json`; keep the Codex overlay's `mcpServers` pointer
 - [ ] `bun run devcheck` passes

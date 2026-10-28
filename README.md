@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/faostat-mcp-server</h1>
   <p><b>Global food & agriculture statistics from the UN FAOSTAT bulk-download corpus, served from a local SQLite mirror with a DataCanvas SQL surface, via MCP. STDIO or Streamable HTTP.</b>
-  <div>7 Tools • 0 Resources • 0 Prompts</div>
+  <div>7 Tools • 1 Skill Resource • 0 Prompts</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.4.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/faostat-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/faostat-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.4.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/faostat-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/faostat-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 [![Install in Claude Desktop](https://img.shields.io/badge/Install_in-Claude_Desktop-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://github.com/cyanheads/faostat-mcp-server/releases/latest/download/faostat-mcp-server.mcpb) [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=faostat-mcp-server&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBjeWFuaGVhZHMvZmFvc3RhdC1tY3Atc2VydmVyIl19) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22faostat-mcp-server%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40cyanheads%2Ffaostat-mcp-server%22%5D%7D)
 
@@ -94,7 +94,7 @@ Global food and agriculture statistics from the UN's FAOSTAT: production, trade,
 
 ### `faostat_dataframe_describe` <sub>tool</sub>
 
-- Lists staged tables with source tool, query params, row count, column schema, and creation/expiry (2-hour sliding TTL)
+- Lists staged tables with source tool, query params, row count, column schema, and recorded creation/expiry timestamps
 - `name` describes one table outright; otherwise `offset` + `limit` (max 100, default 20) page the listing newest-first
 - Typed errors: `canvas_disabled`, `canvas_not_found`, `missing_table`
 
@@ -108,6 +108,8 @@ Global food and agriculture statistics from the UN's FAOSTAT: production, trade,
 - Typed errors: `canvas_disabled`, `canvas_not_found`
 
 ## Features
+
+The [faostat-guide](./skills/faostat-guide/SKILL.md) covers comparable reporting years, country versus regional totals, units, coverage, and complete SQL analysis across staged results. It ships with plugin, npm, Docker, and MCPB installs and is served through the MCP Skills extension as a skill resource.
 
 Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
@@ -127,154 +129,32 @@ Agent-friendly output:
 
 ## Getting started
 
-### Public Hosted Instance
-
-A public instance is available at `https://faostat.caseyjhand.com/mcp` — no installation required. It serves Streamable HTTP; each client takes its own configuration shape.
-
-For Claude Code:
+Connect to the hosted instance, no install:
 
 ```sh
 claude mcp add --transport http faostat-mcp-server https://faostat.caseyjhand.com/mcp
 ```
 
-For Cline (`cline_mcp_settings.json`):
+Or run it locally after [building the mirror](#building-the-mirror):
 
-```json
-{
-  "mcpServers": {
-    "faostat-mcp-server": {
-      "type": "streamableHttp",
-      "url": "https://faostat.caseyjhand.com/mcp"
-    }
-  }
-}
+```sh
+claude mcp add faostat-mcp-server -- npx -y @cyanheads/faostat-mcp-server
 ```
 
-For Cursor (`mcp.json`):
+For other clients, add this to the MCP config file:
 
 ```json
 {
   "mcpServers": {
     "faostat-mcp-server": {
-      "url": "https://faostat.caseyjhand.com/mcp"
-    }
-  }
-}
-```
-
-Claude Desktop adds remote servers under Settings → Connectors.
-
-### Self-Hosted / Local
-
-Add the following to your MCP client configuration file. The server runs entirely on a local mirror, so [build the mirror](#building-the-mirror) once before querying.
-
-```json
-{
-  "mcpServers": {
-    "faostat-mcp-server": {
-      "type": "stdio",
-      "command": "bunx",
-      "args": ["@cyanheads/faostat-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
-    }
-  }
-}
-```
-
-Or with npx (no Bun required):
-
-```json
-{
-  "mcpServers": {
-    "faostat-mcp-server": {
-      "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@cyanheads/faostat-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
+      "args": ["-y", "@cyanheads/faostat-mcp-server"]
     }
   }
 }
 ```
 
-Or with Docker:
-
-```json
-{
-  "mcpServers": {
-    "faostat-mcp-server": {
-      "type": "stdio",
-      "command": "docker",
-      "args": [
-        "run", "-i", "--rm",
-        "-e", "MCP_TRANSPORT_TYPE=stdio",
-        "-v", "faostat-mirror:/usr/src/app/.faostat-mirror",
-        "ghcr.io/cyanheads/faostat-mcp-server:latest"
-      ]
-    }
-  }
-}
-```
-
-For Streamable HTTP, set the transport and start the server:
-
-```sh
-MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
-# Server listens at http://localhost:3010/mcp
-```
-
-No API key is required — the FAOSTAT bulk-download service is public and keyless.
-
-### Prerequisites
-
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
-- Disk for the local mirror. The default domain set (`QCL,TCL,FBS,FS,RL,GLE,RFN,QV`, ∼37M rows) needs a few GB; `TCL` (∼17M rows) dominates and can be dropped from `FAOSTAT_DOMAINS` on a constrained host.
-
-### Installation
-
-1. **Clone the repository:**
-
-```sh
-git clone https://github.com/cyanheads/faostat-mcp-server.git
-```
-
-2. **Navigate into the directory:**
-
-```sh
-cd faostat-mcp-server
-```
-
-3. **Install dependencies:**
-
-```sh
-bun install
-```
-
-4. **Configure environment:**
-
-```sh
-cp .env.example .env
-# edit .env to override the default domain set, mirror path, or refresh cron
-```
-
-### Building the mirror
-
-The corpus is not bundled. Before the data tools can answer queries, sync the selected domains into the local mirror:
-
-```sh
-bun run mirror:init      # one-time bootstrap — downloads and indexes the FAOSTAT_DOMAINS set
-bun run mirror:refresh   # re-sync domains whose upstream update date has advanced; build missing planner statistics
-bun run mirror:verify    # report sync status, local row counts, and sample reads
-```
-
-`mirror:init` is idempotent and resumable per domain — re-running after an interrupt re-streams only the unfinished domain ZIP. `FAOSTAT_DOMAINS` selects which domains are indexed; everything else in the catalog shows in `faostat_list_domains` with `indexed: false` until added and re-synced. On HTTP transport, set `FAOSTAT_REFRESH_CRON` to refresh in-process on a schedule; on stdio, run `mirror:refresh` out-of-band. The read tools return `index_not_ready` until the first sync completes.
-
-`mirror:refresh` also builds query-planner statistics (`ANALYZE`) for any selected domain that has none, even when its data is unchanged upstream — a mirror synced by an older release, or one whose last build failed. Otherwise the server builds them itself, in the background on a worker thread, the first time a data read touches that domain, and keeps answering meanwhile.
+The bulk-download service is public and keyless. For Docker or a source build, see [Running the server](#running-the-server).
 
 ## Configuration
 
@@ -299,6 +179,15 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 
 ### Local development
 
+Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+), plus disk for the mirror. The default domain set (`QCL,TCL,FBS,FS,RL,GLE,RFN,QV`, ∼37M rows) needs a few GB; drop `TCL` (∼17M rows) from `FAOSTAT_DOMAINS` on a constrained host.
+
+```sh
+git clone https://github.com/cyanheads/faostat-mcp-server.git
+cd faostat-mcp-server && bun install
+cp .env.example .env
+# Override the default domain set, mirror path, or refresh cron in .env.
+```
+
 - **Build and run:**
 
   ```sh
@@ -319,14 +208,27 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
   bun run lint:mcp   # Validate MCP definitions against spec
   ```
 
+### Building the mirror
+
+The corpus is not bundled. Before the data tools can answer queries, sync the selected domains into the local mirror:
+
+```sh
+bun run mirror:init      # one-time bootstrap — downloads and indexes the FAOSTAT_DOMAINS set
+bun run mirror:refresh   # re-sync domains whose upstream update date has advanced; build missing planner statistics
+bun run mirror:verify    # report sync status, local row counts, and sample reads
+```
+
+`mirror:init` is idempotent and resumable per domain — re-running after an interrupt re-streams only the unfinished domain ZIP. `FAOSTAT_DOMAINS` selects which domains are indexed; everything else in the catalog shows in `faostat_list_domains` with `indexed: false` until added and re-synced. On HTTP transport, set `FAOSTAT_REFRESH_CRON` to refresh in-process on a schedule; on stdio, run `mirror:refresh` out-of-band. The read tools return `index_not_ready` until the first sync completes.
+
+`mirror:refresh` also builds query-planner statistics (`ANALYZE`) for any selected domain that has none, even when its data is unchanged upstream — a mirror synced by an older release, or one whose last build failed. Otherwise the server builds them itself, in the background on a worker thread, the first time a data read touches that domain, and keeps answering meanwhile.
+
 ### Docker
 
 ```sh
-docker build -t faostat-mcp-server .
-docker run --rm -p 3010:3010 -v faostat-mirror:/usr/src/app/.faostat-mirror faostat-mcp-server
+docker run --rm -p 3010:3010 -v faostat-mirror:/usr/src/app/.faostat-mirror ghcr.io/cyanheads/faostat-mcp-server:latest
 ```
 
-The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `/var/log/faostat-mcp-server`. A dedicated dependency stage installs the production tree for the target platform (DuckDB's prebuilt native binding included), so the slim runtime image carries no build toolchain and a multi-arch build never runs Bun under emulation. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them. Mount a volume at the mirror path to persist the corpus across container recreations, and bootstrap it inside the container:
+Build locally with `docker build -t faostat-mcp-server .`. For stdio from an MCP client, use `"command": "docker"` with `"args": ["run", "-i", "--rm", "-e", "MCP_TRANSPORT_TYPE=stdio", "-v", "faostat-mirror:/usr/src/app/.faostat-mirror", "ghcr.io/cyanheads/faostat-mcp-server:latest"]`. The image defaults to HTTP transport, stateless session mode, and logs to `/var/log/faostat-mcp-server`. A dedicated dependency stage installs the production tree for the target platform (DuckDB's prebuilt native binding included), so the slim runtime image carries no build toolchain and a multi-arch build never runs Bun under emulation. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them. Mount a volume at the mirror path to persist the corpus across container recreations, and bootstrap it inside the container:
 
 ```sh
 docker exec <container> bun run mirror:init      # one-time bootstrap
@@ -340,6 +242,7 @@ docker exec <container> bun run mirror:refresh   # re-sync updated domains; buil
 |:----------|:--------|
 | `src/index.ts` | `createApp()` entry point — registers the seven tools (`faostat_dataframe_drop` behind its opt-in flag), wires the mirror and canvas in `setup()`, schedules the HTTP refresh. |
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
+| `skills/faostat-guide` | Published agent guide, also served as an MCP skill resource. |
 | `src/mcp-server/tools/definitions` | Tool definitions (`*.tool.ts`). |
 | `src/services/faostat-mirror` | The bulk-download mirror service — manifest discovery, streaming ZIP ingester, CSV parsing, dimension store, SQLite-backed `MirrorService` wiring, and the two-worker read pool (`read-pool.ts`, `read-worker.ts`) that runs cube reads and statistics builds off the main thread. |
 | `src/services/canvas-accessor.ts`, `canvas-staging.ts` | DataCanvas accessor and the spill/query/describe/drop staging layer. |

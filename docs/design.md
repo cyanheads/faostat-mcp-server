@@ -18,11 +18,11 @@ Data path: FAOSTAT's keyless **bulk-download service** (per-domain zipped normal
 | `faostat_dataframe_describe` | List DataCanvas tables and columns staged by a prior query call — each table's name, row count, and column schema. Call before `faostat_dataframe_query` to discover table/column names for SQL. | `canvas_id?`, `name?`, `limit?`, `offset?` | `readOnlyHint`, `idempotentHint`, `openWorldHint:false` |
 | `faostat_dataframe_drop` | Drop one staged canvas table and its provenance before its 2-hour TTL. Idempotent (`dropped: false` for a name not staged on the resolved canvas). Opt-in: registered through `disabledTool()` unless `FAOSTAT_DATAFRAME_DROP_ENABLED=true`. | `name`, `canvas_id?` | `destructiveHint`, `idempotentHint`, `openWorldHint:false` |
 
-**Surface count: 7 tools** (`faostat_dataframe_drop` opt-in). No resources, no prompts (see below).
+**Surface count: 7 tools** (`faostat_dataframe_drop` opt-in), one skill resource, no prompts.
 
 ### Resources
 
-None. The data behind every resource candidate (domain catalog, code lists, observations) is already reachable through the tool surface, and the server's clients are agent-driven (tool-only). A `faostat://domain/{code}` summary resource was considered and dropped — `faostat_list_domains` covers it without a second access path to maintain.
+The MCP Skills extension serves `skills/faostat-guide/SKILL.md` as a resource. Statistical data remains tool-accessible: `faostat_list_domains` covers catalog metadata without a separate domain-summary resource.
 
 ### Prompts
 
