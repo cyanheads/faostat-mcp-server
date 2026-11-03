@@ -17,6 +17,8 @@ export default mergeConfig(
   defineConfig({
     resolve: { alias },
     test: {
+      // Each fixture owns SQLite read workers and may open DuckDB; bound concurrent native engines.
+      maxWorkers: 4,
       coverage: {
         /**
          * Native workers load outside Vitest's transform graph. Their behavior
