@@ -221,7 +221,7 @@ The corpus is not bundled. Before the data tools can answer queries, sync the se
 ```sh
 bun run mirror:init      # one-time bootstrap — downloads and indexes the FAOSTAT_DOMAINS set
 bun run mirror:refresh   # re-sync domains whose upstream update date has advanced; build missing planner statistics
-bun run mirror:verify    # report sync status, local row counts, and sample reads
+bun run mirror:verify    # report sync status, local row counts, checkpoints, and dimension population
 ```
 
 `mirror:init` is idempotent and resumable per domain — re-running after an interrupt re-streams only the unfinished domain ZIP. `FAOSTAT_DOMAINS` selects which domains are indexed; everything else in the catalog shows in `faostat_list_domains` with `indexed: false` until added and re-synced. On HTTP transport, set `FAOSTAT_REFRESH_CRON` to refresh in-process on a schedule; on stdio, run `mirror:refresh` out-of-band. The read tools return `index_not_ready` until the first sync completes.
@@ -240,7 +240,7 @@ Build locally with `docker build -t faostat-mcp-server .`. For stdio from an MCP
 
 ```sh
 docker exec <container> bun run mirror:init      # one-time bootstrap
-docker exec <container> bun run mirror:verify    # sync status + sample reads
+docker exec <container> bun run mirror:verify    # sync status, row counts, checkpoints, and dimension population
 docker exec <container> bun run mirror:refresh   # re-sync updated domains; build missing planner statistics
 ```
 
