@@ -378,7 +378,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run start:http` | Production mode (HTTP) |
 | `bun run mirror:init` | One-time bootstrap — download and index the `FAOSTAT_DOMAINS` set into the local mirror. Idempotent, resumable per domain. Required before the data tools answer queries. |
 | `bun run mirror:refresh` | Re-sync domains whose upstream `DateUpdate` has advanced (skips unchanged), and build query-planner statistics (`ANALYZE`) for any domain that has none, unchanged ones included. Run out-of-band on stdio; HTTP transport schedules it via `FAOSTAT_REFRESH_CRON`. |
-| `bun run mirror:verify` | Report per-domain sync status, local row counts, and sample reads against the mirror. |
+| `bun run mirror:verify` | Report per-domain sync status, local row counts, checkpoints, and shared dimension population. |
 | `bun run lint:mcp` | Validate MCP tool definitions against the spec (format-parity, schema shape, naming). Rule catalog: `api-linter` skill. |
 | `bun run lint:packaging` | Packaging surface checks — registry/bundle env parity, npm launch shape, bundle exclusions, plugin manifests, and published `skills/` (run by devcheck). |
 | `bun run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/*.md` |
