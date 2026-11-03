@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-11-03 · ⚠️ Breaking
+
+Preserve FAOSTAT observation identities and discover item-specific metrics and units.
+
 ## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-10-28
 
 Publish a FAOSTAT analysis guide over MCP and update framework, canvas, and bundle support.
