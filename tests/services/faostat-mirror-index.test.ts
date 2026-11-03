@@ -398,9 +398,17 @@ describe('FaostatMirror query-planner statistics (#3, #24)', () => {
     expect(rows.length).toBeGreaterThan(0);
     // The composite index whose selection the planner gets wrong without stats.
     expect(rows.map((r) => r.idx)).toContain(`${TABLE}_item_code_element_code_year_idx`);
-    // Every stat string opens with the table's row count — the cardinality the
-    // optimizer lacked (60 countries + 4 aggregates, 2 years each).
-    for (const row of rows) expect(row.stat.split(' ')[0]).toBe('128');
+    // Full indexes cover 128 rows. Nullable identity/source partial indexes cover
+    // none in this numeric, source-less fixture (Node records their zero stats).
+    const emptyIndexes = new Set([
+      `${TABLE}_item_code_text_idx`,
+      `${TABLE}_item_code_text_element_code_year_idx`,
+      `${TABLE}_source_code_idx`,
+    ]);
+    for (const row of rows)
+      expect(row.stat.split(' ')[0]).toBe(
+        row.idx !== null && emptyIndexes.has(row.idx) ? '0' : '128',
+      );
   });
 
   it('upgrades an existing analyzed mirror in the background without re-sync (#34)', async () => {

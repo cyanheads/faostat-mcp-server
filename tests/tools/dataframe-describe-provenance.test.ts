@@ -231,6 +231,11 @@ describe('faostat_dataframe_describe provenance parity', () => {
       'unit',
       'value',
       'flag',
+      'item_code_text',
+      'period',
+      'value_qualifier',
+      'source_code',
+      'source',
     ]);
 
     // Cross-check the whole schema against the engine itself: every reported type

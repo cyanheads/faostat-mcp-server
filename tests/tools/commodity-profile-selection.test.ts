@@ -278,7 +278,9 @@ describe('single-item selection (#41)', () => {
         const samples: number[] = [];
         for (let size = 5000; size <= 320000; size *= 2) {
           const query = shape(size);
-          await store.upsertItems([{ item_code: 999, item: query, cpc_code: null }]);
+          await store.upsertItems([
+            { item_code: 999, item_code_text: null, item: query, cpc_code: null },
+          ]);
           const start = process.threadCpuUsage();
           const resolved = await store.resolve('item', {
             query,

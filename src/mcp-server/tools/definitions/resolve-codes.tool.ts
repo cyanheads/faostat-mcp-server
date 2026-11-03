@@ -1,6 +1,6 @@
 /**
  * @fileoverview `faostat_resolve_codes` — resolves human terms to the opaque
- * integer codes a query needs (areas, items, elements). FAOSTAT is unqueryable
+ * codes a query needs (areas, items, elements). FAOSTAT is unqueryable
  * without code resolution: "wheat" → item 15, "production" → element 5510. Flags
  * each area as an individual country or an aggregate region so an agent doesn't
  * sum a region with its members. Backed by FTS5 over the bundled dimension code
@@ -18,7 +18,7 @@ const MAX_MATCHES = 200;
 export const resolveCodesTool = tool('faostat_resolve_codes', {
   title: 'faostat-mcp-server: resolve codes',
   description:
-    'Resolve human terms to the opaque integer codes faostat_query_observations needs, within a dimension: areas (countries/regions), items (commodities), or elements (metrics like production, yield, import quantity). Pass `query` for fuzzy full-text matching ("maize" → item 56), `name_contains` for a substring filter, or `code` for an exact-code lookup; omit all three to list the whole dimension. Item and element results are scoped to the requested domain — only codes present in that domain\'s cube are returned, so a resolved code is always queryable there (areas are shared across domains). Page large listings with `offset` + `limit`: when the response reports `truncated`, pass the returned `nextOffset` to fetch the next page. Every area match is flagged `country` or `aggregate` — aggregates (World, continents, economic groupings — codes ≥ 5000 plus a few curated sub-threshold roll-ups such as China=351, which sums mainland + Taiwan + Hong Kong + Macao) double-count if summed with their member countries, so resolve before querying and exclude aggregates unless you want the regional roll-up.',
+    'Resolve labels to the numeric codes or exact alphanumeric item identities faostat_query_observations needs: areas (countries/regions), items (commodities), and elements (metrics). Use query for full-text matching, name_contains for substring matching, code or code_text for exact identity, or omit them to list. Item and element matches occur in the selected domain; areas use shared vocabulary. For elements, optionally pass item_codes or item_codes_text to discover metrics and distinct units observed for those items; this does not establish area/year/source coverage. Empty item selectors match nothing. Page with offset and limit using nextOffset when truncated. Areas carry country/aggregate classification. Verified domain-specific item groups carry aggregate; null means unclassified, not safe-to-sum. Item groups can overlap their members even with matching units. Area aggregates include codes ≥ 5000 and curated roll-ups such as China=351; exclude overlapping regional and country rows when summing.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
 
   enrichment: {
@@ -45,6 +45,19 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
 
   errors: [
     {
+      reason: 'invalid_item_scope',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'Item selectors are combined or supplied outside element resolution.',
+      recovery:
+        'Use either item_codes or item_codes_text with dimension element; omit both for domain-wide elements.',
+    },
+    {
+      reason: 'invalid_text_selector',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'code_text is supplied with code or outside the item dimension.',
+      recovery: 'Use code_text alone for an alphanumeric item, or use code for numeric identities.',
+    },
+    {
       reason: 'unknown_domain',
       code: JsonRpcErrorCode.InvalidParams,
       when: 'The domain code is not a selected (indexed) FAOSTAT domain.',
@@ -53,10 +66,9 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
     {
       reason: 'index_not_ready',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The dimension tables are not yet populated (mirror has never completed a sync).',
+      when: 'The shared dimension tables are empty, or the selected item/element domain requires an initial sync or an ingest upgrade.',
       retryable: true,
-      recovery:
-        'Wait for the initial sync to finish or run the mirror init script, then retry shortly.',
+      recovery: 'Wait for sync to finish, or run mirror:init or mirror:refresh, then retry.',
     },
     // Raised by the mirror read pool when the call's ceiling fires.
     {
@@ -66,7 +78,7 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       retryable: true,
       when: "The item or element lookup's mirror read — time queued behind other calls' reads plus execution — ran past the 45-second per-call ceiling.",
       recovery:
-        'Retry in a few seconds — the lookup itself is fast; it waited behind slower reads from other calls.',
+        'For element lookup, pass item_codes or item_codes_text to narrow unit discovery, or use an exact code; retry after other reads finish.',
     },
   ],
 
@@ -99,6 +111,30 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       .int()
       .optional()
       .describe('Exact code lookup. Takes precedence over `query`/`name_contains` when provided.'),
+    code_text: z
+      .string()
+      .regex(/^\d+[A-Za-z][A-Za-z0-9]*$/)
+      .optional()
+      .describe(
+        'Exact alphanumeric item code. Only for dimension item; mutually exclusive with code. Numeric identities use code.',
+      ),
+    item_codes: z
+      .array(z.number().int())
+      .optional()
+      .describe(
+        'For element resolution only: restrict elements and units to these items. Empty matches nothing; omit for domain-wide elements. Mutually exclusive with item_codes_text.',
+      ),
+    item_codes_text: z
+      .array(
+        z
+          .string()
+          .regex(/^\d+[A-Za-z][A-Za-z0-9]*$/)
+          .describe('Exact alphanumeric item identity.'),
+      )
+      .optional()
+      .describe(
+        'For element resolution only: restrict elements and units to these exact text items. Empty matches nothing; mutually exclusive with item_codes.',
+      ),
     limit: z
       .number()
       .int()
@@ -125,13 +161,28 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
           .object({
             code: z
               .number()
-              .describe('The opaque integer code to pass into faostat_query_observations.'),
+              .nullable()
+              .describe(
+                'Numeric code for faostat_query_observations; null for alphanumeric items carried by code_text.',
+              ),
+            code_text: z
+              .string()
+              .nullable()
+              .describe(
+                'Exact alphanumeric item identity for item_codes_text; null for numeric codes.',
+              ),
             name: z.string().describe('Human-readable label.'),
             kind: z
               .enum(['country', 'aggregate'])
               .nullable()
               .describe(
-                'For areas: "country" (individual nation) or "aggregate" (region/grouping; excluded from sums by default). Null for items/elements.',
+                'For areas: country or aggregate region. For items: aggregate only for verified domain-specific groups; null means unclassified, never safe-to-sum. Null for elements.',
+              ),
+            units: z
+              .array(z.string().describe('Observed unit label.'))
+              .optional()
+              .describe(
+                'Element matches only: distinct non-null units observed in the selected domain and item scope. Empty means no specified units.',
               ),
             cpc_code: z
               .string()
@@ -144,16 +195,39 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
   }),
 
   async handler(input, ctx) {
+    if (
+      (input.item_codes !== undefined || input.item_codes_text !== undefined) &&
+      (input.dimension !== 'element' ||
+        (input.item_codes !== undefined && input.item_codes_text !== undefined))
+    )
+      throw ctx.fail(
+        'invalid_item_scope',
+        'Item selectors require dimension element and are mutually exclusive.',
+      );
+    if (input.code_text !== undefined && (input.code !== undefined || input.dimension !== 'item'))
+      throw ctx.fail(
+        'invalid_text_selector',
+        'code_text requires dimension item and must not be combined with code.',
+      );
     const mirror = getFaostatMirror();
     if (!mirror.isSelected(input.domain)) {
       throw ctx.fail('unknown_domain', `Domain "${input.domain}" is not in the indexed set.`);
     }
-    if (!(await mirror.dimensions.isPopulated())) {
-      throw ctx.fail('index_not_ready', 'FAOSTAT dimension tables are not yet populated.');
+    if (
+      (input.dimension !== 'area' && !(await mirror.ready(input.domain))) ||
+      !(await mirror.dimensions.isPopulated())
+    ) {
+      throw ctx.fail(
+        'index_not_ready',
+        `FAOSTAT shared dimensions or the selected ${input.domain.toUpperCase()} domain require a completed sync before resolution.`,
+      );
     }
 
     const { matches, total } = await mirror.resolve(input.domain, input.dimension, {
       ...(input.code !== undefined ? { code: input.code } : {}),
+      ...(input.code_text !== undefined ? { codeText: input.code_text } : {}),
+      ...(input.item_codes !== undefined ? { itemCodes: input.item_codes } : {}),
+      ...(input.item_codes_text !== undefined ? { itemCodesText: input.item_codes_text } : {}),
       ...(input.query ? { query: input.query } : {}),
       ...(input.name_contains ? { nameContains: input.name_contains } : {}),
       limit: input.limit,
@@ -172,11 +246,13 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       const criterion =
         input.code !== undefined
           ? `code ${input.code}`
-          : input.query
-            ? `query "${input.query}"`
-            : input.name_contains
-              ? `name containing "${input.name_contains}"`
-              : 'the listing';
+          : input.code_text !== undefined
+            ? `code_text "${input.code_text}"`
+            : input.query
+              ? `query "${input.query}"`
+              : input.name_contains
+                ? `name containing "${input.name_contains}"`
+                : 'the listing';
       const domainUpper = input.domain.toUpperCase();
       ctx.enrich.notice(
         total > 0
@@ -194,9 +270,11 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       dimension: input.dimension,
       matches: matches.map((m) => ({
         code: m.code,
+        code_text: m.code_text,
         name: m.name,
         kind: m.kind,
         ...(m.cpc_code !== undefined ? { cpc_code: m.cpc_code } : {}),
+        ...(m.units !== undefined ? { units: m.units } : {}),
       })),
     };
   },
@@ -213,7 +291,12 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
     for (const m of result.matches) {
       const kind = m.kind ? ` [${m.kind}]` : '';
       const cpc = m.cpc_code ? ` (CPC ${m.cpc_code})` : '';
-      lines.push(`- **${m.code}** — ${m.name}${kind}${cpc}`);
+      const units =
+        m.units !== undefined
+          ? ` (units: ${m.units.length ? m.units.join(', ') : 'unspecified'})`
+          : '';
+      const code = [m.code, m.code_text].filter((value) => value !== null).join(' / ');
+      lines.push(`- **${code}** — ${m.name}${kind}${cpc}${units}`);
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

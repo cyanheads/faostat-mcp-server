@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS areas (
   kind      TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS items (
-  item_code INTEGER PRIMARY KEY NOT NULL,
+  id INTEGER PRIMARY KEY,
+  item_code INTEGER UNIQUE,
+  item_code_text TEXT UNIQUE,
   cpc_code  TEXT,
   item      TEXT NOT NULL
 );
@@ -52,7 +54,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS areas_fts USING fts5(
   area, content='areas', content_rowid='area_code', tokenize='${FTS_TOKENIZER}'
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
-  item, content='items', content_rowid='item_code', tokenize='${FTS_TOKENIZER}'
+  item, content='items', content_rowid='id', tokenize='${FTS_TOKENIZER}'
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS elements_fts USING fts5(
   element, content='elements', content_rowid='element_code', tokenize='${FTS_TOKENIZER}'
@@ -112,8 +114,26 @@ export class DimensionsStore {
 
   private async open(): Promise<SqliteHandle> {
     if (!this.handle) {
-      this.handle = await openSqliteHandle(join(this.dir, DIMENSIONS_DB_FILE));
-      this.handle.exec(SCHEMA_SQL);
+      const handle = await openSqliteHandle(join(this.dir, DIMENSIONS_DB_FILE));
+      try {
+        const oldItems = handle.prepare<{ name: string }>('PRAGMA table_info(items)').all();
+        if (oldItems.length && !oldItems.some((c) => c.name === 'id')) {
+          handle.transaction(() => {
+            handle.exec(`DROP TABLE IF EXISTS items_fts;
+            ALTER TABLE items RENAME TO items_legacy;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, item_code INTEGER UNIQUE, item_code_text TEXT UNIQUE, cpc_code TEXT, item TEXT NOT NULL);
+            INSERT INTO items (id, item_code, cpc_code, item) SELECT item_code, item_code, cpc_code, item FROM items_legacy;
+            DROP TABLE items_legacy;`);
+            handle.exec(SCHEMA_SQL);
+            handle.exec("INSERT INTO items_fts(items_fts) VALUES ('rebuild')");
+          });
+        }
+        handle.exec(SCHEMA_SQL);
+        this.handle = handle;
+      } catch (error) {
+        handle.close();
+        throw error;
+      }
     }
     return this.handle;
   }
@@ -148,8 +168,8 @@ export class DimensionsStore {
     const h = await this.open();
     h.transaction(() => {
       const upsert = h.prepare(
-        `INSERT INTO items (item_code, cpc_code, item) VALUES (?, ?, ?)
-         ON CONFLICT(item_code) DO UPDATE SET cpc_code=excluded.cpc_code, item=excluded.item`,
+        `INSERT INTO items (item_code, item_code_text, cpc_code, item) VALUES (?, ?, ?, ?)
+         ON CONFLICT DO UPDATE SET cpc_code=excluded.cpc_code, item=excluded.item`,
       );
       const ftsDel = h.prepare(
         `INSERT INTO items_fts(items_fts, rowid, item) VALUES('delete', ?, ?)`,
@@ -157,11 +177,17 @@ export class DimensionsStore {
       const ftsIns = h.prepare(`INSERT INTO items_fts(rowid, item) VALUES (?, ?)`);
       for (const r of records) {
         const existing = h
-          .prepare<{ item: string }>(`SELECT item FROM items WHERE item_code = ?`)
-          .get(r.item_code);
-        if (existing) ftsDel.run(r.item_code, existing.item);
-        upsert.run(r.item_code, r.cpc_code, r.item);
-        ftsIns.run(r.item_code, r.item);
+          .prepare<{ id: number; item: string }>(
+            `SELECT id, item FROM items WHERE item_code = ? OR item_code_text = ?`,
+          )
+          .get(r.item_code, r.item_code_text);
+        if (existing) ftsDel.run(existing.id, existing.item);
+        upsert.run(r.item_code, r.item_code_text, r.cpc_code, r.item);
+        const inserted = h
+          .prepare<{ id: number }>('SELECT id FROM items WHERE item_code = ? OR item_code_text = ?')
+          .get(r.item_code, r.item_code_text);
+        if (!inserted) throw new Error('Item upsert did not persist its exact identity.');
+        ftsIns.run(inserted.id, r.item);
       }
     });
   }
@@ -249,17 +275,20 @@ export class DimensionsStore {
     dimension: DimensionKind,
     opts: {
       code?: number;
+      codeText?: string;
       query?: string;
       /** Prefer normalized exact labels across the complete scoped vocabulary. */
       preferExact?: boolean;
       nameContains?: string;
       limit: number;
       offset?: number;
-      domainCodes?: number[];
+      domainCodes?: (number | string)[];
     },
   ): Promise<{ matches: ResolvedCode[]; total: number }> {
     const h = await this.open();
     const cfg = DIMENSION_CONFIG[dimension];
+    const codeColumn =
+      dimension === 'item' ? 'COALESCE(item_code, item_code_text)' : cfg.codeColumn;
     const offset = opts.offset ?? 0;
     const { domainCodes } = opts;
 
@@ -273,9 +302,10 @@ export class DimensionsStore {
     const domainParams = domainCodes ?? [];
 
     // Exact code lookup — single row, domain-scoped, never paged.
-    if (opts.code !== undefined) {
-      const inDomain = !domainCodes || domainCodes.includes(opts.code);
-      const row = inDomain ? this.selectByCode(h, dimension, opts.code) : undefined;
+    const exactCode = opts.codeText ?? opts.code;
+    if (exactCode !== undefined) {
+      const inDomain = !domainCodes || domainCodes.includes(exactCode);
+      const row = inDomain ? this.selectByCode(h, dimension, exactCode) : undefined;
       return { matches: row ? [row] : [], total: row ? 1 : 0 };
     }
 
@@ -284,11 +314,11 @@ export class DimensionsStore {
       const query = normalize(opts.query);
       const scope = domainCodes && new Set(domainCodes);
       const exact = h
-        .prepare<Record<string, unknown>>(`SELECT * FROM ${cfg.table} ORDER BY ${cfg.codeColumn}`)
+        .prepare<Record<string, unknown>>(`SELECT * FROM ${cfg.table} ORDER BY ${codeColumn}`)
         .all()
         .filter(
           (row) =>
-            (!scope || scope.has(Number(row[cfg.codeColumn]))) &&
+            (!scope || scope.has((row[cfg.codeColumn] ?? row.item_code_text) as number | string)) &&
             normalize(String(row[cfg.labelColumn])) === query,
         );
       if (exact.length > 0) {
@@ -319,13 +349,21 @@ export class DimensionsStore {
           `SELECT rowid FROM ${cfg.ftsTable} WHERE ${cfg.ftsTable} MATCH ? ORDER BY rank, rowid`,
         )
         .all(ftsMatch)
-        .map((r) => r.rowid)
-        .filter((id) => !scope || scope.has(id));
+        .map((r) =>
+          h
+            .prepare<Record<string, unknown>>(
+              `SELECT * FROM ${cfg.table} WHERE ${dimension === 'item' ? 'id' : cfg.codeColumn} = ?`,
+            )
+            .get(r.rowid),
+        )
+        .filter((r): r is Record<string, unknown> => r !== undefined)
+        .filter(
+          (r) => !scope || scope.has((r[cfg.codeColumn] ?? r.item_code_text) as number | string),
+        );
       const total = ids.length;
       const matches = ids
         .slice(offset, offset + opts.limit)
-        .map((id) => this.selectByCode(h, dimension, id))
-        .filter((r): r is ResolvedCode => r !== undefined);
+        .map((row) => this.toResolved(dimension, row));
       return { matches, total };
     }
 
@@ -333,7 +371,7 @@ export class DimensionsStore {
     if (opts.nameContains) {
       const like = `%${opts.nameContains.replace(/[%_]/g, (c) => `\\${c}`)}%`;
       const filter = `${cfg.labelColumn} LIKE ? ESCAPE '\\'${
-        domainPlaceholders ? ` AND ${cfg.codeColumn} IN (${domainPlaceholders})` : ''
+        domainPlaceholders ? ` AND ${codeColumn} IN (${domainPlaceholders})` : ''
       }`;
       const total =
         h
@@ -341,23 +379,21 @@ export class DimensionsStore {
           .get(like, ...domainParams)?.n ?? 0;
       const rows = h
         .prepare<Record<string, unknown>>(
-          `SELECT * FROM ${cfg.table} WHERE ${filter} ORDER BY ${cfg.codeColumn} LIMIT ? OFFSET ?`,
+          `SELECT * FROM ${cfg.table} WHERE ${filter} ORDER BY ${codeColumn} LIMIT ? OFFSET ?`,
         )
         .all(like, ...domainParams, opts.limit, offset);
       return { matches: rows.map((r) => this.toResolved(dimension, r)), total };
     }
 
     // List all.
-    const whereSql = domainPlaceholders
-      ? ` WHERE ${cfg.codeColumn} IN (${domainPlaceholders})`
-      : '';
+    const whereSql = domainPlaceholders ? ` WHERE ${codeColumn} IN (${domainPlaceholders})` : '';
     const total =
       h
         .prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM ${cfg.table}${whereSql}`)
         .get(...domainParams)?.n ?? 0;
     const rows = h
       .prepare<Record<string, unknown>>(
-        `SELECT * FROM ${cfg.table}${whereSql} ORDER BY ${cfg.codeColumn} LIMIT ? OFFSET ?`,
+        `SELECT * FROM ${cfg.table}${whereSql} ORDER BY ${codeColumn} LIMIT ? OFFSET ?`,
       )
       .all(...domainParams, opts.limit, offset);
     return { matches: rows.map((r) => this.toResolved(dimension, r)), total };
@@ -366,11 +402,13 @@ export class DimensionsStore {
   private selectByCode(
     h: SqliteHandle,
     dimension: DimensionKind,
-    code: number,
+    code: number | string,
   ): ResolvedCode | undefined {
     const cfg = DIMENSION_CONFIG[dimension];
     const row = h
-      .prepare<Record<string, unknown>>(`SELECT * FROM ${cfg.table} WHERE ${cfg.codeColumn} = ?`)
+      .prepare<Record<string, unknown>>(
+        `SELECT * FROM ${cfg.table} WHERE ${dimension === 'item' && typeof code === 'string' ? 'item_code_text' : cfg.codeColumn} = ?`,
+      )
       .get(code);
     return row ? this.toResolved(dimension, row) : undefined;
   }
@@ -380,6 +418,7 @@ export class DimensionsStore {
       const code = Number(row.area_code);
       return {
         code,
+        code_text: null,
         name: String(row.area),
         // Derive kind at read time from the code, not the stored `kind` column:
         // mirrors ingested before the deny-set fix persisted the old classification,
@@ -390,13 +429,19 @@ export class DimensionsStore {
     if (dimension === 'item') {
       const cpc = row.cpc_code == null ? undefined : String(row.cpc_code);
       return {
-        code: Number(row.item_code),
+        code: row.item_code === null ? null : Number(row.item_code),
+        code_text: row.item_code_text == null ? null : String(row.item_code_text),
         name: String(row.item),
         kind: null,
         ...(cpc !== undefined ? { cpc_code: cpc } : {}),
       };
     }
-    return { code: Number(row.element_code), name: String(row.element), kind: null };
+    return {
+      code: Number(row.element_code),
+      code_text: null,
+      name: String(row.element),
+      kind: null,
+    };
   }
 
   close(): Promise<void> {

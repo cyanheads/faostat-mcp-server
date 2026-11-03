@@ -10,7 +10,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { internalError, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { markdownCell } from '@/mcp-server/tools/markdown-cell.js';
 import {
   canvasEnabled,
@@ -36,14 +36,35 @@ function toObservation({
   value,
   unit,
   flag,
+  item_code_text,
+  period,
+  value_qualifier,
+  source_code,
+  source,
 }: ObservationRow) {
-  return { area_code, area, item_code, item, element_code, element, year, value, unit, flag };
+  return {
+    area_code,
+    area,
+    item_code,
+    item,
+    element_code,
+    element,
+    year,
+    value,
+    unit,
+    flag,
+    item_code_text,
+    period,
+    value_qualifier,
+    source_code,
+    source,
+  };
 }
 
 export const queryObservationsTool = tool('faostat_query_observations', {
   title: 'faostat-mcp-server: query observations',
   description:
-    "Query a FAOSTAT domain's data cube by area(s), item(s), element(s), and year range, returning observations (area, item, element, year, value, unit, and the data-quality flag). Resolve codes first with faostat_resolve_codes — the cube is unqueryable without them. Aggregate regions (World, continents, economic groupings) are EXCLUDED by default so a naive SUM does not double-count a region with its member countries; set include_aggregates=true to get the regional roll-ups, or pass explicit area_codes to query exactly what you name. Small result sets return inline; large ones spill to a DataCanvas table (returned canvas_id + table_name) — call faostat_dataframe_describe for its columns, then faostat_dataframe_query for GROUP BY / ranking / time-series analysis. Every row carries its flag — commonly A=Official, B=time-series break, E=Estimated, I=Imputed, M=Missing (value cannot exist), T=Unofficial, X=from an international organization, plus others FAOSTAT defines per domain — so honor it, treat any unrecognized flag as informational, and never assume an estimated, imputed, or unrecognized value is official.",
+    "Query a FAOSTAT domain's data cube by area(s), item(s), element(s), sources, and year range, returning values with units and data-quality flags. Resolve numeric codes or exact alphanumeric item identities with faostat_resolve_codes; element resolution accepts item selectors and returns units. Empty queries with explicit items and elements list available elements for those items across the domain, without establishing area/year/source coverage. Aggregate regions are excluded by default; include_aggregates=true returns roll-ups, and explicit area_codes are honored verbatim. Item groups can overlap their members even with matching units; they remain included, and kind=null does not establish safe-to-sum. Keep source methodologies separate. Small results return inline; large ones spill to a DataCanvas table (canvas_id + table_name); call faostat_dataframe_describe for columns, then faostat_dataframe_query for analysis. Honor every row's flag: commonly A=Official, B=time-series break, E=Estimated, I=Imputed, M=Missing, T=Unofficial, X=international organization; unrecognized flags never establish official status.",
   annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: false },
 
   enrichment: {
@@ -60,6 +81,12 @@ export const queryObservationsTool = tool('faostat_query_observations', {
 
   errors: [
     {
+      reason: 'conflicting_item_selectors',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'Both numeric item_codes and exact item_codes_text are supplied.',
+      recovery: 'Supply either item_codes or item_codes_text, omitting the other selector.',
+    },
+    {
       reason: 'domain_not_indexed',
       code: JsonRpcErrorCode.NotFound,
       when: 'The domain is not in the local mirror selection (FAOSTAT_DOMAINS) — whether a valid FAOSTAT code or not.',
@@ -69,10 +96,9 @@ export const queryObservationsTool = tool('faostat_query_observations', {
     {
       reason: 'index_not_ready',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The domain mirror is cold — its initial sync has never completed.',
+      when: 'The domain mirror requires an initial sync or an ingest upgrade.',
       retryable: true,
-      recovery:
-        'Wait for the initial sync to finish, or run the mirror init script, then retry shortly.',
+      recovery: 'Wait for sync to finish, or run mirror:init or mirror:refresh, then retry.',
     },
     {
       reason: 'canvas_disabled',
@@ -128,6 +154,23 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       .array(z.number().int())
       .optional()
       .describe('Element codes from faostat_resolve_codes (e.g. 5510 Production).'),
+    item_codes_text: z
+      .array(
+        z
+          .string()
+          .regex(/^\d+[A-Za-z][A-Za-z0-9]*$/)
+          .describe('Exact alphanumeric item code.'),
+      )
+      .optional()
+      .describe(
+        'Exact alphanumeric item identities from resolver code_text; mutually exclusive with item_codes. Numeric codes use item_codes.',
+      ),
+    source_codes: z
+      .array(z.number().int())
+      .optional()
+      .describe(
+        'Exact source codes, such as 3050 or 3051 in GLE. Omit to return every methodology; choose or group sources before summing.',
+      ),
     year_start: z.number().int().optional().describe('Inclusive start year (e.g. 2000).'),
     year_end: z.number().int().optional().describe('Inclusive end year (e.g. 2022).'),
     include_aggregates: z
@@ -152,13 +195,53 @@ export const queryObservationsTool = tool('faostat_query_observations', {
 
   output: z.object({
     domain: z.string().describe('The domain code echoed back.'),
+    available_elements: z
+      .array(
+        z
+          .object({
+            code: z.number().describe('Element code available for the selected items.'),
+            name: z.string().describe('Element label.'),
+            units: z
+              .array(z.string().describe('Observed unit.'))
+              .describe('Distinct specified units for these items in this domain.'),
+          })
+          .describe('An element observed for the selected items.'),
+      )
+      .optional()
+      .describe(
+        'On an empty query with explicit items and elements: all elements available for those items across the domain. Does not establish coverage for requested area/year/source filters.',
+      ),
     observations: z
       .array(
         z
           .object({
             area_code: z.number().describe('Area code.'),
             area: z.string().describe('Area name.'),
-            item_code: z.number().describe('Item code.'),
+            item_code: z
+              .number()
+              .nullable()
+              .describe('Numeric item code; null for alphanumeric identities.'),
+            item_code_text: z
+              .string()
+              .nullable()
+              .describe('Exact alphanumeric item code; null for numeric identities.'),
+            period: z
+              .string()
+              .nullable()
+              .describe(
+                'Original multi-year period label; null for annual rows. Year is the integer midpoint.',
+              ),
+            value_qualifier: z
+              .string()
+              .nullable()
+              .describe(
+                'Bound operator such as <; value is a bound rather than an exact observation when present.',
+              ),
+            source_code: z
+              .number()
+              .nullable()
+              .describe('Source methodology code; null when the domain has none.'),
+            source: z.string().nullable().describe('Source methodology label; null when absent.'),
             item: z.string().describe('Item name.'),
             element_code: z.number().describe('Element code.'),
             element: z.string().describe('Element (metric) name.'),
@@ -202,6 +285,11 @@ export const queryObservationsTool = tool('faostat_query_observations', {
   }),
 
   async handler(input, ctx) {
+    if (input.item_codes !== undefined && input.item_codes_text !== undefined)
+      throw ctx.fail(
+        'conflicting_item_selectors',
+        'item_codes and item_codes_text are mutually exclusive.',
+      );
     const mirror = getFaostatMirror();
     const code = input.domain.toUpperCase();
     if (!mirror.isSelected(code)) {
@@ -213,7 +301,10 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       );
     }
     if (!(await mirror.ready(code))) {
-      throw ctx.fail('index_not_ready', `The ${code} mirror has not completed its initial sync.`);
+      throw ctx.fail(
+        'index_not_ready',
+        `The ${code} mirror requires a completed sync before it can be queried.`,
+      );
     }
 
     // A reversed year range is a contradiction the mirror would silently treat as
@@ -234,18 +325,13 @@ export const queryObservationsTool = tool('faostat_query_observations', {
     // would otherwise drop an empty array and broaden the query to the entire
     // dimension, so short-circuit here — before any mirror call — the moment a code
     // array is defined-and-empty. An omitted array still means "unfiltered".
-    const emptyDimension =
-      input.area_codes?.length === 0
-        ? 'area_codes'
-        : input.item_codes?.length === 0
-          ? 'item_codes'
-          : input.element_codes?.length === 0
-            ? 'element_codes'
-            : undefined;
+    const emptyDimension = (
+      ['area_codes', 'item_codes', 'element_codes', 'item_codes_text', 'source_codes'] as const
+    ).find((dimension) => input[dimension]?.length === 0);
     if (emptyDimension) {
       ctx.enrich.total(0);
       ctx.enrich.notice(
-        `${emptyDimension} was an empty array — an explicit empty selection matches nothing. Omit ${emptyDimension} to query every code in that dimension, or pass codes from faostat_resolve_codes.`,
+        `${emptyDimension} was an empty array — an explicit empty selection matches nothing. Omit ${emptyDimension} to query every code in that dimension${emptyDimension === 'source_codes' ? ', or pass source codes carried by observations in this domain' : ', or pass codes from faostat_resolve_codes'}.`,
       );
       return { domain: code, observations: [], spilled: false, truncated: false };
     }
@@ -253,6 +339,8 @@ export const queryObservationsTool = tool('faostat_query_observations', {
     const filters = {
       ...(input.area_codes?.length ? { areaCodes: input.area_codes } : {}),
       ...(input.item_codes?.length ? { itemCodes: input.item_codes } : {}),
+      ...(input.item_codes_text?.length ? { itemCodesText: input.item_codes_text } : {}),
+      ...(input.source_codes?.length ? { sourceCodes: input.source_codes } : {}),
       ...(input.element_codes?.length ? { elementCodes: input.element_codes } : {}),
       ...(input.year_start !== undefined ? { yearStart: input.year_start } : {}),
       ...(input.year_end !== undefined ? { yearEnd: input.year_end } : {}),
@@ -273,11 +361,48 @@ export const queryObservationsTool = tool('faostat_query_observations', {
     );
 
     if (total === 0) {
+      let availableElements: { code: number; name: string; units: string[] }[] | undefined;
+      if (
+        (input.item_codes !== undefined || input.item_codes_text !== undefined) &&
+        input.element_codes !== undefined
+      ) {
+        availableElements = [];
+        let offset = 0;
+        let availableTotal: number;
+        do {
+          const page = await mirror.resolve(code, 'element', {
+            ...(input.item_codes !== undefined ? { itemCodes: input.item_codes } : {}),
+            ...(input.item_codes_text !== undefined
+              ? { itemCodesText: input.item_codes_text }
+              : {}),
+            limit: 200,
+            offset,
+            signal,
+          });
+          availableTotal = page.total;
+          availableElements.push(
+            ...page.matches.map((match) => {
+              if (match.code === null || match.units === undefined)
+                throw internalError(
+                  'Element resolution returned an invalid identity or omitted units.',
+                );
+              return { code: match.code, name: match.name, units: match.units };
+            }),
+          );
+          offset += page.matches.length;
+        } while (offset < availableTotal);
+      }
       ctx.enrich.total(0);
       ctx.enrich.notice(
         `No observations matched in ${code}. Widen the year range, relax filters, or re-check codes with faostat_resolve_codes${input.include_aggregates ? '' : ' (aggregates are excluded by default — set include_aggregates=true for regional roll-ups)'}.`,
       );
-      return { domain: code, observations: [], spilled: false, truncated: false };
+      return {
+        domain: code,
+        observations: [],
+        spilled: false,
+        truncated: false,
+        ...(availableElements !== undefined ? { available_elements: availableElements } : {}),
+      };
     }
 
     // Spill when the match set exceeds the inline budget AND canvas is on. An
@@ -306,6 +431,8 @@ export const queryObservationsTool = tool('faostat_query_observations', {
             domain: code,
             area_codes: input.area_codes,
             item_codes: input.item_codes,
+            item_codes_text: input.item_codes_text,
+            source_codes: input.source_codes,
             element_codes: input.element_codes,
             year_start: input.year_start,
             year_end: input.year_end,
@@ -396,15 +523,29 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       lines.push('_Returned inline — no canvas table was staged for this result._\n');
     }
     lines.push(`**${result.observations.length} observation(s)** in ${result.domain}\n`);
+    if (result.available_elements !== undefined) {
+      lines.push(
+        'Elements observed for the selected items across this domain; these do not establish requested area/year/source coverage:',
+      );
+      if (result.available_elements.length === 0)
+        lines.push('_No elements available for these items._');
+      for (const element of result.available_elements)
+        lines.push(
+          `- **${element.code}** — ${markdownCell(element.name)} (units: ${element.units.length ? element.units.map(markdownCell).join(', ') : 'unspecified'})`,
+        );
+    }
     if (result.observations.length === 0) {
       lines.push('_No observations._');
       return [{ type: 'text', text: lines.join('\n') }];
     }
-    lines.push('| Area | Item | Element | Year | Value | Unit | Flag |');
-    lines.push('| --- | --- | --- | --- | --- | --- | --- |');
+    lines.push('| Area | Item | Element | Year | Value | Unit | Flag | Period | Source |');
+    lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- |');
     for (const o of result.observations) {
+      const itemCode = [o.item_code, o.item_code_text]
+        .filter((value) => value !== null)
+        .join(' / ');
       lines.push(
-        `| ${markdownCell(o.area)} (${o.area_code}) | ${markdownCell(o.item)} (${o.item_code}) | ${markdownCell(o.element)} (${o.element_code}) | ${o.year} | ${o.value ?? ''} | ${markdownCell(o.unit)} | ${markdownCell(o.flag)} |`,
+        `| ${markdownCell(o.area)} (${o.area_code}) | ${markdownCell(o.item)} (${markdownCell(itemCode)}) | ${markdownCell(o.element)} (${o.element_code}) | ${o.year} | ${o.value_qualifier ?? ''}${o.value ?? ''} | ${markdownCell(o.unit)} | ${markdownCell(o.flag)} | ${markdownCell(o.period)} | ${markdownCell(o.source)}${o.source_code === null ? '' : ` (${o.source_code})`} |`,
       );
     }
     return [{ type: 'text', text: lines.join('\n') }];

@@ -50,6 +50,11 @@ const OBSERVATION_COLUMNS = [
   ['unit', 'VARCHAR'],
   ['value', 'DOUBLE'],
   ['flag', 'VARCHAR'],
+  ['item_code_text', 'VARCHAR'],
+  ['period', 'VARCHAR'],
+  ['value_qualifier', 'VARCHAR'],
+  ['source_code', 'BIGINT'],
+  ['source', 'VARCHAR'],
 ];
 
 /**

@@ -73,6 +73,7 @@ describe('error-contract conformance', () => {
       expect(declaredReasons(queryObservationsTool.errors)).toEqual([
         'canvas_disabled',
         'canvas_not_found',
+        'conflicting_item_selectors',
         'domain_not_indexed',
         'index_not_ready',
         'invalid_year_range',
@@ -111,6 +112,8 @@ describe('error-contract conformance', () => {
     it('declares only reachable reasons (no dead no_match)', () => {
       expect(declaredReasons(resolveCodesTool.errors)).toEqual([
         'index_not_ready',
+        'invalid_item_scope',
+        'invalid_text_selector',
         'query_timeout',
         'unknown_domain',
       ]);

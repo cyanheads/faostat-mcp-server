@@ -72,7 +72,7 @@ export const STAGE_MAX_ROWS = 50_000;
 
 /**
  * Column schema of a table staged from `FaostatMirror.streamObservations` rows —
- * the ten columns that stream selects, in its order. Declared rather than inferred:
+ * the columns that stream selects, in its order. Declared rather than inferred:
  * the framework would type each column from the rows already buffered for the
  * inline preview, and `value` is the one column that window can mistype — whole
  * numbers infer BIGINT, an all-null window VARCHAR — after which every later row is
@@ -90,6 +90,11 @@ export const OBSERVATION_TABLE_SCHEMA: ColumnSchema[] = [
   { name: 'unit', type: 'VARCHAR' },
   { name: 'value', type: 'DOUBLE' },
   { name: 'flag', type: 'VARCHAR' },
+  { name: 'item_code_text', type: 'VARCHAR' },
+  { name: 'period', type: 'VARCHAR' },
+  { name: 'value_qualifier', type: 'VARCHAR' },
+  { name: 'source_code', type: 'BIGINT' },
+  { name: 'source', type: 'VARCHAR' },
 ];
 
 /**

@@ -59,34 +59,65 @@ export function dataRowToObservation(
     return i === undefined ? undefined : fields[i];
   };
   const areaCode = Number(get('Area Code'));
-  const itemCode = Number(get('Item Code'));
+  const itemRaw = get('Item Code');
+  const itemCode = Number.isFinite(Number(itemRaw)) ? Number(itemRaw) : null;
+  const itemCodeText =
+    itemCode === null && itemRaw !== undefined && /^\d+[A-Za-z][A-Za-z0-9]*$/.test(itemRaw)
+      ? itemRaw
+      : null;
   const elementCode = Number(get('Element Code'));
   // Prefer Year; fall back to Year Code (calendar-year domains duplicate them).
   const yearRaw = get('Year') ?? get('Year Code');
-  const year = Number(yearRaw);
+  const periodMatch = yearRaw?.match(/^(\d{4})-(\d{4})$/);
+  const period = periodMatch ? (yearRaw ?? null) : null;
+  const year = periodMatch
+    ? (Number(periodMatch[1]) + Number(periodMatch[2])) / 2
+    : Number(yearRaw);
+  if (
+    yearRaw?.includes('-') &&
+    (!periodMatch || Number(periodMatch[1]) > Number(periodMatch[2]) || !Number.isInteger(year))
+  ) {
+    throw new Error(
+      `Unsupported FAOSTAT period "${yearRaw}"; expected an ordered calendar-year range with an integer midpoint.`,
+    );
+  }
   if (
     !Number.isFinite(areaCode) ||
-    !Number.isFinite(itemCode) ||
+    (itemCode === null && itemCodeText === null) ||
     !Number.isFinite(elementCode) ||
     !Number.isFinite(year)
   ) {
     return null;
   }
   const valueRaw = get('Value');
-  const value = valueRaw !== undefined && valueRaw !== '' ? Number(valueRaw) : null;
+  const qualifier = valueRaw?.match(/^(<=|>=|<|>)/)?.[0] ?? null;
+  const value =
+    valueRaw !== undefined && valueRaw !== ''
+      ? Number(qualifier ? valueRaw.slice(qualifier.length) : valueRaw)
+      : null;
+  const sourceRaw = get('Source Code');
+  const sourceCode = sourceRaw ? Number(sourceRaw) : null;
+  if (sourceCode !== null && !Number.isSafeInteger(sourceCode))
+    throw new Error('Invalid FAOSTAT Source Code; expected an integer.');
+  const source = get('Source') || null;
   const note = get('Note');
   const unit = get('Unit');
   const flag = get('Flag');
   return {
-    id: `${areaCode}|${itemCode}|${elementCode}|${year}`,
+    id: `${areaCode}|${itemCode ?? `text:${itemCodeText}`}|${elementCode}|${period ?? year}${sourceCode === null ? '' : `|source:${sourceCode}`}`,
     area_code: areaCode,
     area_m49: stripApostrophe(get('Area Code (M49)')),
     area: get('Area') ?? '',
     item_code: itemCode,
+    item_code_text: itemCodeText,
     item: get('Item') ?? '',
     element_code: elementCode,
     element: get('Element') ?? '',
     year,
+    period,
+    source_code: sourceCode,
+    source,
+    value_qualifier: qualifier,
     unit: unit && unit.length > 0 ? unit : null,
     value: value !== null && Number.isFinite(value) ? value : null,
     flag: flag && flag.length > 0 ? flag : null,
@@ -130,10 +161,14 @@ export function parseItemCodes(text: string): ItemRecord[] {
   if (ci === undefined || ni === undefined) return records;
   for (let i = 1; i < lines.length; i++) {
     const f = parseCsvLine(lines[i]);
-    const code = Number(f[ci]);
-    if (!Number.isFinite(code)) continue;
+    const raw = f[ci];
+    const code = Number.isFinite(Number(raw)) ? Number(raw) : null;
+    const textCode =
+      code === null && raw !== undefined && /^\d+[A-Za-z][A-Za-z0-9]*$/.test(raw) ? raw : null;
+    if (code === null && textCode === null) continue;
     records.push({
       item_code: code,
+      item_code_text: textCode,
       cpc_code: cpci === undefined ? null : stripApostrophe(f[cpci]),
       item: f[ni] ?? '',
     });

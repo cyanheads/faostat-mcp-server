@@ -89,13 +89,18 @@ export interface ObservationRow {
   element: string;
   element_code: number;
   flag: string | null;
-  /** Synthetic primary key: `area|item|element|year`. */
+  /** Composite exact identity; ordinary numeric annual source-less rows keep `area|item|element|year`. */
   id: string;
   item: string;
-  item_code: number;
+  item_code: number | null;
+  item_code_text: string | null;
   note: string | null;
+  period: string | null;
+  source: string | null;
+  source_code: number | null;
   unit: string | null;
   value: number | null;
+  value_qualifier: string | null;
   year: number;
 }
 
@@ -152,7 +157,8 @@ export interface ItemRecord {
   /** CPC crosswalk code with the leading apostrophe stripped, or null. */
   cpc_code: string | null;
   item: string;
-  item_code: number;
+  item_code: number | null;
+  item_code_text: string | null;
 }
 
 /** One element code record in the shared `elements` dimension table. */
@@ -169,12 +175,15 @@ export interface FlagRecord {
 
 /** The dimension a resolve query targets, plus the SQLite column it filters. */
 export interface ResolvedCode {
-  /** The opaque integer code. */
-  code: number;
+  /** The numeric upstream code; null for alphanumeric items carried by code_text. */
+  code: number | null;
+  code_text: string | null;
   /** CPC crosswalk code for items; absent otherwise. */
   cpc_code?: string;
-  /** Country vs aggregate for areas; null for items/elements. */
+  /** Country/aggregate for areas; verified aggregate groups for items; otherwise unknown. */
   kind: AreaKind | null;
   /** The human-readable label. */
   name: string;
+  /** Distinct non-null units for an element in the selected domain/item scope. */
+  units?: string[];
 }

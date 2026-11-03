@@ -622,6 +622,10 @@ describe('FaostatMirror reads on the pool', () => {
       'domainDimensionCodes (via resolve)',
       (m, s) => m.resolve(FIXTURE_DOMAIN, 'item', { limit: 10, signal: s }),
     ],
+    [
+      'element units (via resolve)',
+      (m, s) => m.resolve(FIXTURE_DOMAIN, 'element', { itemCodes: [15], limit: 10, signal: s }),
+    ],
   ];
 
   it.each(readPaths)(

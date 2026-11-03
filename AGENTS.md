@@ -35,7 +35,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 - **Use `ctx.state`** for tenant-scoped storage. Never access persistence directly. The canvas staging layer resolves the session canvas from `ctx.state`.
 - **Secrets in env vars only** — never hardcoded. (This server is keyless; there are no secrets to manage.)
 - **Carry the data-quality flag through.** Every FAOSTAT observation has a flag (`A`/`E`/`I`/`B`/`X`). Never drop it from output or `format()` — it's load-bearing for downstream rigor.
-- **Aggregate exclusion is the safe default.** `faostat_query_observations` excludes area codes ≥ 5000 (World/continents/groupings) unless `include_aggregates: true`, so a naive `SUM` doesn't double-count. Preserve this.
+- **Area aggregate exclusion is the default.** `faostat_query_observations` excludes area codes ≥ 5000 and curated rollups unless `include_aggregates: true` or explicit `area_codes` are supplied. This prevents area overlap; item groups, units, periods, and source estimates still require separate analytical choices.
 - **Close the loop on issues.** When implementing work tracked by a GitHub issue, comment on the issue with what landed and close it. Do both — a comment without a close leaves stale issues open; a close without a comment leaves no record of what shipped. The comment is for future readers — state the concrete changes, not the conversation that produced them.
 
 ---
@@ -55,7 +55,7 @@ import { getFaostatMirror } from '@/services/faostat-mirror/index.js';
 
 export const resolveCodesTool = tool('faostat_resolve_codes', {
   title: 'faostat-mcp-server: resolve codes',
-  description: 'Resolve human terms to the opaque integer codes a query needs …',
+  description: 'Resolve human terms to the opaque codes a query needs …',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
 
   // enrichment fields reach BOTH client surfaces via ctx.enrich (provenance,
@@ -73,8 +73,8 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       when: 'The domain code is not a selected (indexed) FAOSTAT domain.',
       recovery: 'Call faostat_list_domains to see valid, indexed domain codes.' },
     { reason: 'index_not_ready', code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The dimension tables are not yet populated (mirror cold).', retryable: true,
-      recovery: 'Run the mirror init script or wait for the initial sync, then retry.' },
+      when: 'Shared dimensions are empty or the selected item/element domain needs a sync.', retryable: true,
+      recovery: 'Run mirror:init or mirror:refresh, or wait for sync, then retry.' },
   ],
 
   input: z.object({
@@ -88,6 +88,9 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
     const mirror = getFaostatMirror();
     if (!mirror.isSelected(input.domain)) {
       throw ctx.fail('unknown_domain', `Domain "${input.domain}" is not indexed.`);
+    }
+    if ((input.dimension !== 'area' && !(await mirror.ready(input.domain))) || !(await mirror.dimensions.isPopulated())) {
+      throw ctx.fail('index_not_ready', 'The selected vocabulary requires a completed sync.');
     }
     const { matches, total } = await mirror.resolve(input.domain, input.dimension, { /* … */ });
     ctx.enrich({ totalMatches: total, truncated: total > matches.length });
@@ -105,7 +108,7 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
 
 `faostat_query_observations` and `faostat_commodity_profile` inline a small preview and **spill** large result sets to a DuckDB-backed canvas table via the staging helpers in `src/services/canvas-staging.ts`. The returned `canvas_id` + `table_name` are then read through the mandatory `faostat_dataframe_describe` / `faostat_dataframe_query` pair — without that pair the spilled token is dead output. `faostat_dataframe_drop` removes one staged table ahead of its TTL; it is opt-in, so `src/index.ts` registers it through `dataframeDropRegistration()`, which wraps it in `disabledTool()` unless `FAOSTAT_DATAFRAME_DROP_ENABLED=true`, and the server `instructions` name it only when it is live. Guard with `canvasEnabled()` and surface `canvas_disabled` when staging is off.
 
-`schema` is required: pass `OBSERVATION_TABLE_SCHEMA` (the ten `streamObservations` columns) or `PROFILE_TABLE_SCHEMA` (those plus `domain`). The staged types are declared, never inferred from the preview rows — inference types `value` from whatever the preview window holds, and a whole-number window truncates every later fractional value.
+`schema` is required: pass `OBSERVATION_TABLE_SCHEMA` (the `streamObservations` columns, including item text codes, periods, value qualifiers, and sources) or `PROFILE_TABLE_SCHEMA` (those plus `domain`). The staged types are declared, never inferred from the preview rows — inference types `value` from whatever the preview window holds, and a whole-number window truncates every later fractional value.
 
 ```ts
 import {
@@ -455,7 +458,7 @@ import { canvasEnabled, stageObservations } from '@/services/canvas-staging.js';
 - [ ] If wrapping external API: normalization and `format()` preserve uncertainty; do not fabricate facts from missing upstream data
 - [ ] If wrapping external API: tests include at least one sparse payload case with omitted upstream fields
 - [ ] FAOSTAT observations: the data-quality `flag` is carried through `output` and `format()` — never dropped
-- [ ] `faostat_query_observations` keeps aggregate exclusion as the default (codes ≥ 5000 excluded unless `include_aggregates: true`)
+- [ ] `faostat_query_observations` keeps area aggregate exclusion as the default (threshold plus curated rollups; explicit area selections bypass it); item-group classification does not change query inclusion
 - [ ] Query-path tools tested against a built mirror (`bun run mirror:init`) — the read tools surface `index_not_ready` until the first sync completes
 - [ ] Registered in the `createApp()` `tools` array in `src/index.ts`
 - [ ] Tests use `createMockContext()` from `@cyanheads/mcp-ts-core/testing`

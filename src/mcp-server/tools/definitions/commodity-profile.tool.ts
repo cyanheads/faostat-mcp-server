@@ -340,7 +340,7 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
       signal,
     });
     const selected = resolved.matches[0];
-    if (!selected) {
+    if (!selected || selected.code === null) {
       throw ctx.fail(
         'no_match',
         `No QCL item matched ${input.item_code ?? `"${input.item_query}"`}.`,
@@ -515,7 +515,7 @@ export const commodityProfileTool = tool('faostat_commodity_profile', {
 
     return {
       item_query: itemQuery,
-      resolved_items: resolved.matches.map((m) => ({ code: m.code, name: m.name })),
+      resolved_items: [{ code: selected.code, name: selected.name }],
       top_producers: topProducers,
       top_exporters: exporters,
       top_importers: importers,

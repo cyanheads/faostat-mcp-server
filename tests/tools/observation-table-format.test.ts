@@ -36,7 +36,8 @@ type Observation = QueryResult['observations'][number];
 type ProfileResult = Parameters<NonNullable<typeof commodityProfileTool.format>>[0];
 type TrendPoint = ProfileResult['production_trend'][number];
 
-const OBSERVATION_HEADER = '| Area | Item | Element | Year | Value | Unit | Flag |';
+const OBSERVATION_HEADER =
+  '| Area | Item | Element | Year | Value | Unit | Flag | Period | Source |';
 const TREND_HEADER = '| Year | Value | Unit | Observations | Flags |';
 
 /** What a cell displays for `value`: the text itself, with CR/LF as their escape sequences. */
@@ -50,6 +51,11 @@ function observation(overrides: Partial<Observation>): Observation {
     area_code: 2,
     area: 'Afghanistan',
     item_code: 15,
+    item_code_text: null,
+    period: null,
+    value_qualifier: null,
+    source_code: null,
+    source: null,
     item: 'Wheat',
     element_code: 5510,
     element: 'Production',
@@ -105,14 +111,14 @@ describe('faostat_query_observations table rows (#27)', () => {
     ]);
     expect(tableLines(rendered, OBSERVATION_HEADER)).toEqual([
       OBSERVATION_HEADER,
-      '| --- | --- | --- | --- | --- | --- | --- |',
-      '| Afghanistan (2) | Wheat (15) | Production (5510) | 2020 | 5000 | t | A |',
-      "| Côte d'Ivoire (107) | Wheat (15) | Production (5510) | 2021 | 1.5 | t | E |",
-      '| Albania (3) | Wheat (15) | Production (5510) | 2020 |  |  |  |',
+      '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+      '| Afghanistan (2) | Wheat (15) | Production (5510) | 2020 | 5000 | t | A |  |  |',
+      "| Côte d'Ivoire (107) | Wheat (15) | Production (5510) | 2021 | 1.5 | t | E |  |  |",
+      '| Albania (3) | Wheat (15) | Production (5510) | 2020 |  |  |  |  |  |',
     ]);
   });
 
-  it('keeps every row at seven cells and displays each label as written', () => {
+  it('keeps every row at nine cells and displays each label as written', () => {
     const observations = [
       observation({ area_code: 1, area: 'Pipe | Land' }),
       observation({ area_code: 2, item: 'x\\|y' }),
@@ -134,6 +140,8 @@ describe('faostat_query_observations table rows (#27)', () => {
         String(o.value),
         displayed(o.unit ?? ''),
         displayed(o.flag ?? ''),
+        '',
+        '',
       ]);
     });
   });
@@ -254,7 +262,7 @@ describe('structuredContent keeps raw labels (#27)', () => {
     ]);
     const lines = tableLines(text(queryObservationsTool.format?.(result)), OBSERVATION_HEADER);
     expect(lines[2]).toBe(
-      '| Pipe \\| Land (7) | Wheat (15) | Production (5510) | 2020 | 1.5 | kg\\|ha | A |',
+      '| Pipe \\| Land (7) | Wheat (15) | Production (5510) | 2020 | 1.5 | kg\\|ha | A |  |  |',
     );
     // format() escaped a copy — the result it rendered still carries the raw label.
     expect(result.observations[0]?.area).toBe('Pipe | Land');

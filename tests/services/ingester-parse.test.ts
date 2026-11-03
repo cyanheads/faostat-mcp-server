@@ -22,6 +22,15 @@ const HEADER = headerIndex(
 );
 
 describe('dataRowToObservation', () => {
+  it('skips absent item codes instead of inventing numeric zero', () => {
+    for (const columns of [
+      ['Area Code', 'Element Code', 'Year'],
+      ['Area Code', 'Element Code', 'Year', 'Item Code'],
+    ]) {
+      expect(dataRowToObservation(['2', '5510', '2020'], headerIndex(columns))).toBeNull();
+    }
+  });
+
   it('preserves sparse observations as null without inventing labels', () => {
     const header = headerIndex(['Area Code', 'Item Code', 'Element Code', 'Year Code', 'Value']);
     expect(dataRowToObservation(['2', '15', '5510', '2020', 'not-a-number'], header)).toEqual({
@@ -30,6 +39,11 @@ describe('dataRowToObservation', () => {
       area_m49: null,
       area: '',
       item_code: 15,
+      item_code_text: null,
+      period: null,
+      source_code: null,
+      source: null,
+      value_qualifier: null,
       item: '',
       element_code: 5510,
       element: '',
@@ -58,6 +72,11 @@ describe('dataRowToObservation', () => {
       area_m49: '004',
       area: 'Afghanistan',
       item_code: 15,
+      item_code_text: null,
+      period: null,
+      source_code: null,
+      source: null,
+      value_qualifier: null,
       item: 'Wheat',
       element_code: 5510,
       element: 'Production',
@@ -95,6 +114,10 @@ describe('dataRowToObservation', () => {
 });
 
 describe('dimension code-list parsers', () => {
+  it('skips a short item row whose identity cell is absent', () => {
+    expect(parseItemCodes('Item,Item Code\nWheat')).toEqual([]);
+  });
+
   it.each([
     ['areas', parseAreaCodes],
     ['items', parseItemCodes],
@@ -110,7 +133,7 @@ describe('dimension code-list parsers', () => {
       { area_code: 2, area_m49: null, area: 'Afghanistan', kind: 'country' },
     ]);
     expect(parseItemCodes('Item Code,Item\nx,Invalid\n15,Wheat')).toEqual([
-      { item_code: 15, cpc_code: null, item: 'Wheat' },
+      { item_code: 15, item_code_text: null, cpc_code: null, item: 'Wheat' },
     ]);
     expect(parseElementCodes('Element Code,Element\nx,Invalid\n5510,Production')).toEqual([
       { element_code: 5510, element: 'Production' },
@@ -141,7 +164,9 @@ describe('dimension code-list parsers', () => {
 
   it('parses ItemCodes and strips the CPC apostrophe', () => {
     const items = parseItemCodes("Item Code,CPC Code,Item\n15,'0111,Wheat");
-    expect(items).toEqual([{ item_code: 15, cpc_code: '0111', item: 'Wheat' }]);
+    expect(items).toEqual([
+      { item_code: 15, item_code_text: null, cpc_code: '0111', item: 'Wheat' },
+    ]);
   });
 
   it('parses Elements de-duplicating repeated codes', () => {

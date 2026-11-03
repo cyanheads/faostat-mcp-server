@@ -82,7 +82,7 @@ describe('FaostatMirror end-to-end', () => {
 
   it('resolves an area by exact code', async () => {
     const { matches } = await mirror.resolve(FIXTURE_DOMAIN, 'area', { code: 351, limit: 10 });
-    expect(matches).toEqual([{ code: 351, name: 'China', kind: 'aggregate' }]);
+    expect(matches).toEqual([{ code: 351, code_text: null, name: 'China', kind: 'aggregate' }]);
   });
 
   it('preserves historical reporting entities as countries', async () => {
@@ -114,9 +114,9 @@ describe('FaostatMirror end-to-end', () => {
       ]);
       const handle = await mirror.getMirror(FIXTURE_DOMAIN)!.raw();
       handle
-        .prepare(`INSERT INTO obs_QCL
+        .prepare(`INSERT INTO obs_QCL (id, area_code, area_m49, area, item_code, item, element_code, element, year, unit, value, flag, note, item_code_text, period, value_qualifier, source_code, source)
       SELECT ? || '|' || id, ?, area_m49, ?, item_code, item, element_code, element,
-        year, unit, value, flag, note FROM obs_QCL WHERE area_code = 2`)
+        year, unit, value, flag, note, item_code_text, period, value_qualifier, source_code, source FROM obs_QCL WHERE area_code = 2`)
         .run(String(code), code, `Roll-up ${code}`);
       const classified = await mirror.resolve(FIXTURE_DOMAIN, 'area', { code, limit: 1 });
       expect(classified.matches[0]?.kind).toBe('aggregate');
@@ -240,7 +240,9 @@ describe('FaostatMirror end-to-end', () => {
     // resolve surface: 351 resolves as aggregate — computed at read time from the
     // code, so the fix reaches already-ingested mirrors with no re-sync.
     const resolved = await mirror.resolve(FIXTURE_DOMAIN, 'area', { code: 351, limit: 10 });
-    expect(resolved.matches).toEqual([{ code: 351, name: 'China', kind: 'aggregate' }]);
+    expect(resolved.matches).toEqual([
+      { code: 351, code_text: null, name: 'China', kind: 'aggregate' },
+    ]);
 
     // query surface: the SAME code is dropped from the default (aggregate-excluded)
     // set, yet reachable via include_aggregates — proving it's the exclusion

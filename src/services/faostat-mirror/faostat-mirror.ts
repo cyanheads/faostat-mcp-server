@@ -49,15 +49,31 @@ const CUBE_COLUMNS: Record<string, string> = {
   area_m49: 'TEXT',
   area: 'TEXT',
   item_code: 'INTEGER',
+  item_code_text: 'TEXT',
   item: 'TEXT',
   element_code: 'INTEGER',
   element: 'TEXT',
   year: 'INTEGER',
+  period: 'TEXT',
+  value_qualifier: 'TEXT',
+  source_code: 'INTEGER',
+  source: 'TEXT',
   unit: 'TEXT',
   value: 'REAL',
   flag: 'TEXT',
   note: 'TEXT',
 };
+
+/**
+ * Verified group aggregates named by FAO's production methodology:
+ * https://github.com/SWS-Methodology/faoswsProduction/blob/master/modules/Value%20of%20Agricultural%20Production/main.R
+ * Presence verified against each domain's bundled ItemCodes. This positive set is
+ * incomplete; an unlisted identity is unknown, never certified safe to sum.
+ */
+const AGGREGATE_ITEMS: ReadonlyMap<string, ReadonlySet<number>> = new Map([
+  ['QCL', new Set([1717, 1720, 1723, 1730, 1735, 1738, 1780])],
+  ['TCL', new Set([1723])],
+]);
 
 /** SQLite filename for a domain mirror table. */
 function domainDbFile(code: string): string {
@@ -67,6 +83,29 @@ function domainDbFile(code: string): string {
 /** Cube table name for a domain — the single derivation every SQL path shares. */
 function cubeTable(code: string): string {
   return `obs_${code.toUpperCase()}`;
+}
+
+/** Install on empty new stores or during sync, never scan an old cube on its first read. */
+function createObservationIndexes(handle: SqliteHandle, table: string): void {
+  handle.exec(
+    `CREATE INDEX IF NOT EXISTS ${table}_item_code_text_idx ON ${table}(item_code_text) WHERE item_code_text IS NOT NULL`,
+  );
+  handle.exec(
+    `CREATE INDEX IF NOT EXISTS ${table}_item_code_text_element_code_year_idx ON ${table}(item_code_text, element_code, year) WHERE item_code_text IS NOT NULL`,
+  );
+  handle.exec(
+    `CREATE INDEX IF NOT EXISTS ${table}_source_code_idx ON ${table}(source_code) WHERE source_code IS NOT NULL`,
+  );
+  // Lead with unit so this discovery index does not compete with element/year observation reads.
+  handle.exec(
+    `CREATE INDEX IF NOT EXISTS ${table}_unit_element_idx ON ${table}(unit, element_code)`,
+  );
+}
+
+/** Revision 1 is a compatible numeric-only cube awaiting index preparation; 2 has current indexes. */
+function ingestRevision(handle: SqliteHandle): number | undefined {
+  return handle.prepare<{ revision: number }>('SELECT revision FROM ingest_revision').get()
+    ?.revision;
 }
 
 /**
@@ -110,8 +149,10 @@ export interface ObservationQuery {
   elementCodes?: number[];
   includeAggregates: boolean;
   itemCodes?: number[];
+  itemCodesText?: string[];
   limit: number;
   offset: number;
+  sourceCodes?: number[];
   yearEnd?: number;
   yearStart?: number;
 }
@@ -147,6 +188,15 @@ function buildObservationWhere(q: Omit<ObservationQuery, 'limit' | 'offset'>): {
     where.push(`item_code IN (${q.itemCodes.map(() => '?').join(',')})`);
     params.push(...q.itemCodes);
   }
+  for (const [column, codes] of [
+    ['item_code_text', q.itemCodesText],
+    ['source_code', q.sourceCodes],
+  ] as const) {
+    if (codes?.length) {
+      where.push(`${column} IN (${codes.map(() => '?').join(',')})`);
+      params.push(...codes);
+    }
+  }
   if (q.elementCodes?.length) {
     where.push(`element_code IN (${q.elementCodes.map(() => '?').join(',')})`);
     params.push(...q.elementCodes);
@@ -162,9 +212,9 @@ function buildObservationWhere(q: Omit<ObservationQuery, 'limit' | 'offset'>): {
   return { whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '', params };
 }
 
-/** The ten columns a staged observation table carries, in `OBSERVATION_TABLE_SCHEMA` order. */
+/** The columns a staged observation table carries, in `OBSERVATION_TABLE_SCHEMA` order. */
 const STREAM_COLUMNS =
-  'area_code, area, item_code, item, element_code, element, year, unit, value, flag';
+  'area_code, area, item_code, item, element_code, element, year, unit, value, flag, item_code_text, period, value_qualifier, source_code, source';
 
 /**
  * How a row read is bounded: a `page` of every cube column (the overflow probe
@@ -197,7 +247,7 @@ export function buildObservationSql(
 ): { sql: string; params: SqlValue[] } {
   const { whereSql, params } = buildObservationWhere(filters);
   const columns = read.kind === 'stream' ? STREAM_COLUMNS : '*';
-  const orderBy = filters.itemCodes?.length ? '+year' : 'year';
+  const orderBy = filters.itemCodes?.length || filters.itemCodesText?.length ? '+year' : 'year';
   const sql = `SELECT ${columns} FROM ${cubeTable(code)} ${whereSql} ORDER BY ${orderBy} ASC LIMIT ?`;
   return read.kind === 'page'
     ? { sql: `${sql} OFFSET ?`, params: [...params, read.limit, read.offset] }
@@ -281,6 +331,35 @@ export class FaostatMirror {
         table: cubeTable(upper),
         primaryKey: 'id',
         columns: CUBE_COLUMNS,
+        version: 2,
+        migrations: [
+          {
+            version: 2,
+            up(handle) {
+              const columns = new Set(
+                handle
+                  .prepare<{ name: string }>(`PRAGMA table_info(${cubeTable(upper)})`)
+                  .all()
+                  .map((c) => c.name),
+              );
+              const legacy = !columns.has('item_code_text');
+              for (const [name, type] of Object.entries(CUBE_COLUMNS)) {
+                if (!columns.has(name))
+                  handle.exec(`ALTER TABLE ${cubeTable(upper)} ADD COLUMN ${name} ${type}`);
+              }
+              handle.exec('CREATE TABLE IF NOT EXISTS ingest_revision (revision INTEGER NOT NULL)');
+              if (upper === 'FS' || upper === 'GLE') {
+                handle.exec(
+                  "UPDATE mirror_sync_state SET status = 'pending', completed_at = NULL, checkpoint = NULL, cursor = NULL, total = NULL",
+                );
+              } else
+                handle
+                  .prepare('INSERT INTO ingest_revision(revision) VALUES (?)')
+                  .run(legacy ? 1 : 2);
+              if (!legacy) createObservationIndexes(handle, cubeTable(upper));
+            },
+          },
+        ],
         indexes: [
           { columns: ['area_code'] },
           { columns: ['item_code'] },
@@ -326,15 +405,19 @@ export class FaostatMirror {
   }
 
   /** True once a domain's mirror has ever completed a sync (queryable mid-refresh). */
-  ready(code: string): Promise<boolean> {
+  async ready(code: string): Promise<boolean> {
     const mirror = this.getMirror(code);
-    return mirror ? mirror.ready() : Promise.resolve(false);
+    if (!mirror) return false;
+    const handle = await mirror.raw();
+    return ingestRevision(handle) !== undefined && (await mirror.ready());
   }
 
   /** Public status for a selected domain. */
-  status(code: string) {
+  async status(code: string) {
     const mirror = this.getMirror(code);
-    return mirror ? mirror.status() : Promise.resolve(undefined);
+    if (!mirror) return;
+    const status = await mirror.status();
+    return { ...status, ready: status.ready && (await this.ready(code)) };
   }
 
   /**
@@ -360,7 +443,7 @@ export class FaostatMirror {
    * domain whose planner is flying blind is caught by its first data read. The gate
    * is deliberately not on `openDomain` itself: the statistics serve the `item_code
    * + element_code + year` filter shape, and a whole-column scan that shape does not
-   * describe — the distinct-code read behind {@link domainDimensionCodes} — would
+   * describe — the distinct-code read behind {@link domainItemCodes} — would
    * otherwise schedule an optimization it cannot use (#22).
    */
   private async openAnalyzedDomain(
@@ -667,6 +750,9 @@ export class FaostatMirror {
     dimension: DimensionKind,
     opts: {
       code?: number;
+      codeText?: string;
+      itemCodes?: number[];
+      itemCodesText?: string[];
       query?: string;
       /** Prefer normalized exact labels before relevance matching. */
       preferExact?: boolean;
@@ -677,43 +763,110 @@ export class FaostatMirror {
       signal?: AbortSignal;
     },
   ): Promise<{ matches: ResolvedCode[]; total: number }> {
-    const { signal, ...lookup } = opts;
-    const domainCodes =
-      dimension === 'area' ? undefined : await this.domainDimensionCodes(domain, dimension, signal);
-    return this.dimensions.resolve(dimension, {
+    const { signal, itemCodes, itemCodesText, ...lookup } = opts;
+    const units = new Map<number, string[]>();
+    let domainCodes: (number | string)[] | undefined;
+    if (dimension === 'element') {
+      const selected = itemCodesText ?? itemCodes;
+      const opened = await this.openDomain(domain);
+      domainCodes = [];
+      if (opened && selected?.length !== 0) {
+        const column = itemCodesText !== undefined ? 'item_code_text' : 'item_code';
+        const predicates: string[] = [];
+        const params: SqlValue[] = [];
+        if (selected) {
+          predicates.push(`${column} IN (${selected.map(() => '?').join(', ')})`);
+          params.push(...selected);
+        }
+        if (lookup.code !== undefined) {
+          predicates.push('element_code = ?');
+          params.push(lookup.code);
+        }
+        const where = predicates.length ? ` WHERE ${predicates.join(' AND ')}` : '';
+        /**
+         * Old cubes gain the covering element/unit index during refresh. Until
+         * then a domain-wide sequential scan beats scattered table reads through
+         * the element-only index. Item and exact-code selectors retain indexed paths.
+         */
+        const unitIndex = `${opened.table}_unit_element_idx`;
+        const hasUnitIndex = opened.handle
+          .prepare('SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?')
+          .get('index', unitIndex);
+        const scan =
+          !selected && hasUnitIndex
+            ? ` INDEXED BY ${unitIndex}`
+            : predicates.length
+              ? ''
+              : ' NOT INDEXED';
+        const rows = await this.reads.all<{ code: number; unit: string | null }>(
+          {
+            file: opened.file,
+            sql: `SELECT DISTINCT element_code AS code, unit FROM ${opened.table}${scan}${where} ORDER BY element_code, unit`,
+            params,
+          },
+          signal,
+        );
+        for (const row of rows) {
+          const values = units.get(row.code) ?? [];
+          if (row.unit !== null) values.push(row.unit);
+          units.set(row.code, values);
+        }
+        domainCodes = [...units.keys()];
+      }
+    } else if (dimension === 'item') {
+      domainCodes = await this.domainItemCodes(domain, signal);
+    }
+    const result = await this.dimensions.resolve(dimension, {
       ...lookup,
       ...(domainCodes ? { domainCodes } : {}),
     });
+    return {
+      ...result,
+      matches: result.matches.map((match) => {
+        const elementUnits = match.code === null ? undefined : units.get(match.code);
+        return {
+          ...match,
+          ...(dimension === 'element' && elementUnits !== undefined ? { units: elementUnits } : {}),
+          ...(dimension === 'item' &&
+          match.code !== null &&
+          AGGREGATE_ITEMS.get(domain.toUpperCase())?.has(match.code)
+            ? { kind: 'aggregate' as const }
+            : {}),
+        };
+      }),
+    };
   }
 
   /**
-   * The distinct item/element codes present in a domain's observation cube — the
+   * The distinct item codes present in a domain's observation cube — the
    * membership set that scopes {@link resolve} (issue #8). Index-backed: `SELECT
-   * DISTINCT item_code|element_code` reads the existing per-column covering index,
+   * DISTINCT item_code` reads the existing per-column covering index,
    * so no schema change or re-sync is needed. `raw()` runs the store DDL on open,
    * so the table exists even for a selected-but-unsynced domain — then the cube is
-   * empty, the set is `[]`, and resolve returns no matches (the honest answer for a
-   * domain you cannot yet query).
+   * empty. Tool handlers gate item resolution on the selected domain's
+   * readiness before reaching this read; shared area vocabulary remains available.
    *
    * Opens ungated (#22). This is a discovery read — the single-column index already
    * serves it, and it is the call an agent makes first, so routing it through the
    * statistics gate charged the cheapest call for the slowest optimization and left
    * an HTTP caller waiting out a full ANALYZE for codes it could have had at once.
    */
-  private async domainDimensionCodes(
+  private async domainItemCodes(
     domain: string,
-    dimension: Exclude<DimensionKind, 'area'>,
     signal?: AbortSignal,
-  ): Promise<number[]> {
+  ): Promise<(number | string)[]> {
     const opened = await this.openDomain(domain);
     if (!opened) return [];
-    const { file, table } = opened;
-    const column = dimension === 'item' ? 'item_code' : 'element_code';
-    const rows = await this.reads.all<{ code: number | null }>(
-      { file, sql: `SELECT DISTINCT ${column} AS code FROM ${table}`, params: [] },
+    const { file, table, handle } = opened;
+    const sql =
+      ingestRevision(handle) === 2
+        ? `SELECT DISTINCT item_code AS code FROM ${table} WHERE item_code IS NOT NULL UNION ALL SELECT DISTINCT item_code_text AS code FROM ${table} WHERE item_code_text IS NOT NULL`
+        : `SELECT DISTINCT item_code AS code FROM ${table}`;
+    const rows = await this.reads.all<{ code: number | string | null }>(
+      { file, sql, params: [] },
       signal,
     );
-    return rows.map((r) => r.code).filter((c): c is number => c != null);
+    return rows.map((r) => r.code).filter((c): c is number | string => c != null);
   }
 
   /**
@@ -751,6 +904,24 @@ export class FaostatMirror {
     try {
       await this.builds.get(upper);
       const dataset = args.dataset ?? (await this.resolveDataset(upper, args.signal));
+      const handle = await mirror.raw();
+      const revision = ingestRevision(handle);
+      const needsReplacement = revision === undefined;
+      if (needsReplacement) {
+        handle.transaction(() => {
+          handle.exec(`DELETE FROM ${cubeTable(upper)}`);
+          handle.exec(
+            "UPDATE mirror_sync_state SET status = 'pending', completed_at = NULL, checkpoint = NULL, cursor = NULL, total = NULL",
+          );
+        });
+        this.reads.invalidate(this.domainFile(upper));
+      }
+      if (revision !== 2) {
+        createObservationIndexes(handle, cubeTable(upper));
+        /** Compatible refreshes stay readable after partial writes; enable text membership first. */
+        if (revision === 1) handle.exec('UPDATE ingest_revision SET revision = 2');
+        this.reads.invalidate(this.domainFile(upper));
+      }
       // Bind the manifest-bound ingester onto the per-domain slot the read-path
       // mirror's `sync` delegates to, run, then clear the slot. One Mirror instance
       // owns both paths against one open store handle.
@@ -763,10 +934,16 @@ export class FaostatMirror {
         }),
       );
       const result = await mirror.runSync({
-        mode,
+        mode: needsReplacement ? 'init' : mode,
         signal: args.signal,
         ...(args.onProgress ? { onProgress: args.onProgress } : {}),
       });
+      if (await mirror.ready()) {
+        handle.transaction(() => {
+          handle.exec('DELETE FROM ingest_revision');
+          handle.exec('INSERT INTO ingest_revision(revision) VALUES (2)');
+        });
+      }
       const applied = result.recordsApplied > 0 || result.tombstonesApplied > 0;
       if (applied || !this.hasStatistics(await mirror.raw(), cubeTable(upper))) {
         await this.buildStatistics(upper);

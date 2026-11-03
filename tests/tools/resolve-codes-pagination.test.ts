@@ -141,7 +141,9 @@ describe('faostat_resolve_codes pagination (#7)', () => {
       dimension: 'area',
       code: 5,
     });
-    expect(result.matches).toEqual([{ code: 5, name: 'Country 5', kind: 'country' }]);
+    expect(result.matches).toEqual([
+      { code: 5, code_text: null, name: 'Country 5', kind: 'country' },
+    ]);
     expect(enrichment.truncated).toBe(false);
     expect(enrichment.nextOffset).toBeUndefined();
   });

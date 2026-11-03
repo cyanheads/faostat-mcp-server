@@ -32,7 +32,7 @@ Global food and agriculture statistics from the UN's FAOSTAT: production, trade,
 | Tool | Description |
 |:---|:---|
 | `faostat_list_domains` | Discover FAOSTAT statistical domains with codes, descriptions, last-update date, upstream row count, and local index status. The entry point — every query keys on a domain code. |
-| `faostat_resolve_codes` | Resolve human terms to the opaque integer codes a query needs (areas, items, elements), flagging each area as a country or an aggregate region. |
+| `faostat_resolve_codes` | Resolve human terms to the codes a query needs (areas, items, elements), flagging each area as a country or an aggregate region. |
 | `faostat_query_observations` | Query a domain's cube by area(s), item(s), element(s), and year range. Inline preview for small results; large sets spill to a DataCanvas table. |
 | `faostat_commodity_profile` | Workflow: assemble top producers, the production trend, and trade flows for one commodity from the production and trade domains in a single call. |
 | `faostat_dataframe_query` | Run a read-only SQL `SELECT` against the canvas tables staged by the analytical tools. |
@@ -52,21 +52,27 @@ Global food and agriculture statistics from the UN's FAOSTAT: production, trade,
 
 ### `faostat_resolve_codes` <sub>tool</sub>
 
-- FTS5 full-text `query`, substring `name_contains`, or exact `code` lookup within a `dimension`: `area`, `item`, or `element`
+- FTS5 full-text `query`, substring `name_contains`, or exact `code` lookup within a `dimension`: `area`, `item`, or `element`; `code_text` looks up alphanumeric items
 - Item/element matches are scoped to codes present in the given `domain`'s cube; area codes are shared across domains
+- Element matches include observed `units`; `item_codes` or `item_codes_text` restrict element discovery and units to selected items. Item/element lookups require that domain to be ready
 - Every area match is flagged `country` or `aggregate` (codes ≥ 5000, plus curated sub-threshold roll-ups such as China=351)
+- Verified item groups are marked `aggregate` by domain. Classification is incomplete: `kind: null` does not mean items can safely be summed together
 - `limit` (max 200, default 50) + `offset` page the match set
-- Typed errors: `unknown_domain`, `index_not_ready`, `query_timeout`
+- Typed errors: `unknown_domain`, `index_not_ready`, `invalid_text_selector`, `invalid_item_scope`, `query_timeout`
 
 ---
 
 ### `faostat_query_observations` <sub>tool</sub>
 
-- Filters by `area_codes` / `item_codes` / `element_codes` and an inclusive `year_start` / `year_end` range
+- Filters by `area_codes` / `item_codes` / `item_codes_text` / `element_codes` / `source_codes` and an inclusive `year_start` / `year_end` range
+- Alphanumeric items retain their exact `item_code_text` with `item_code: null`; numeric items retain their integer code
+- Period observations retain `period` (e.g. `2000-2002`) and use its midpoint as `year` for filtering. Censored values retain the numeric bound plus `value_qualifier` (e.g. `<` with `2.5`)
+- Source-specific rows carry `source_code` and `source`; omitting `source_codes` returns all sources, which must be compared separately rather than summed
+- An empty query with explicit item and element selections returns `available_elements` with labels and units for those items; this does not establish coverage for the requested areas, years, or sources
 - Aggregate regions excluded by default (`include_aggregates: false`); explicit `area_codes` bypass the exclusion
 - `limit` caps the inline page (default 200, max 1000); a match that exceeds it spills in full to a DataCanvas table (50,000-row staging cap) — `faostat_dataframe_describe` for its columns, then SQL via `faostat_dataframe_query`
 - Every row carries its data-quality `flag` (`A`/`E`/`I`/`B`/`M`/`T`/`X`, others per domain) — never dropped
-- Typed errors: `domain_not_indexed`, `index_not_ready`, `canvas_disabled`, `canvas_not_found`, `invalid_year_range`, `query_timeout`
+- Typed errors: `domain_not_indexed`, `index_not_ready`, `canvas_disabled`, `canvas_not_found`, `invalid_year_range`, `conflicting_item_selectors`, `query_timeout`
 
 ---
 
@@ -109,7 +115,7 @@ Global food and agriculture statistics from the UN's FAOSTAT: production, trade,
 
 ## Features
 
-The [faostat-guide](./skills/faostat-guide/SKILL.md) covers comparable reporting years, country versus regional totals, units, coverage, and complete SQL analysis across staged results. It ships with plugin, npm, Docker, and MCPB installs and is served through the MCP Skills extension as a skill resource.
+The [faostat-guide](./skills/faostat-guide/SKILL.md) covers reporting periods, censored values, source estimates, country versus regional totals, units, coverage, and complete SQL analysis across staged results. It ships with plugin, npm, Docker, and MCPB installs and is served through the MCP Skills extension as a skill resource.
 
 Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
@@ -219,6 +225,8 @@ bun run mirror:verify    # report sync status, local row counts, and sample read
 ```
 
 `mirror:init` is idempotent and resumable per domain — re-running after an interrupt re-streams only the unfinished domain ZIP. `FAOSTAT_DOMAINS` selects which domains are indexed; everything else in the catalog shows in `faostat_list_domains` with `indexed: false` until added and re-synced. On HTTP transport, set `FAOSTAT_REFRESH_CRON` to refresh in-process on a schedule; on stdio, run `mirror:refresh` out-of-band. The read tools return `index_not_ready` until the first sync completes.
+
+After upgrading an older mirror, run `mirror:refresh`. FS and GLE rebuild once to recover period/text-item rows and separate source estimates, even when the upstream date is unchanged; they remain unready until that rebuild succeeds. Compatible numeric domains stay readable and gain the new indexes during refresh without a forced download. Until those indexes are prepared, domain-wide element/unit discovery can be slow; scope it with `item_codes` or `item_codes_text` when possible.
 
 `mirror:refresh` also builds query-planner statistics (`ANALYZE`) for any selected domain that has none, even when its data is unchanged upstream — a mirror synced by an older release, or one whose last build failed. Otherwise the server builds them itself, in the background on a worker thread, the first time a data read touches that domain, and keeps answering meanwhile.
 
