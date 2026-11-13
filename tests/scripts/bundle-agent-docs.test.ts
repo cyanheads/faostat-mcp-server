@@ -14,7 +14,6 @@ describe('bundle agent documentation', () => {
     'node_modules/parent/node_modules/@modelcontextprotocol/server/dist/ext/skills/index.mjs',
     'node_modules/example/dist/skills/runtime.js',
     'skills/faostat-analysis/SKILL.md',
-    'node_modules/example/dist/SKILL.md',
   ])('keeps runtime or published entry %s', (entry) => {
     expect(filterAgentDocEntries([entry])).toEqual([]);
     expect(packaging.checkBundleEntries([entry], 'fixture.mcpb')).toEqual([]);
@@ -27,7 +26,8 @@ describe('bundle agent documentation', () => {
     'node_modules/@scope/parent/node_modules/example/.claude/settings.json',
     'node_modules/example/.agents/config.json',
     'node_modules/example/SKILL.md',
-  ])('removes dependency root documentation %s', (entry) => {
+    'node_modules/example/dist/SKILL.md',
+  ])('removes dependency agent documentation %s', (entry) => {
     expect(filterAgentDocEntries([entry])).toEqual([entry]);
     expect(packaging.checkBundleEntries([entry], 'fixture.mcpb')).toHaveLength(1);
   });
