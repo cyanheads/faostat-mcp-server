@@ -151,7 +151,7 @@ describe('faostat_dataframe_query error-contract reasons', () => {
   });
 
   it('keeps system_catalog_access for a denied catalog reference', async () => {
-    await expect(run(`SELECT * FROM information_schema.tables`)).rejects.toMatchObject({
+    await expect(run(`SELECT * FROM duckdb_tables`)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'system_catalog_access' },
     });
