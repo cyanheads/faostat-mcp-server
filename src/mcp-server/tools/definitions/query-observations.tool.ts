@@ -26,8 +26,9 @@ import type { ObservationRow } from '@/services/faostat-mirror/index.js';
 import { getFaostatMirror } from '@/services/faostat-mirror/index.js';
 
 /**
- * `totalCount` is exact up to this many matches and a floor beyond — the staging
- * cap, so a staged first page and a counted page report one total.
+ * `totalCount` is exact up to this many matches and, on any page but the last, a
+ * floor beyond — the staging cap, so a staged first page and a counted page report
+ * one total. The last page counts its match exactly, whatever its size.
  */
 export const TOTAL_COUNT_CAP = STAGE_MAX_ROWS;
 
@@ -97,13 +98,13 @@ export const queryObservationsTool = tool('faostat_query_observations', {
     totalCount: z
       .number()
       .describe(
-        'Observations the filters matched. Exact up to 50,000; past that it is 50,000, a floor — more matched — and totalCountIsFloor is true. A staged first page reports the staged table row count, capped the same way (truncated is then true).',
+        'Observations the filters matched. Exact up to 50,000, and exact on the last page of any match; on any other page past 50,000 it is 50,000, a floor — more matched — and totalCountIsFloor is true. A staged first page reports the staged table row count, capped the same way (truncated is then true).',
       ),
     totalCountIsFloor: z
       .boolean()
       .optional()
       .describe(
-        'True when more than 50,000 observations matched, so totalCount (50,000) is a floor and not the match size. Absent when totalCount is exact.',
+        'True when totalCount (50,000) is a floor and not the match size: more than 50,000 observations matched and this page is not the last. Absent when totalCount is exact.',
       ),
     nextOffset: z
       .number()
