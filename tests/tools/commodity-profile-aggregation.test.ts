@@ -22,7 +22,9 @@ import {
   fixtureDataset,
 } from '../fixtures/synthetic-domain.js';
 
+const TCL = 'TCL';
 const PRODUCTION = { elementCode: 5510, element: 'Production' } as const;
+const IMPORTS = { elementCode: 5610, element: 'Import quantity' } as const;
 const CATTLE = { itemCode: 100, item: 'Milk of cattle' } as const;
 const GOATS = { itemCode: 101, item: 'Milk of goats' } as const;
 const ALPHA = { areaCode: 10, area: 'Alpha' } as const;
@@ -31,22 +33,32 @@ const BRAVO = { areaCode: 20, area: 'Bravo' } as const;
 let mirror: FaostatMirror | undefined;
 let dir: string | undefined;
 
-/** Sync a mirror holding exactly `observations`, and return the tool's result. */
+/**
+ * Sync a mirror holding exactly `observations` — plus a trade domain holding
+ * `trade`, when given — and return the tool's result.
+ */
 async function profile(
   observations: ExplicitObservation[],
   input: Record<string, unknown> = { item_query: 'Milk of cattle' },
+  trade?: ExplicitObservation[],
 ) {
   dir = mkdtempSync(join(tmpdir(), 'faostat-profile-agg-'));
   const zip = buildExplicitDomainZip(observations);
+  const tradeZip = trade ? buildExplicitDomainZip(trade, TCL) : undefined;
   vi.stubGlobal(
     'fetch',
-    vi.fn(async () => chunkedResponse(zip, 1 << 16)),
+    vi.fn(async (url: string | URL) =>
+      chunkedResponse(tradeZip && String(url).includes(`_${TCL}_`) ? tradeZip : zip, 1 << 16),
+    ),
   );
-  mirror = initFaostatMirror({ dir, domains: [FIXTURE_DOMAIN] });
-  await mirror.runDomainSync(FIXTURE_DOMAIN, 'init', {
-    signal: new AbortController().signal,
-    dataset: fixtureDataset(),
-  });
+  const domains = trade ? [FIXTURE_DOMAIN, TCL] : [FIXTURE_DOMAIN];
+  mirror = initFaostatMirror({ dir, domains });
+  for (const domain of domains) {
+    await mirror.runDomainSync(domain, 'init', {
+      signal: new AbortController().signal,
+      dataset: fixtureDataset(domain),
+    });
+  }
   const ctx = createMockContext({ tenantId: 'profile-agg', errors: commodityProfileTool.errors });
   const parsed = commodityProfileTool.input.parse(input);
   return { ctx, result: await commodityProfileTool.handler(parsed, ctx) };
@@ -125,7 +137,66 @@ describe('faostat_commodity_profile per-country aggregation (#5a)', () => {
       ['t', 60],
       ['No', 55],
     ]);
+    // Two units share one reference year: the tonne series trails the head count's 2022.
+    expect(result.top_producers.map((r) => [r.unit, r.year, r.years_behind])).toEqual([
+      ['t', 2021, 1],
+      ['No', 2022, 0],
+    ]);
     expect(getEnrichment(ctx).notice as string).toMatch(/more than one unit/);
+  });
+
+  it('ranks a series with no unit as its own group, once, at its own latest year', async () => {
+    /*
+     * A blank unit ingests as NULL, and NULL never equals NULL: matching a group to
+     * its latest year with `=` would drop the unit-less series, and taking the
+     * latest year per country alone would leave Alpha's ending in 2022 and drop
+     * its 2021 unit-less row.
+     */
+    const { ctx, result } = await profile([
+      { ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2022, value: 60, unit: 't' },
+      { ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2020, value: 7, unit: '', flag: 'E' },
+      { ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2021, value: 9, unit: '', flag: 'I' },
+      { ...BRAVO, ...CATTLE, ...PRODUCTION, year: 2019, value: 40, unit: '' },
+    ]);
+
+    expect(result.top_producers).toEqual([
+      {
+        area_code: 10,
+        area: 'Alpha',
+        value: 60,
+        observations: 1,
+        unit: 't',
+        year: 2022,
+        years_behind: 0,
+        flags: 'A',
+      },
+      {
+        area_code: 20,
+        area: 'Bravo',
+        value: 40,
+        observations: 1,
+        unit: null,
+        year: 2019,
+        years_behind: 3,
+        flags: 'A',
+      },
+      {
+        area_code: 10,
+        area: 'Alpha',
+        value: 9,
+        observations: 1,
+        unit: null,
+        year: 2021,
+        years_behind: 1,
+        flags: 'I',
+      },
+    ]);
+    const text = (commodityProfileTool.format?.(result) ?? [])
+      .map((c) => (c.type === 'text' ? c.text : ''))
+      .join('\n');
+    expect(text).toContain('- Bravo (20): 40  [2019, 3 yr behind, 1 obs, flags A]');
+    expect(text).toContain('- Alpha (10): 9  [2021, 1 yr behind, 1 obs, flags I]');
+    expect(getEnrichment(ctx).notice as string).toMatch(/more than one unit \(t, unspecified\)/);
   });
 });
 
@@ -147,13 +218,58 @@ describe('faostat_commodity_profile per-country latest year (#5b, #5d)', () => {
 
     expect(result.resolved_items).toHaveLength(1);
     expect(result.top_producers).toHaveLength(2);
-    expect(result.top_producers[0]).toMatchObject({ area: 'Bravo', value: 90, year: 2021 });
+    expect(result.top_producers[0]).toMatchObject({
+      area: 'Bravo',
+      value: 90,
+      year: 2021,
+      years_behind: 1,
+    });
     expect(result.top_producers[1]).toMatchObject({
       area: 'Alpha',
       value: 30,
       year: 2022,
+      years_behind: 0,
       observations: 1,
     });
+  });
+
+  it('measures the lag against the year bounds: with year_end 2021 both countries are current (#50)', async () => {
+    const { result } = await profile(
+      [
+        { ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2021, value: 10 },
+        { ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2022, value: 30 },
+        { ...BRAVO, ...CATTLE, ...PRODUCTION, year: 2020, value: 100 },
+        { ...BRAVO, ...CATTLE, ...PRODUCTION, year: 2021, value: 90 },
+      ],
+      { item_query: 'Milk of cattle', year_end: 2021 },
+    );
+    expect(result.top_producers.map((r) => [r.area, r.year, r.years_behind])).toEqual([
+      ['Bravo', 2021, 0],
+      ['Alpha', 2021, 0],
+    ]);
+  });
+
+  it('gives each ranking its own latest year, so trade ending a year earlier is current (#50)', async () => {
+    const { result } = await profile(
+      [
+        { ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2022, value: 30 },
+        { ...BRAVO, ...CATTLE, ...PRODUCTION, year: 2021, value: 90 },
+      ],
+      { item_query: 'Milk of cattle' },
+      [
+        { ...ALPHA, ...CATTLE, ...IMPORTS, year: 2021, value: 4 },
+        { ...BRAVO, ...CATTLE, ...IMPORTS, year: 2021, value: 8 },
+      ],
+    );
+    expect(result.top_producers.map((r) => [r.area, r.year, r.years_behind])).toEqual([
+      ['Bravo', 2021, 1],
+      ['Alpha', 2022, 0],
+    ]);
+    // The importers' latest year is TCL's 2021, not QCL's 2022.
+    expect(result.top_importers.map((r) => [r.area, r.year, r.years_behind])).toEqual([
+      ['Bravo', 2021, 0],
+      ['Alpha', 2021, 0],
+    ]);
   });
 
   it('returns the annual trend on both client surfaces (#5e)', async () => {
@@ -219,6 +335,7 @@ describe('faostat_commodity_profile empty ranking sections (#5f)', () => {
       commodityProfileTool.format?.({
         item_query: 'wheat',
         resolved_items: [{ code: 15, name: 'Wheat' }],
+        ranking_elements: { top_producers: [], top_exporters: [], top_importers: [] },
         top_producers: [
           {
             area_code: 10,
@@ -227,6 +344,7 @@ describe('faostat_commodity_profile empty ranking sections (#5f)', () => {
             observations: 1,
             unit: 't',
             year: 2022,
+            years_behind: 0,
             flags: 'A',
           },
         ],

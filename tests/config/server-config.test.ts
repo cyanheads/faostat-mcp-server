@@ -1,10 +1,13 @@
 /**
  * @fileoverview `getServerConfig()` — the FAOSTAT env vars it reads, their
- * defaults, and the error naming the variable when a value fails to parse. The
- * module caches its parse, so each case imports a fresh copy under its own env.
+ * defaults, and the error naming the variable when a value fails to parse — and the
+ * never-throwing reads `src/index.ts` makes before `createApp()`, which must reach
+ * the same value. The module caches its parse, so each case imports a fresh copy
+ * under its own env.
  * @module tests/config/server-config
  */
 
+import { parseConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -14,6 +17,7 @@ const FAOSTAT_VARS = [
   'FAOSTAT_MIRROR_PATH',
   'FAOSTAT_REFRESH_CRON',
   'FAOSTAT_DATAFRAME_DROP_ENABLED',
+  'FAOSTAT_CLAMP_LIMITS',
 ] as const;
 
 /** A fresh `getServerConfig` reading `env` (every other FAOSTAT var unset). */
@@ -45,6 +49,7 @@ describe('getServerConfig', () => {
       domains: 'QCL,TCL,FBS,FS,RL,GLE,RFN,QV',
       mirrorPath: './.faostat-mirror',
       dataframeDropEnabled: false,
+      clampLimits: true,
     });
   });
 
@@ -55,6 +60,7 @@ describe('getServerConfig', () => {
       FAOSTAT_MIRROR_PATH: '/data/mirror',
       FAOSTAT_REFRESH_CRON: '0 6 * * *',
       FAOSTAT_DATAFRAME_DROP_ENABLED: 'true',
+      FAOSTAT_CLAMP_LIMITS: 'false',
     });
     expect(getServerConfig()).toEqual({
       bulkBaseUrl: 'https://example.org/bulk',
@@ -62,7 +68,32 @@ describe('getServerConfig', () => {
       mirrorPath: '/data/mirror',
       refreshCron: '0 6 * * *',
       dataframeDropEnabled: true,
+      clampLimits: false,
     });
+  });
+
+  it.each([
+    ['true', true],
+    ['yes', true],
+    ['false', false],
+    ['0', false],
+    ['off', false],
+    ['', true],
+    ['   ', true],
+    [`\${FAOSTAT_CLAMP_LIMITS}`, true],
+  ])('parses FAOSTAT_CLAMP_LIMITS=%j as %s', async (raw, clamp) => {
+    const getServerConfig = await configUnder({ FAOSTAT_CLAMP_LIMITS: raw });
+    expect(getServerConfig().clampLimits).toBe(clamp);
+  });
+
+  it('rejects a FAOSTAT_CLAMP_LIMITS value that is not a boolean word', async () => {
+    const getServerConfig = await configUnder({ FAOSTAT_CLAMP_LIMITS: 'maybe' });
+    expect(() => getServerConfig()).toThrow(
+      expect.objectContaining({
+        code: JsonRpcErrorCode.ConfigurationError,
+        message: expect.stringContaining('FAOSTAT_CLAMP_LIMITS'),
+      }),
+    );
   });
 
   it.each([
@@ -140,5 +171,74 @@ describe('dataframeDropRequested', () => {
       FAOSTAT_DATAFRAME_DROP_ENABLED: 'true',
     });
     expect(dataframeDropRequested()).toBe(true);
+  });
+});
+
+describe('clampLimitsRequested', () => {
+  /** Fresh `clampLimitsRequested` and `getServerConfig` reading `env`. */
+  async function readersUnder(env: Record<string, string> = {}) {
+    for (const name of FAOSTAT_VARS) vi.stubEnv(name, undefined);
+    for (const [name, value] of Object.entries(env)) vi.stubEnv(name, value);
+    vi.resetModules();
+    return import('@/config/server-config.js');
+  }
+
+  it.each([
+    [undefined, true],
+    ['', true],
+    ['  ', true],
+    [`\${user_config.clamp_limits}`, true],
+    ['true', true],
+    ['on', true],
+    ['false', false],
+    ['no', false],
+  ])('reads FAOSTAT_CLAMP_LIMITS=%j as %s, as getServerConfig does', async (raw, clamp) => {
+    const { clampLimitsRequested, getServerConfig } = await readersUnder(
+      raw === undefined ? {} : { FAOSTAT_CLAMP_LIMITS: raw },
+    );
+    expect(clampLimitsRequested()).toBe(clamp);
+    expect(getServerConfig().clampLimits).toBe(clamp);
+  });
+
+  it('reads an unparseable value as the default (on) without throwing, leaving the rejection to getServerConfig', async () => {
+    const { clampLimitsRequested, getServerConfig } = await readersUnder({
+      FAOSTAT_CLAMP_LIMITS: 'maybe',
+    });
+    expect(clampLimitsRequested()).toBe(true);
+    expect(() => getServerConfig()).toThrow(
+      expect.objectContaining({ message: expect.stringContaining('FAOSTAT_CLAMP_LIMITS') }),
+    );
+  });
+});
+
+describe('canvasRowLimit', () => {
+  /** A fresh `canvasRowLimit` reading `CANVAS_DEFAULT_ROW_LIMIT` as `raw`. */
+  async function rowLimitUnder(raw: string | undefined) {
+    vi.stubEnv('CANVAS_DEFAULT_ROW_LIMIT', raw);
+    vi.resetModules();
+    const { canvasRowLimit } = await import('@/config/server-config.js');
+    return canvasRowLimit;
+  }
+
+  it.each([undefined, '', `\${CANVAS_DEFAULT_ROW_LIMIT}`, '500', '25000'])(
+    'reads CANVAS_DEFAULT_ROW_LIMIT=%j as the framework config does',
+    async (raw) => {
+      const canvasRowLimit = await rowLimitUnder(raw);
+      const framework = parseConfig(raw === undefined ? {} : { CANVAS_DEFAULT_ROW_LIMIT: raw });
+      expect(canvasRowLimit()).toBe(framework.canvas.defaultRowLimit);
+    },
+  );
+
+  it('pins the framework default when the variable is unset', async () => {
+    const canvasRowLimit = await rowLimitUnder(undefined);
+    expect(canvasRowLimit()).toBe(10_000);
+  });
+
+  it('reads an unparseable value as the default without throwing, leaving the rejection to createApp', async () => {
+    const canvasRowLimit = await rowLimitUnder('lots');
+    expect(canvasRowLimit()).toBe(10_000);
+    expect(() => parseConfig({ CANVAS_DEFAULT_ROW_LIMIT: 'lots' })).toThrow(
+      /CANVAS_DEFAULT_ROW_LIMIT/,
+    );
   });
 });

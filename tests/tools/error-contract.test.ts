@@ -71,12 +71,12 @@ describe('error-contract conformance', () => {
   describe('faostat_query_observations', () => {
     it('declares only reachable reasons (no dead unknown_domain / empty_result)', () => {
       expect(declaredReasons(queryObservationsTool.errors)).toEqual([
-        'canvas_disabled',
         'canvas_not_found',
         'conflicting_item_selectors',
         'domain_not_indexed',
         'index_not_ready',
         'invalid_year_range',
+        'pool_closed',
         'query_timeout',
       ]);
     });
@@ -114,6 +114,7 @@ describe('error-contract conformance', () => {
         'index_not_ready',
         'invalid_item_scope',
         'invalid_text_selector',
+        'pool_closed',
         'query_timeout',
         'unknown_domain',
       ]);
@@ -187,6 +188,7 @@ describe('faostat_commodity_profile production-domain availability (#37)', () =>
       'invalid_year_range',
       'missing_item',
       'no_match',
+      'pool_closed',
       'query_timeout',
     ]);
   });

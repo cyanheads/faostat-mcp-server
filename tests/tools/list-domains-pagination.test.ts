@@ -16,8 +16,10 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { type AnyToolDefinition, z } from '@cyanheads/mcp-ts-core';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { withStrictCountInputs } from '@/mcp-server/tools/count-input.js';
 import { listDomainsTool } from '@/mcp-server/tools/definitions/list-domains.tool.js';
 import { type FaostatMirror, initFaostatMirror } from '@/services/faostat-mirror/index.js';
 import type { ManifestDataset } from '@/services/faostat-mirror/types.js';
@@ -276,5 +278,93 @@ describe('faostat_list_domains bounded retrieval (#16)', () => {
     const text = wire.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
     expect(text).toContain('Local rows: 6 (synced ');
     expect(text).toContain('Index ready: yes');
+  });
+
+  describe('limit above the 200 cap (#56)', () => {
+    /** `count` synthetic domains, so a page at the cap can leave another page behind. */
+    function wideCatalog(count: number): ManifestDataset[] {
+      return Array.from({ length: count }, (_, i) => ({
+        DatasetCode: `D${String(i).padStart(4, '0')}`,
+        DatasetName: `Domain ${i}`,
+        DateUpdate: '2025-12-31T00:00:00',
+        FileLocation: `https://bulk.example.test/D${i}.zip`,
+      }));
+    }
+
+    /** The tool's result on both surfaces. */
+    async function wire(input: Record<string, unknown>) {
+      const result = await runToolContract(listDomainsTool, input);
+      expect(result.isError).not.toBe(true);
+      return {
+        structured: result.structuredContent as Record<string, unknown> & {
+          domains: { code: string }[];
+        },
+        text: result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n'),
+      };
+    }
+
+    it('serves limit 500 at 200 and names the next page on both surfaces', async () => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => Response.json(fixtureManifestResponse(wideCatalog(205)))),
+      );
+      const { structured, text } = await wire({ limit: 500 });
+      expect(structured.domains).toHaveLength(200);
+      const notice =
+        'limit 500 is above the 200 cap; returned up to 200. Showing domains 1–200 of 205. Call again with offset 200 to fetch the next page.';
+      expect(structured).toMatchObject({
+        requestedLimit: 500,
+        effectiveLimit: 200,
+        truncated: true,
+        nextOffset: 200,
+        notice,
+      });
+      expect(text).toContain('**200 domain(s):**');
+      expect(text).toContain('**requestedLimit:** 500');
+      expect(text).toContain('**effectiveLimit:** 200');
+      expect(text).toContain(`> ${notice}`);
+    });
+
+    it('names no next call when the capped page holds every match', async () => {
+      const { structured, text } = await wire({ limit: 500 });
+      expect(structured.domains).toHaveLength(CATALOG.length);
+      expect(structured).toMatchObject({ requestedLimit: 500, effectiveLimit: 200 });
+      expect(structured.notice).toBe('limit 500 is above the 200 cap; returned up to 200.');
+      expect(structured).not.toHaveProperty('nextOffset');
+      expect(text).toContain('> limit 500 is above the 200 cap; returned up to 200.');
+    });
+
+    it('carries no clamp fields or notice at the cap', async () => {
+      const { structured, text } = await wire({ limit: 200 });
+      expect(structured.domains).toHaveLength(CATALOG.length);
+      expect(structured).not.toHaveProperty('requestedLimit');
+      expect(structured).not.toHaveProperty('effectiveLimit');
+      expect(structured).not.toHaveProperty('notice');
+      expect(text).not.toContain('cap;');
+    });
+
+    it('reports no clamp on an exact-code lookup, which limit never binds', async () => {
+      const { structured } = await wire({ code: 'RL', limit: 500 });
+      expect(structured.domains.map((d) => d.code)).toEqual(['RL']);
+      expect(structured).not.toHaveProperty('requestedLimit');
+      expect(structured).not.toHaveProperty('notice');
+    });
+
+    it('advertises limit with no maximum, and with maximum 200 when registered strict', () => {
+      const limitOf = (definition: AnyToolDefinition) =>
+        z.toJSONSchema(definition.input, { io: 'input' }).properties?.limit;
+      expect(limitOf(listDomainsTool)).toEqual({
+        type: 'integer',
+        minimum: 1,
+        default: 20,
+        description: expect.stringContaining('at most 200 per call'),
+      });
+      expect(limitOf(withStrictCountInputs(listDomainsTool))).toMatchObject({
+        type: 'integer',
+        minimum: 1,
+        maximum: 200,
+        default: 20,
+      });
+    });
   });
 });

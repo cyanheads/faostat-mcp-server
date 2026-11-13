@@ -10,7 +10,8 @@
  *    cancellation cut off a read queued or running, a cut-off worker is retired
  *    and replaced under the four-thread cap, a crashed worker fails its read
  *    retryably, `invalidate()` makes a worker replan from rewritten statistics,
- *    and `close()` settles everything;
+ *    and `close()` settles everything with a `pool_closed` rejection that
+ *    `isPoolClosed()` tells apart from a job's own failure (#46);
  *  - statistics builds on the pool (#24): `analyze()` runs `ANALYZE` on a worker,
  *    a failing build keeps its worker, a second build waits while reads pass it,
  *    and `close()` settles queued and running builds;
@@ -52,7 +53,12 @@ import { resolveCodesTool } from '@/mcp-server/tools/definitions/resolve-codes.t
 import { setCanvas } from '@/services/canvas-accessor.js';
 import { OBSERVATION_TABLE_SCHEMA, stageObservations } from '@/services/canvas-staging.js';
 import { FaostatMirror, initFaostatMirror } from '@/services/faostat-mirror/faostat-mirror.js';
-import { type ReadJob, ReadPool, withQueryCeiling } from '@/services/faostat-mirror/read-pool.js';
+import {
+  isPoolClosed,
+  type ReadJob,
+  ReadPool,
+  withQueryCeiling,
+} from '@/services/faostat-mirror/read-pool.js';
 import {
   buildDomainZip,
   buildMidSizeDomainZip,
@@ -525,23 +531,25 @@ describe('ReadPool', () => {
     expect(await statRowCount(second)).toBeGreaterThan(0);
   }, 30_000);
 
-  it('close() rejects a queued build and retires the worker running one (#24)', async () => {
+  it('close() rejects a queued build and retires the worker running one (#24, #46)', async () => {
     const [first, second] = [await analyzable('close-a.db'), await analyzable('close-b.db')];
     const pool = track(new ReadPool());
     const holder = await openSqliteHandle(first);
     holder.exec('BEGIN IMMEDIATE');
     try {
       const builds = [pool.analyze(first, 't'), pool.analyze(second, 't')];
+      expect(pool.stats()).toMatchObject({ building: 1, queued: 1 });
       await pool.close();
       for (const outcome of await Promise.allSettled(builds)) {
         expect(outcome).toMatchObject({
           status: 'rejected',
-          reason: { code: JsonRpcErrorCode.ServiceUnavailable },
+          reason: { code: JsonRpcErrorCode.ServiceUnavailable, data: { reason: 'pool_closed' } },
         });
       }
       expect(pool.stats()).toMatchObject({ building: 0, queued: 0, retired: 1 });
       await expect(pool.analyze(second, 't')).rejects.toMatchObject({
         code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { reason: 'pool_closed' },
       });
     } finally {
       holder.exec('ROLLBACK');
@@ -549,7 +557,7 @@ describe('ReadPool', () => {
     }
   }, 30_000);
 
-  it('close() rejects queued and running reads, retires busy workers, ends idle ones, and refuses new reads', async () => {
+  it('close() rejects queued and running reads, retires busy workers, ends idle ones, and refuses new reads (#46)', async () => {
     const idle = track(new ReadPool());
     await Promise.all([idle.all(quick()), idle.all(quick())]);
     expect(idle.stats()).toMatchObject({ live: 2, threads: 2 });
@@ -565,14 +573,34 @@ describe('ReadPool', () => {
     for (const outcome of settled) {
       expect(outcome).toMatchObject({
         status: 'rejected',
-        reason: { code: JsonRpcErrorCode.ServiceUnavailable },
+        reason: { code: JsonRpcErrorCode.ServiceUnavailable, data: { reason: 'pool_closed' } },
       });
     }
     expect(busy.stats()).toMatchObject({ busy: 0, live: 0, queued: 0, retired: 2 });
     await expect(busy.all(quick())).rejects.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
       message: expect.stringMatching(/closed/),
+      data: { reason: 'pool_closed' },
     });
+  }, 30_000);
+
+  it("tells the pool's shutdown rejection apart from a job's own failure (#46)", async () => {
+    const pool = track(new ReadPool(CRASH_ENTRY));
+    const died = await pool.all({ file: spinFile, sql: 'crash', params: [] }).catch((e) => e);
+    const driver = await track(new ReadPool())
+      .analyze(spinFile, 'missing_table')
+      .catch((e) => e);
+    const cancelled = await pool.all(quick(), AbortSignal.abort()).catch((e) => e);
+    const timedOutRead = await pool.all(quick(), timedOut()).catch((e) => e);
+    await pool.close();
+    const closed = await pool.analyze(spinFile, 't').catch((e) => e);
+
+    expect(died).toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+    expect(closed).toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+    expect(
+      [died, driver, cancelled, timedOutRead, closed].map((error) => isPoolClosed(error)),
+    ).toEqual([false, false, false, false, true]);
+    expect(isPoolClosed(new Error('The mirror read pool is closed.'))).toBe(false);
   }, 30_000);
 });
 
@@ -625,6 +653,13 @@ describe('FaostatMirror reads on the pool', () => {
     [
       'element units (via resolve)',
       (m, s) => m.resolve(FIXTURE_DOMAIN, 'element', { itemCodes: [15], limit: 10, signal: s }),
+    ],
+    ['countObservations', (m, s) => m.countObservations(FIXTURE_DOMAIN, all, 10, s)],
+    ['itemElements', (m, s) => m.itemElements(FIXTURE_DOMAIN, [15], s)],
+    [
+      'elementUnits',
+      (m, s) =>
+        m.elementUnits(FIXTURE_DOMAIN, { ...all, itemCodes: [15], elementCodes: [5510] }, s),
     ],
   ];
 
@@ -761,6 +796,32 @@ describe('tool calls on the pool', () => {
     },
   );
 
+  it.each([
+    ['faostat_query_observations', queryObservationsTool, { domain: FIXTURE_DOMAIN }],
+    ['faostat_commodity_profile', commodityProfileTool, { item_query: 'wheat' }],
+    ['faostat_resolve_codes', resolveCodesTool, { domain: FIXTURE_DOMAIN, dimension: 'item' }],
+  ] as [string, AnyToolDefinition, Record<string, unknown>][])(
+    '%s fails with the declared, retryable pool_closed when shutdown has closed the read pool',
+    async (_name, tool, input) => {
+      await syncMirror(5);
+      // A call that reaches the mirror while the server shuts down finds the pool closed.
+      await (mirror as unknown as { reads: ReadPool }).reads.close();
+      const { error, text } = failure(await runToolContract(tool, input));
+      const recovery = 'Retry once the server is back up; this call did not complete.';
+      expect(tool.errors?.find((e) => e.reason === 'pool_closed')).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        retryable: true,
+        recovery,
+      });
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { reason: 'pool_closed', retryable: true, recovery: { hint: recovery } },
+      });
+      expect(text).toContain(recovery);
+      expect(text).toContain('pool_closed');
+    },
+  );
+
   it("answers a domain's first data read without spending its ceiling on the statistics build (#24)", async () => {
     // A domain without `sqlite_stat1` (synced before statistics shipped, or whose
     // last build failed), in a fresh process. Its first data read used to run
@@ -820,9 +881,10 @@ describe('tool calls on the pool', () => {
         if (++reads === cancelOnRead) controller.abort();
         return pending;
       });
+      // 120 rows overflow a 50-row page, so the first page stages and the stream is read second.
       const wire = await runToolContract(
         queryObservationsTool,
-        { domain: FIXTURE_DOMAIN },
+        { domain: FIXTURE_DOMAIN, limit: 50 },
         { context: { tenantId: 'off-thread-cancel', signal: controller.signal } },
       );
       expect(reads).toBe(cancelOnRead);
@@ -841,7 +903,7 @@ describe('tool calls on the pool', () => {
     const { error, text } = failure(
       await runToolContract(
         queryObservationsTool,
-        { domain: FIXTURE_DOMAIN },
+        { domain: FIXTURE_DOMAIN, limit: 50 },
         { context: { tenantId: 'off-thread-stream-timeout' } },
       ),
     );

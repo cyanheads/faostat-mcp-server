@@ -3,21 +3,27 @@
  * real domain sync into a temp SQLite mirror, then exercises the read path:
  * dimension code resolution (FTS + country/aggregate classification) and
  * observation queries (aggregate exclusion default, year range, code filters,
- * streaming). Fully offline — `fetch` is stubbed to return the fixture ZIP.
+ * streaming). Fully offline — `fetch` is stubbed to return the fixture ZIP. A
+ * second suite runs two instances over one store directory: a sync refused by the
+ * other's lease must leave that sync's rows, state, and revision as they were.
  * @module tests/services/faostat-mirror
  */
 
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryObservationsTool } from '@/mcp-server/tools/definitions/query-observations.tool.js';
 import { resolveCodesTool } from '@/mcp-server/tools/definitions/resolve-codes.tool.js';
-import { type FaostatMirror, initFaostatMirror } from '@/services/faostat-mirror/faostat-mirror.js';
+import { FaostatMirror, initFaostatMirror } from '@/services/faostat-mirror/faostat-mirror.js';
 import {
   buildDomainZip,
+  buildExplicitDomainZip,
+  buildMidSizeDomainZip,
   chunkedResponse,
+  type ExplicitObservation,
   FIXTURE_DOMAIN,
   fixtureDataset,
 } from '../fixtures/synthetic-domain.js';
@@ -376,5 +382,341 @@ describe('FaostatMirror end-to-end', () => {
     // DateUpdate equals the stored checkpoint → no re-stream, no fetch.
     expect(result.recordsApplied).toBe(0);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+/** A promise and its resolve — paces a sync without timers. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: () => void = () => {};
+  const promise = new Promise<void>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+/** `bytes` as a response body that delivers every byte, then stays open until `gate` resolves. */
+function heldOpen(bytes: Uint8Array, gate: Promise<void>): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+    },
+    async pull(controller) {
+      await gate;
+      controller.close();
+    },
+  });
+  return new Response(body, { status: 200 });
+}
+
+describe('FaostatMirror sync while another instance holds the lease', () => {
+  let dir: string;
+  const opened: FaostatMirror[] = [];
+  /** Keeps the holder's ZIP body open after its last byte until resolved. */
+  let zipGate: ReturnType<typeof deferred>;
+
+  function openMirror(domain: string): FaostatMirror {
+    const mirror = new FaostatMirror({ dir, domains: [domain] });
+    opened.push(mirror);
+    return mirror;
+  }
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'faostat-lease-'));
+    zipGate = deferred();
+  });
+
+  afterEach(async () => {
+    zipGate.resolve();
+    for (const mirror of opened.splice(0)) await mirror.close();
+    vi.unstubAllGlobals();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("refuses the second sync without touching the holder's committed rows, sync state, or revision", async () => {
+    // A fresh FS store has no ingest revision until its first sync completes, so a
+    // sync of it replaces the whole cube — the step a refused sync must never run.
+    const DOMAIN = 'FS';
+    const TABLE = `obs_${DOMAIN}`;
+    // 6,000 rows: one 5,000-row page commits, the rest wait on the held body.
+    const { zip, total } = buildMidSizeDomainZip({ domain: DOMAIN, countryCount: 600, years: 10 });
+    const fetcher = vi.fn(async () => heldOpen(zip, zipGate.promise));
+    vi.stubGlobal('fetch', fetcher);
+    const holder = openMirror(DOMAIN);
+    const committed = deferred();
+    const holding = holder.runDomainSync(DOMAIN, 'init', {
+      signal: new AbortController().signal,
+      dataset: fixtureDataset(DOMAIN),
+      onProgress: ({ records }) => {
+        if (records > 0) committed.resolve();
+      },
+    });
+    await committed.promise;
+
+    const handle = await holder.getMirror(DOMAIN)!.raw();
+    const storeState = () => ({
+      rows: handle.prepare<{ n: number }>(`SELECT count(*) AS n FROM ${TABLE}`).get()?.n,
+      syncState: handle.prepare('SELECT * FROM mirror_sync_state').all(),
+      revision: handle.prepare('SELECT revision FROM ingest_revision').all(),
+    });
+    const before = storeState();
+    expect(before).toMatchObject({ rows: 5000, revision: [] });
+
+    await expect(
+      openMirror(DOMAIN).runDomainSync(DOMAIN, 'refresh', {
+        signal: new AbortController().signal,
+        dataset: fixtureDataset(DOMAIN),
+      }),
+    ).rejects.toMatchObject({ code: JsonRpcErrorCode.Conflict, data: { reason: 'sync_locked' } });
+    expect(storeState()).toEqual(before);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    zipGate.resolve();
+    expect(await holding).toMatchObject({ recordsApplied: total, total });
+    expect(storeState()).toMatchObject({ rows: total, revision: [{ revision: 2 }] });
+    expect(await holder.ready(DOMAIN)).toBe(true);
+  }, 30_000);
+
+  it('refuses a sync of a revision-1 store without indexing it or raising its revision, and prepares it once the lease is free', async () => {
+    const TABLE = `obs_${FIXTURE_DOMAIN}`;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => chunkedResponse(buildDomainZip(), 64)),
+    );
+    const mirror = openMirror(FIXTURE_DOMAIN);
+    const sync = (mode: 'init' | 'refresh') =>
+      mirror.runDomainSync(FIXTURE_DOMAIN, mode, {
+        signal: new AbortController().signal,
+        dataset: fixtureDataset(),
+      });
+    await sync('init');
+    const handle = await mirror.getMirror(FIXTURE_DOMAIN)!.raw();
+    // A compatible numeric cube from before text identities: revision 1, without their indexes.
+    const textEraIndexes = [
+      'item_code_text_idx',
+      'item_code_text_element_code_year_idx',
+      'source_code_idx',
+      'unit_element_idx',
+    ].map((suffix) => `${TABLE}_${suffix}`);
+    for (const index of textEraIndexes) handle.exec(`DROP INDEX ${index}`);
+    handle.exec('UPDATE ingest_revision SET revision = 1');
+    // Another process holds the store's sync lease, with an expiry no clock reaches.
+    handle
+      .prepare(
+        'UPDATE mirror_sync_lease SET owner = ?, generation = generation + 1, expires_at = ? WHERE id = 1',
+      )
+      .run('another-process', Number.MAX_SAFE_INTEGER);
+    const storeState = () => ({
+      indexes: handle
+        .prepare<{ name: string }>(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ? ORDER BY name",
+        )
+        .all(TABLE)
+        .map((row) => row.name),
+      syncState: handle.prepare('SELECT * FROM mirror_sync_state').all(),
+      revision: handle.prepare('SELECT revision FROM ingest_revision').all(),
+    });
+    const before = storeState();
+
+    await expect(sync('refresh')).rejects.toMatchObject({
+      code: JsonRpcErrorCode.Conflict,
+      data: { reason: 'sync_locked' },
+    });
+    expect(storeState()).toEqual(before);
+
+    handle.exec('UPDATE mirror_sync_lease SET owner = NULL, expires_at = NULL WHERE id = 1');
+    expect((await sync('refresh')).recordsApplied).toBe(0);
+    expect(storeState().revision).toEqual([{ revision: 2 }]);
+    expect(storeState().indexes).toEqual(expect.arrayContaining(textEraIndexes));
+  }, 30_000);
+
+  it('publishes a first sync’s revision before releasing the lease, so a claim right after replaces nothing', async () => {
+    const DOMAIN = 'FS';
+    const { zip, total } = buildMidSizeDomainZip({ domain: DOMAIN, countryCount: 60, years: 2 });
+    const fetcher = vi.fn(async () => chunkedResponse(zip, 1 << 16));
+    vi.stubGlobal('fetch', fetcher);
+    const first = openMirror(DOMAIN);
+    const next = openMirror(DOMAIN);
+    const domain = first.getMirror(DOMAIN)!;
+    const handle = await domain.raw();
+    const leases = domain.store.syncLease!;
+    const release = leases.release.bind(leases);
+    let revisionAtRelease: unknown;
+    let nextSync: Promise<unknown> | undefined;
+    // The runner releases the lease after its completion commit; the other instance claims at once.
+    vi.spyOn(leases, 'release').mockImplementation(async (lease) => {
+      revisionAtRelease = handle.prepare('SELECT revision FROM ingest_revision').all();
+      await release(lease);
+      nextSync = next.runDomainSync(DOMAIN, 'refresh', {
+        signal: new AbortController().signal,
+        dataset: fixtureDataset(DOMAIN),
+      });
+      await nextSync;
+    });
+
+    const synced = await first.runDomainSync(DOMAIN, 'init', {
+      signal: new AbortController().signal,
+      dataset: fixtureDataset(DOMAIN),
+    });
+    expect(synced).toMatchObject({ recordsApplied: total, total });
+    expect(await nextSync).toMatchObject({ recordsApplied: 0, total });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(revisionAtRelease).toEqual([{ revision: 2 }]);
+  }, 30_000);
+
+  it('leaves the revision unpublished when a first sync is stopped after its last page, before it completes', async () => {
+    const DOMAIN = 'FS';
+    const { zip } = buildMidSizeDomainZip({ domain: DOMAIN, countryCount: 60, years: 2 });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => chunkedResponse(zip, 1 << 16)),
+    );
+    const mirror = openMirror(DOMAIN);
+    const controller = new AbortController();
+    const stopped = new Error('Stopped for shutdown');
+
+    await expect(
+      mirror.runDomainSync(DOMAIN, 'init', {
+        signal: controller.signal,
+        dataset: fixtureDataset(DOMAIN),
+        // Only the terminal page carries the checkpoint; it has committed when this runs.
+        onProgress: ({ checkpoint }) => {
+          if (checkpoint) controller.abort(stopped);
+        },
+      }),
+    ).rejects.toBe(stopped);
+    const handle = await mirror.getMirror(DOMAIN)!.raw();
+    expect(handle.prepare('SELECT revision FROM ingest_revision').all()).toEqual([]);
+    expect(await mirror.status(DOMAIN)).toMatchObject({ status: 'error', ready: false });
+  }, 30_000);
+});
+
+/**
+ * The profile's item-scoped reads (#51, #50): the element codes an item carries
+ * (its selection read), the units a ranking's own rows use, and each ranked row's
+ * lag behind the ranking's latest year.
+ */
+describe('FaostatMirror profile reads (#50, #51)', () => {
+  let dir: string;
+  let mirror: FaostatMirror;
+
+  const STOCKS = { itemCode: 866, item: 'Cattle', elementCode: 5111, element: 'Stocks' } as const;
+  const ROWS: ExplicitObservation[] = [
+    { areaCode: 10, area: 'Alpha', ...STOCKS, unit: 'An', year: 2021, value: 100 },
+    { areaCode: 20, area: 'Bravo', ...STOCKS, unit: '', year: 2022, value: 1 },
+    { areaCode: 5000, area: 'World', ...STOCKS, unit: 'No', year: 2024, value: 9 },
+    { areaCode: 30, area: 'Charlie', ...STOCKS, unit: 'An', year: 2019, value: 50 },
+    {
+      areaCode: 10,
+      area: 'Alpha',
+      itemCode: 15,
+      item: 'Wheat',
+      elementCode: 5510,
+      element: 'Production',
+      year: 2022,
+      value: 5,
+    },
+    {
+      areaCode: 10,
+      area: 'Alpha',
+      itemCode: 15,
+      item: 'Wheat',
+      elementCode: 5312,
+      element: 'Area harvested',
+      unit: 'ha',
+      year: 2022,
+      value: 2,
+    },
+  ];
+  const stocks = { itemCodes: [866], elementCodes: [5111], includeAggregates: false };
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'faostat-mirror-profile-'));
+    const zip = buildExplicitDomainZip(ROWS);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => chunkedResponse(zip, 1 << 16)),
+    );
+    mirror = new FaostatMirror({ dir, domains: [FIXTURE_DOMAIN] });
+    await mirror.runDomainSync(FIXTURE_DOMAIN, 'init', {
+      signal: new AbortController().signal,
+      dataset: fixtureDataset(),
+    });
+  });
+
+  afterEach(async () => {
+    await mirror.close();
+    vi.unstubAllGlobals();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('lists the elements an item carries, labeled from the vocabulary, and none for an absent item', async () => {
+    expect(await mirror.itemElements(FIXTURE_DOMAIN, [15])).toEqual([
+      { element_code: 5312, element: 'Area harvested' },
+      { element_code: 5510, element: 'Production' },
+    ]);
+    expect(await mirror.itemElements(FIXTURE_DOMAIN, [866])).toEqual([
+      { element_code: 5111, element: 'Stocks' },
+    ]);
+    expect(await mirror.itemElements(FIXTURE_DOMAIN, [999])).toEqual([]);
+  });
+
+  it('reads the units of the rows a ranking matches: countries only, within the year bounds', async () => {
+    // A blank unit is its own (null) unit; the World aggregate's unit is excluded.
+    expect(await mirror.elementUnits(FIXTURE_DOMAIN, stocks)).toEqual([
+      { element_code: 5111, unit: null },
+      { element_code: 5111, unit: 'An' },
+    ]);
+    expect(await mirror.elementUnits(FIXTURE_DOMAIN, { ...stocks, yearStart: 2022 })).toEqual([
+      { element_code: 5111, unit: null },
+    ]);
+    expect(
+      await mirror.elementUnits(FIXTURE_DOMAIN, { ...stocks, includeAggregates: true }),
+    ).toEqual([
+      { element_code: 5111, unit: null },
+      { element_code: 5111, unit: 'An' },
+      { element_code: 5111, unit: 'No' },
+    ]);
+    expect(await mirror.elementUnits(FIXTURE_DOMAIN, { ...stocks, yearStart: 2030 })).toEqual([]);
+  });
+
+  it('measures every ranked row against the ranking’s latest year, beyond the rows the limit returns', async () => {
+    // Alpha (An, 2021) outranks Bravo (null unit, 2022); the reference is Bravo's
+    // 2022 even though top_n 1 returns Alpha alone, and the two units share it.
+    expect(await mirror.rankAreaTotals(FIXTURE_DOMAIN, stocks, 1)).toEqual([
+      expect.objectContaining({ area_code: 10, unit: 'An', year: 2021, years_behind: 1 }),
+    ]);
+    expect(
+      (await mirror.rankAreaTotals(FIXTURE_DOMAIN, stocks, 10)).map((r) => [
+        r.area_code,
+        r.year,
+        r.years_behind,
+      ]),
+    ).toEqual([
+      [10, 2021, 1],
+      [30, 2019, 3],
+      [20, 2022, 0],
+    ]);
+    // The reference follows the filters: aggregates in, the World's 2024 sets it.
+    expect(
+      (await mirror.rankAreaTotals(FIXTURE_DOMAIN, { ...stocks, includeAggregates: true }, 10)).map(
+        (r) => [r.area_code, r.years_behind],
+      ),
+    ).toEqual([
+      [10, 3],
+      [30, 5],
+      [5000, 0],
+      [20, 2],
+    ]);
+    // And the year bounds: with year_end 2021, Alpha is current.
+    expect(
+      (await mirror.rankAreaTotals(FIXTURE_DOMAIN, { ...stocks, yearEnd: 2021 }, 10)).map((r) => [
+        r.area_code,
+        r.year,
+        r.years_behind,
+      ]),
+    ).toEqual([
+      [10, 2021, 0],
+      [30, 2019, 2],
+    ]);
   });
 });

@@ -5,11 +5,13 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { type AnyToolDefinition, z } from '@cyanheads/mcp-ts-core';
 import { createCanvasService } from '@cyanheads/mcp-ts-core/canvas';
 import { parseConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { withStrictCountInputs } from '@/mcp-server/tools/count-input.js';
 import { commodityProfileTool } from '@/mcp-server/tools/definitions/commodity-profile.tool.js';
 import { setCanvas } from '@/services/canvas-accessor.js';
 import { DimensionsStore } from '@/services/faostat-mirror/dimensions-store.js';
@@ -109,7 +111,8 @@ describe('single-item selection (#41)', () => {
       production_trend: [],
       trend_points: 0,
     });
-    expect(text(wire)).toContain('### Top producers\n_None._');
+    // The heading still names the element; no row in the bounds gives it a unit.
+    expect(text(wire)).toContain('### Top producers — Production 5510\n_None._');
   });
 
   it('returns bounded ambiguity candidates and executable recovery on both surfaces', async () => {
@@ -151,13 +154,76 @@ describe('single-item selection (#41)', () => {
     const wire = await call({});
     expect(wire.structuredContent).toMatchObject({ error: { data: { reason: 'missing_item' } } });
     expect(text(wire)).toContain('Supply item_code or item_query');
-    for (const input of [
-      { item_code: 0 },
-      { item_code: 1.5 },
-      { item_query: '' },
-      { item_code: 100, top_n: 51 },
-    ])
+    for (const input of [{ item_code: 0 }, { item_code: 1.5 }, { item_query: '' }])
       expect(commodityProfileTool.input.safeParse(input).success).toBe(false);
+  });
+
+  it('serves a top_n above its cap at 50 rows per ranking, with the clamp on both surfaces (#56)', async () => {
+    // 60 countries in every ranking, so each one has more rows than the cap.
+    const production = Array.from({ length: 60 }, (_, i) => ({
+      areaCode: i + 1,
+      area: `Country ${i + 1}`,
+      itemCode: 100,
+      item: 'Milk variant 0',
+      elementCode: 5510,
+      element: 'Production',
+      year: 2022,
+      value: i + 1,
+    }));
+    const trade = production.flatMap((row) => [
+      { ...row, elementCode: 5910, element: 'Export quantity' },
+      { ...row, elementCode: 5610, element: 'Import quantity' },
+    ]);
+    const zips = {
+      QCL: buildExplicitDomainZip(production),
+      TCL: buildExplicitDomainZip(trade, 'TCL'),
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string | URL) =>
+        chunkedResponse(String(url).includes('_TCL_') ? zips.TCL : zips.QCL, 1 << 16),
+      ),
+    );
+    for (const domain of ['QCL', 'TCL'])
+      await mirror.runDomainSync(domain, 'refresh', {
+        signal: new AbortController().signal,
+        dataset: { ...fixtureDataset(domain), DateUpdate: '2026-01-01T00:00:00' },
+      });
+
+    const clamped = await call({ item_code: 100, top_n: 80 });
+    expect(clamped.isError).toBeFalsy();
+    const structured = clamped.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({ requestedTopN: 80, effectiveTopN: 50 });
+    expect(structured.notice).toMatch(/^top_n 80 is above the 50 cap; returned up to 50\. /);
+    for (const ranking of ['top_producers', 'top_exporters', 'top_importers'])
+      expect(structured[ranking]).toHaveLength(50);
+    expect(text(clamped)).toContain('**requestedTopN:** 80');
+    expect(text(clamped)).toContain(`> ${structured.notice}`);
+
+    const atCap = await call({ item_code: 100, top_n: 50 });
+    const unclamped = atCap.structuredContent as Record<string, unknown>;
+    expect(unclamped).not.toHaveProperty('requestedTopN');
+    expect(unclamped).not.toHaveProperty('effectiveTopN');
+    expect(unclamped.notice).not.toMatch(/above the 50 cap/);
+    expect(unclamped.top_producers).toHaveLength(50);
+  });
+
+  it('advertises top_n without a maximum, and with it in strict mode (#56)', () => {
+    const props = (d: AnyToolDefinition) =>
+      (z.toJSONSchema(d.input, { io: 'input' }) as { properties: Record<string, unknown> })
+        .properties;
+    expect(props(commodityProfileTool).top_n).toEqual({
+      type: 'integer',
+      minimum: 1,
+      default: 10,
+      description: expect.stringContaining('at most 50 per call'),
+    });
+    expect(props(withStrictCountInputs(commodityProfileTool)).top_n).toMatchObject({
+      type: 'integer',
+      minimum: 1,
+      maximum: 50,
+      default: 10,
+    });
   });
 
   it('keeps exact resolution scoped and paged before slicing, including past-end', async () => {

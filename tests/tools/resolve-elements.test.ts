@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { withStrictCountInputs } from '@/mcp-server/tools/count-input.js';
 import { queryObservationsTool } from '@/mcp-server/tools/definitions/query-observations.tool.js';
 import { resolveCodesTool } from '@/mcp-server/tools/definitions/resolve-codes.tool.js';
 import { type FaostatMirror, initFaostatMirror } from '@/services/faostat-mirror/faostat-mirror.js';
@@ -192,7 +193,10 @@ it('exposes scoped units, cap pagination, and past-end guidance on both surfaces
   const past = await runToolContract(resolveCodesTool, { ...args, offset: 2 });
   expect(past.structuredContent).toMatchObject({ matches: [], totalMatches: 2, truncated: false });
   expect(JSON.stringify(past.content)).toContain('Offset 2');
-  expect(resolveCodesTool.input.safeParse({ ...args, limit: 201 }).success).toBe(false);
+  // Served at the 200 cap by default; the FAOSTAT_CLAMP_LIMITS=false registration rejects it.
+  expect(
+    withStrictCountInputs(resolveCodesTool).input.safeParse({ ...args, limit: 201 }).success,
+  ).toBe(false);
   expect(resolveCodesTool.input.safeParse({ ...args, offset: -1 }).success).toBe(false);
 });
 

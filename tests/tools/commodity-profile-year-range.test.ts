@@ -97,4 +97,20 @@ describe('faostat_commodity_profile year-range validation (#17)', () => {
     expect(profileEntry?.code).toBe(siblingEntry?.code);
     expect(profileEntry?.recovery).toBe(siblingEntry?.recovery);
   });
+
+  it('describes the year bounds as bounding the rankings, not only the trend', () => {
+    // The lag notice points callers at year_start to drop lagging ranking rows (#50).
+    const { year_start, year_end } = commodityProfileTool.input.shape;
+    for (const field of [year_start, year_end]) expect(field.description).toMatch(/rankings/);
+  });
+
+  it('offers the year bounds, and not item_query, to shorten a profile that timed out (#59)', () => {
+    // One resolved item is read whatever item_query says; the year bounds do cut the rows read.
+    const recovery = commodityProfileTool.errors?.find(
+      (e) => e.reason === 'query_timeout',
+    )?.recovery;
+    expect(recovery).toBe(
+      'Retry shortly, or bound the profile with year_start/year_end so it reads fewer rows (the rankings then cover only that window); the 45-second ceiling includes time this call spent queued behind other mirror reads.',
+    );
+  });
 });

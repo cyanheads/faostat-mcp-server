@@ -121,6 +121,12 @@ export interface AreaAggregateRow {
   value: number;
   /** The latest year this `(area, unit)` group has data in — computed per group. */
   year: number;
+  /**
+   * The ranking's latest year minus {@link year}: 0 when current. The ranking's
+   * latest year is the newest `year` over every row the ranking matched, across all
+   * areas and units, not only the rows returned (#50).
+   */
+  years_behind: number;
 }
 
 /**

@@ -57,6 +57,13 @@
           "default": "false"
         },
         {
+          "name": "FAOSTAT_CLAMP_LIMITS",
+          "description": "A count input (limit, top_n, row_limit) above its cap is served at the cap with a notice. Set to 'false' to advertise each cap as a schema maximum and reject a larger value instead.",
+          "format": "boolean",
+          "isRequired": false,
+          "default": "true"
+        },
+        {
           "name": "MCP_LOG_LEVEL",
           "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
           "format": "string",
@@ -149,6 +156,13 @@
           "format": "boolean",
           "isRequired": false,
           "default": "false"
+        },
+        {
+          "name": "FAOSTAT_CLAMP_LIMITS",
+          "description": "A count input (limit, top_n, row_limit) above its cap is served at the cap with a notice. Set to 'false' to advertise each cap as a schema maximum and reject a larger value instead.",
+          "format": "boolean",
+          "isRequired": false,
+          "default": "true"
         },
         {
           "name": "MCP_LOG_LEVEL",

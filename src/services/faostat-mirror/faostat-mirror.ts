@@ -7,8 +7,9 @@
  * and code resolution. The cube reads build their SQL here and run it on the
  * {@link ReadPool} worker threads (#3), under the signal a tool call takes from
  * {@link FaostatMirror.readSignal}. Owns each cube's query-planner statistics,
- * built on the same pool (#24): in the background when a data read finds none,
- * and after a sync that applied rows or finds none. The init/refresh runners drive
+ * built on the same pool (#24): in the background when a data read finds them
+ * missing or not covering an index, and after a sync that applied rows or finds
+ * the same. The init/refresh runners drive
  * the bulk-ZIP ingesters.
  * @module services/faostat-mirror/faostat-mirror
  */
@@ -19,7 +20,9 @@ import {
   defineMirror,
   type Mirror,
   type MirrorLogger,
+  type MirrorStore,
   type SqliteHandle,
+  type SqliteMirrorStoreSpec,
   type SqlValue,
   type SyncGenerator,
   type SyncMode,
@@ -31,7 +34,7 @@ import { getServerConfig } from '@/config/server-config.js';
 import { DimensionsStore } from './dimensions-store.js';
 import { makeDomainSync } from './ingester.js';
 import { fetchManifest, findDataset } from './manifest.js';
-import { QUERY_CEILING_MS, ReadPool, withQueryCeiling } from './read-pool.js';
+import { isPoolClosed, QUERY_CEILING_MS, ReadPool, withQueryCeiling } from './read-pool.js';
 import type {
   AreaAggregateRow,
   DimensionKind,
@@ -106,6 +109,38 @@ function createObservationIndexes(handle: SqliteHandle, table: string): void {
 function ingestRevision(handle: SqliteHandle): number | undefined {
   return handle.prepare<{ revision: number }>('SELECT revision FROM ingest_revision').get()
     ?.revision;
+}
+
+/**
+ * A domain's SQLite store that publishes ingest revision 2 as a sync's completion
+ * commits through its sync lease, before the runner releases the lease. A process
+ * that claims the lease next never finds a completed sync without its revision, the
+ * state that reads as a store still owing its replacement. A run that fails, stops,
+ * or loses its lease commits no completion, so it publishes nothing. The two writes
+ * are not one transaction: a process killed between them leaves a completed store
+ * without a revision, which its next sync replaces.
+ */
+function revisionPublishingStore(spec: SqliteMirrorStoreSpec): MirrorStore {
+  const store = sqliteMirrorStore(spec);
+  const { syncLease } = store;
+  if (!syncLease) throw new Error(`The mirror store for ${spec.table} provides no sync lease.`);
+  return {
+    ...store,
+    syncLease: {
+      ...syncLease,
+      async commit(lease, state, records, tombstones) {
+        const held = await syncLease.commit(lease, state, records, tombstones);
+        if (held && state.status === 'complete') {
+          const handle = await store.raw();
+          handle.transaction(() => {
+            handle.exec('DELETE FROM ingest_revision');
+            handle.exec('INSERT INTO ingest_revision(revision) VALUES (2)');
+          });
+        }
+        return held;
+      },
+    },
+  };
 }
 
 /**
@@ -239,6 +274,12 @@ export type ObservationRead =
  *   sorts only the matched rows, which the item codes already bound. Under a plain
  *   `year` and a large `LIMIT` it walked the whole element slice in year order
  *   instead, testing `item_code` per row — 1.6M rows for 27,893 on QCL.
+ *
+ * `rowid` breaks ties within a year, so the order is total and the same under
+ * every index the planner can pick for one filter: a page walk whose plan changes
+ * between calls (statistics rebuilt mid-walk) neither repeats nor skips a row
+ * (#52). It changes no plan — `rowid` is the implicit suffix of every index, so an
+ * index that served `year` serves `year, rowid`, and a sort sorts on one more key.
  */
 export function buildObservationSql(
   code: string,
@@ -248,7 +289,7 @@ export function buildObservationSql(
   const { whereSql, params } = buildObservationWhere(filters);
   const columns = read.kind === 'stream' ? STREAM_COLUMNS : '*';
   const orderBy = filters.itemCodes?.length || filters.itemCodesText?.length ? '+year' : 'year';
-  const sql = `SELECT ${columns} FROM ${cubeTable(code)} ${whereSql} ORDER BY ${orderBy} ASC LIMIT ?`;
+  const sql = `SELECT ${columns} FROM ${cubeTable(code)} ${whereSql} ORDER BY ${orderBy} ASC, rowid ASC LIMIT ?`;
   return read.kind === 'page'
     ? { sql: `${sql} OFFSET ?`, params: [...params, read.limit, read.offset] }
     : { sql, params: [...params, read.limit] };
@@ -326,7 +367,7 @@ export class FaostatMirror {
     const ingesters = this.ingesters;
     return defineMirror({
       name: `faostat-${upper}`,
-      store: sqliteMirrorStore({
+      store: revisionPublishingStore({
         path: this.domainFile(upper),
         table: cubeTable(upper),
         primaryKey: 'id',
@@ -465,11 +506,13 @@ export class FaostatMirror {
    * ~5ms. ANALYZE is what makes the composite indexes declared above actually get
    * chosen (#3).
    *
-   * The `sqlite_stat1` probe is the guard: statistics persist inside the `.db`
-   * file, so an already-analyzed mirror with its area/year index (the steady state)
-   * pays one sub-millisecond lookup per domain per process. A domain without them —
-   * synced before statistics shipped and unchanged upstream since, or whose last
-   * build failed — gets one background build on the read pool
+   * The `sqlite_stat1` probe is the guard ({@link hasStatistics}): statistics
+   * persist inside the `.db` file, so an already-analyzed mirror with its area/year
+   * index (the steady state) pays one sub-millisecond lookup per domain per process.
+   * A domain without them, or with an index they do not cover — synced before
+   * statistics shipped and unchanged upstream since, given a new index by a refresh
+   * that applied no rows, or whose last build failed — gets one background build on
+   * the read pool
    * ({@link buildStatistics}), and this read goes ahead on the plan it has (#24).
    * The build costs seconds on QCL (4.2M rows) and over a minute on TCL (17.1M), so
    * waiting for it would stall the caller past its `query_timeout`. A sampled
@@ -518,16 +561,33 @@ export class FaostatMirror {
     }
   }
 
-  /** True when planner statistics include the worker-installed area/year index. */
+  /**
+   * True when planner statistics cover the cube's indexes: the worker-installed
+   * area/year index has a `sqlite_stat1` row, so it exists and was analyzed, and so
+   * does every other full index. A refresh that adds an index to an unchanged
+   * upstream applies no rows, so this check is what finds that index unanalyzed —
+   * the state that sent rankings down a per-country walk of the unit/element index
+   * (#59). Partial indexes are left out: an empty one gets a `0 0` row on the
+   * SQLite builds measured, but a partial index fills only through a sync that
+   * applies rows, and that sync builds. A full index over an empty table never gets
+   * a row, so an empty cube stays uncovered after a build that succeeded; the
+   * success memo, not this check, keeps it from building on every read.
+   */
   private hasStatistics(handle: SqliteHandle, table: string): boolean {
     const statTable = handle
       .prepare(`SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'`)
       .get();
     if (!statTable) return false;
-    const stat = handle
-      .prepare(`SELECT 1 AS ok FROM sqlite_stat1 WHERE tbl = ? AND idx = ? LIMIT 1`)
-      .get(table, `${table}_area_code_year_idx`);
-    return Boolean(stat);
+    const covered = handle
+      .prepare<{ ok: number }>(
+        `SELECT EXISTS (SELECT 1 FROM sqlite_stat1 WHERE tbl = ? AND idx = ?)
+                AND NOT EXISTS (SELECT 1 FROM pragma_index_list(?) AS i
+                                 WHERE i.partial = 0
+                                   AND NOT EXISTS (SELECT 1 FROM sqlite_stat1 AS s
+                                                    WHERE s.tbl = ? AND s.idx = i.name)) AS ok`,
+      )
+      .get(table, `${table}_area_code_year_idx`, table, table);
+    return covered?.ok === 1;
   }
 
   /**
@@ -535,8 +595,10 @@ export class FaostatMirror {
    * read-write handle, so the main thread keeps serving for the whole run — then
    * log and memoize the outcome ({@link recordAnalyzeOutcome}). Single flight: while
    * a build of the domain is in flight, a second call joins it. The returned promise
-   * never rejects, since a failure is recorded, not thrown. It bypasses the read-path
-   * memo and budget, which {@link ensureQueryStatistics} applies before calling.
+   * never rejects, since a failure is recorded, not thrown. A build the pool's
+   * shutdown ends, queued, running, or asked of a closed pool, is neither logged nor
+   * recorded (#46). It bypasses the read-path memo and budget, which
+   * {@link ensureQueryStatistics} applies before calling.
    */
   private buildStatistics(code: string): Promise<void> {
     const inFlight = this.builds.get(code);
@@ -550,6 +612,8 @@ export class FaostatMirror {
       },
       (err: unknown) => {
         this.builds.delete(code);
+        // Shutdown says nothing about the planner: no warning, no attempt spent.
+        if (isPoolClosed(err)) return;
         this.log?.warning?.(
           `Could not ANALYZE ${table} — queries fall back to the planner's uninformed index choice`,
           { error: err instanceof Error ? err.message : String(err) },
@@ -562,14 +626,14 @@ export class FaostatMirror {
   }
 
   /**
-   * Query observations from a domain's mirror with structured filters, year
-   * range, and aggregate exclusion. Rather than a per-call unbounded `COUNT(*)`,
-   * it fetches one row past `limit` — an overflow probe — so the caller can decide
-   * inline-vs-spill without scanning the whole cube. `totalIsExact` is true when
-   * the probe drained under `limit` (then `total` is the exact match count) and
-   * false when it overflowed (then `total` is `limit`, a floor: more rows exist,
-   * and the caller either spills — where the stream yields the exact count when it
-   * drains under the staging cap — or discloses the figure as a lower bound).
+   * Query one page of observations — `limit` rows from `offset`, in the total
+   * order {@link buildObservationSql} sets — with structured filters, year range,
+   * and aggregate exclusion. It fetches one row past `limit` — an overflow probe —
+   * so the caller learns whether rows remain past the page without counting the
+   * match. `totalIsExact` is true when the probe drained under `limit` (no row
+   * follows the page, so `offset` + `total` is the exact match count) and false
+   * when it overflowed (then `total` is `limit`: more rows exist, and the caller
+   * stages them, counts them with {@link countObservations}, or pages on).
    * Assumes the domain is selected and ready (callers gate first).
    *
    * Every cube read runs on {@link reads} and takes the call's
@@ -593,6 +657,36 @@ export class FaostatMirror {
     const totalIsExact = probe.length <= q.limit;
     const rows = totalIsExact ? probe : probe.slice(0, q.limit);
     return { rows, total: rows.length, totalIsExact };
+  }
+
+  /**
+   * Count the observations {@link queryObservations} matches, reading at most
+   * `cap + 1` of them: a result of `cap` or less is the exact count, and `cap + 1`
+   * means more than `cap` matched. The bound keeps the cost at `cap + 1` rows
+   * whatever the match: an exact `COUNT(*)` reads all of it — 1.2M rows and
+   * seconds for one element of QCL, several times that on TCL. The match is read
+   * unordered, so the planner picks the cheapest index for the filters. Runs on
+   * {@link reads} under the call's {@link readSignal}.
+   */
+  async countObservations(
+    code: string,
+    q: Omit<ObservationQuery, 'limit' | 'offset'>,
+    cap: number,
+    signal?: AbortSignal,
+  ): Promise<number> {
+    const opened = await this.openAnalyzedDomain(code);
+    if (!opened) return 0;
+    const { whereSql, params } = buildObservationWhere(q);
+    // An aggregate with no GROUP BY yields exactly one row.
+    const [counted] = (await this.reads.all<{ n: number }>(
+      {
+        file: opened.file,
+        sql: `SELECT count(*) AS n FROM (SELECT 1 FROM ${opened.table} ${whereSql} LIMIT ?)`,
+        params: [...params, cap + 1],
+      },
+      signal,
+    )) as [{ n: number }];
+    return counted.n;
   }
 
   /**
@@ -633,6 +727,13 @@ export class FaostatMirror {
    * units would be arithmetic on incomparable quantities. With a single unit —
    * the ordinary case — this is exactly one row per country.
    *
+   * The match is read once (#59). A self-join of the match to its per-group latest
+   * year read the cube a second time, through whichever index the store's
+   * statistics made look cheapest: with every index analyzed but the unit/element
+   * one, that second read walked the item's whole unit/element slice once per
+   * ranked country and ran past the call ceiling. With one read, the item-bounded
+   * access path is the only plan choice, whatever statistics the store holds.
+   *
    * Assumes the domain is selected and ready (callers gate first).
    */
   async rankAreaTotals(
@@ -646,34 +747,34 @@ export class FaostatMirror {
     const { file, table } = opened;
     const { whereSql, params } = this.buildValuedWhere(q);
     /*
-     * `latest` resolves each (area, unit) group's own newest year; the join then
-     * sums only that year's rows. `l.unit IS m.unit` (not `=`) so the NULL-unit
-     * group joins to itself. `MAX(m.area)` picks the label without widening the
+     * The window gives each row its (area, unit) group's own newest year, and the
+     * outer query sums only the rows at it. PARTITION BY, like GROUP BY, puts every
+     * NULL unit in one group. `MAX(area)` picks the label without widening the
      * GROUP BY — a label variant would otherwise split one area into two rows.
+     *
+     * `years_behind` measures each group against the ranking's own latest year
+     * (#50). The outer window runs over the grouped rows, after GROUP BY and before
+     * ORDER BY / LIMIT, so it sees every group, not just the page returned; the
+     * newest group year is the newest matched year, since each group sits at its
+     * own maximum. It reads nothing beyond the one pass over the match.
      */
-    const rows = await this.reads.all<{
-      area: string;
-      area_code: number;
-      flags: string | null;
-      observations: number;
-      unit: string | null;
-      value: number;
-      year: number;
-    }>(
+    const rows = await this.reads.all<AreaAggregateRow>(
       {
         file,
-        sql: `WITH matched AS (SELECT area_code, area, unit, year, value, flag FROM ${table} ${whereSql}),
-              latest AS (SELECT area_code, unit, MAX(year) AS year FROM matched GROUP BY area_code, unit)
-         SELECT m.area_code AS area_code,
-                MAX(m.area) AS area,
-                m.unit AS unit,
-                m.year AS year,
-                SUM(m.value) AS value,
+        sql: `WITH matched AS (SELECT area_code, area, unit, year, value, flag,
+                                  MAX(year) OVER (PARTITION BY area_code, unit) AS latest_year
+                             FROM ${table} ${whereSql})
+         SELECT area_code,
+                MAX(area) AS area,
+                unit,
+                year,
+                SUM(value) AS value,
                 COUNT(*) AS observations,
-                group_concat(DISTINCT m.flag) AS flags
-           FROM matched m
-           JOIN latest l ON l.area_code = m.area_code AND l.year = m.year AND l.unit IS m.unit
-          GROUP BY m.area_code, m.unit, m.year
+                group_concat(DISTINCT flag) AS flags,
+                MAX(year) OVER () - year AS years_behind
+           FROM matched
+          WHERE year = latest_year
+          GROUP BY area_code, unit, year
           ORDER BY value DESC
           LIMIT ?`,
         params: [...params, topN],
@@ -699,13 +800,7 @@ export class FaostatMirror {
     if (!opened) return [];
     const { file, table } = opened;
     const { whereSql, params } = this.buildValuedWhere(q);
-    const rows = await this.reads.all<{
-      flags: string | null;
-      observations: number;
-      unit: string | null;
-      value: number;
-      year: number;
-    }>(
+    const rows = await this.reads.all<YearAggregateRow>(
       {
         file,
         sql: `SELECT year, unit, SUM(value) AS value, COUNT(*) AS observations,
@@ -718,6 +813,70 @@ export class FaostatMirror {
       signal,
     );
     return rows.map((r) => ({ ...r, flags: normalizeFlagSet(r.flags) }));
+  }
+
+  /**
+   * The elements `itemCodes` carry in a domain's cube, in code order, each labeled
+   * from the shared element vocabulary (null when the vocabulary has no label for
+   * the code). Every row counts, whatever its year or value. This is the profile's
+   * element selection (#51), so it runs on every profile: the item composite's
+   * `(item_code, element_code)` prefix answers `DISTINCT element_code` without
+   * visiting a table row — sub-millisecond for the heaviest TCL item, where the
+   * unit-reading element scope behind {@link resolve} reads every row of the item.
+   * Opens ungated like {@link domainItemCodes}: a covering read needs no statistics
+   * to find its index. `itemCodes` must be non-empty.
+   */
+  async itemElements(
+    code: string,
+    itemCodes: number[],
+    signal?: AbortSignal,
+  ): Promise<{ element: string | null; element_code: number }[]> {
+    const opened = await this.openDomain(code);
+    if (!opened) return [];
+    const rows = await this.reads.all<{ element_code: number }>(
+      {
+        file: opened.file,
+        sql: `SELECT DISTINCT element_code FROM ${opened.table} WHERE item_code IN (${itemCodes.map(() => '?').join(', ')}) ORDER BY element_code`,
+        params: itemCodes,
+      },
+      signal,
+    );
+    const codes = rows.map((r) => r.element_code);
+    if (codes.length === 0) return [];
+    const { matches } = await this.dimensions.resolve('element', {
+      domainCodes: codes,
+      limit: codes.length,
+    });
+    const labels = new Map(matches.map((match) => [match.code, match.name]));
+    return codes.map((elementCode) => ({
+      element_code: elementCode,
+      element: labels.get(elementCode) ?? null,
+    }));
+  }
+
+  /**
+   * The distinct `(element, unit)` pairs among the rows {@link rankAreaTotals} and
+   * {@link sumByYear} aggregate for the same `q` — valued rows, aggregates excluded
+   * unless asked for, within the year bounds — so a profile can name the units each
+   * ranking used (#51). A NULL unit is its own pair, as those paths group it. `q`
+   * must name item and element codes: they keep the read item-bounded.
+   */
+  async elementUnits(
+    code: string,
+    q: Omit<ObservationQuery, 'limit' | 'offset'>,
+    signal?: AbortSignal,
+  ): Promise<{ element_code: number; unit: string | null }[]> {
+    const opened = await this.openAnalyzedDomain(code);
+    if (!opened) return [];
+    const { whereSql, params } = this.buildValuedWhere(q);
+    return this.reads.all<{ element_code: number; unit: string | null }>(
+      {
+        file: opened.file,
+        sql: `SELECT DISTINCT element_code, unit FROM ${opened.table} ${whereSql} ORDER BY element_code, unit`,
+        params,
+      },
+      signal,
+    );
   }
 
   /**
@@ -877,15 +1036,31 @@ export class FaostatMirror {
    *
    * Ends with a statistics build on the read pool whenever the sync applied rows —
    * a FAOSTAT domain ZIP is one atomic unit, so the previous statistics describe a
-   * table that no longer exists — or the domain has none, which is how
-   * `mirror:refresh` catches up a mirror synced before statistics shipped. A sync
-   * that applied nothing to a domain with statistics skips the pass, so the nightly
-   * no-op refresh stays a no-op. The sync is awaited through its build.
+   * table that no longer exists — or the domain's statistics do not cover its
+   * indexes ({@link hasStatistics}). That is how `mirror:refresh` catches up a
+   * mirror synced before statistics shipped, and how a refresh that adds indexes to
+   * an unchanged upstream ends with them analyzed. A sync that applied nothing to a
+   * domain whose statistics cover it skips the pass, so the nightly no-op refresh
+   * stays a no-op. The sync awaits its build only while its signal is live: a run
+   * stopped before the build would start starts none, and one stopped while it waits
+   * stops waiting, leaving the build to the pool, which {@link close} ends without
+   * recording an outcome (#46). Either way it rejects with the abort reason, as a run
+   * stopped mid-sync does, so a shutdown never waits out the minute or more `ANALYZE`
+   * takes on the largest cube; a later sync or data read builds instead, as after a
+   * build that failed.
    *
    * `ANALYZE` holds the file's write lock for its whole run, so a sync and a build
    * of the same domain never overlap (#24): the sync waits out a build already in
-   * flight, and reads schedule none while it runs. A second sync of a domain whose
-   * sync is running fails at once with `Conflict` — it would share the ingester slot.
+   * flight (until its signal aborts, as above), and reads schedule none while it
+   * runs. A second sync of a domain whose sync is running fails at once with
+   * `Conflict` — it would share the ingester slot.
+   *
+   * Every write that prepares the store ({@link prepareCube}) runs as the first step
+   * of the sync generator, which the runner calls only once it holds the store's sync
+   * lease. A sync another process's lease refuses (`sync_locked`) has written nothing,
+   * so a refresh that meets a first sync in flight leaves its committed rows alone.
+   * The revision a completed sync earns is published under the lease as well
+   * ({@link revisionPublishingStore}), so the next claim never replaces a finished sync.
    */
   async runDomainSync(
     code: string,
@@ -902,56 +1077,66 @@ export class FaostatMirror {
     }
     this.syncing.add(upper);
     try {
-      await this.builds.get(upper);
+      const inFlight = this.builds.get(upper);
+      if (inFlight) await unlessAborted(inFlight, args.signal);
       const dataset = args.dataset ?? (await this.resolveDataset(upper, args.signal));
       const handle = await mirror.raw();
-      const revision = ingestRevision(handle);
-      const needsReplacement = revision === undefined;
-      if (needsReplacement) {
-        handle.transaction(() => {
-          handle.exec(`DELETE FROM ${cubeTable(upper)}`);
-          handle.exec(
-            "UPDATE mirror_sync_state SET status = 'pending', completed_at = NULL, checkpoint = NULL, cursor = NULL, total = NULL",
-          );
-        });
-        this.reads.invalidate(this.domainFile(upper));
-      }
-      if (revision !== 2) {
-        createObservationIndexes(handle, cubeTable(upper));
-        /** Compatible refreshes stay readable after partial writes; enable text membership first. */
-        if (revision === 1) handle.exec('UPDATE ingest_revision SET revision = 2');
-        this.reads.invalidate(this.domainFile(upper));
-      }
+      const ingest = makeDomainSync({
+        dataset,
+        dimensions: this.dimensions,
+        ...(this.log ? { log: this.log } : {}),
+      });
+      const prepare = () => this.prepareCube(upper, handle);
       // Bind the manifest-bound ingester onto the per-domain slot the read-path
       // mirror's `sync` delegates to, run, then clear the slot. One Mirror instance
       // owns both paths against one open store handle.
-      this.ingesters.set(
-        upper,
-        makeDomainSync({
-          dataset,
-          dimensions: this.dimensions,
-          ...(this.log ? { log: this.log } : {}),
-        }),
-      );
+      this.ingesters.set(upper, async function* (ctx) {
+        prepare();
+        yield* ingest(ctx);
+      });
       const result = await mirror.runSync({
-        mode: needsReplacement ? 'init' : mode,
+        // The runner takes the mode before it claims the lease, so this read only picks it.
+        mode: ingestRevision(handle) === undefined ? 'init' : mode,
         signal: args.signal,
         ...(args.onProgress ? { onProgress: args.onProgress } : {}),
       });
-      if (await mirror.ready()) {
-        handle.transaction(() => {
-          handle.exec('DELETE FROM ingest_revision');
-          handle.exec('INSERT INTO ingest_revision(revision) VALUES (2)');
-        });
-      }
       const applied = result.recordsApplied > 0 || result.tombstonesApplied > 0;
       if (applied || !this.hasStatistics(await mirror.raw(), cubeTable(upper))) {
-        await this.buildStatistics(upper);
+        args.signal.throwIfAborted();
+        await unlessAborted(this.buildStatistics(upper), args.signal);
       }
       return result;
     } finally {
       this.ingesters.delete(upper);
       this.syncing.delete(upper);
+    }
+  }
+
+  /**
+   * Bring a domain's store to the current cube revision before its first page lands.
+   * The first step of the sync generator, so it runs only under the store's sync
+   * lease ({@link runDomainSync}), and it reads the revision there, as of the claim.
+   * - No revision (legacy FS/GLE rows, or a store whose first sync never completed):
+   *   the rows are replaced, so they go, and with them the completion marker and total
+   *   the state keeps across runs. The runner rewrites every other state column with
+   *   each page it commits.
+   * - Below revision 2: the current indexes, then, for a compatible numeric cube
+   *   (revision 1), text membership — so a refresh that stops after partial writes
+   *   leaves them readable.
+   */
+  private prepareCube(code: string, handle: SqliteHandle): void {
+    const revision = ingestRevision(handle);
+    if (revision === undefined) {
+      handle.transaction(() => {
+        handle.exec(`DELETE FROM ${cubeTable(code)}`);
+        handle.exec('UPDATE mirror_sync_state SET completed_at = NULL, total = NULL');
+      });
+      this.reads.invalidate(this.domainFile(code));
+    }
+    if (revision !== 2) {
+      createObservationIndexes(handle, cubeTable(code));
+      if (revision === 1) handle.exec('UPDATE ingest_revision SET revision = 2');
+      this.reads.invalidate(this.domainFile(code));
     }
   }
 
@@ -976,6 +1161,20 @@ export class FaostatMirror {
     for (const mirror of this.mirrors.values()) await mirror.close();
     await this.dimensions.close();
   }
+}
+
+/**
+ * Settle as `promise` does, or reject with `signal`'s reason once it aborts, at once
+ * when it already has. Ends only the wait: `promise` runs on, and its outcome still
+ * reaches whatever else awaits it.
+ */
+function unlessAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
 }
 
 // --- Init/accessor pattern ---

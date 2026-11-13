@@ -95,12 +95,12 @@ function expectDescribeThenQuery(wire: WireProfile, pointer: string) {
 
 /** A canvas whose every acquire fails — the staging layer degrades to `undefined`. */
 function failingCanvas(onAcquire: () => void = () => {}): DataCanvas {
-  return {
-    acquire: async () => {
-      onAcquire();
-      throw new Error('simulated canvas failure');
-    },
-  } as unknown as DataCanvas;
+  const fail = async () => {
+    onAcquire();
+    throw new Error('simulated canvas failure');
+  };
+  // Staging onto the session canvas goes through acquireShared, a named canvas_id through acquire.
+  return { acquire: fail, acquireShared: fail } as unknown as DataCanvas;
 }
 
 beforeAll(() => {
@@ -173,9 +173,9 @@ describe('faostat_commodity_profile notice (canvas on, merged set fits inline)',
     const input = commodityProfileTool.input.parse({ item_query: 'wheat' });
     const result = await commodityProfileTool.handler(input, ctx);
 
-    // TCL is outside this mirror's selection, so the profile is production-only.
-    // That has no bearing on whether the set fit inline — a production-only set
-    // that fits is exactly as complete as a merged one that fits.
+    // TCL is outside this mirror's selection, so the profile has no trade.
+    // That has no bearing on whether the set fit inline — a QCL-only set that
+    // fits is exactly as complete as a merged one that fits.
     expect(result.spilled).toBe(false);
     expect(result.canvas_id).toBeDefined();
     expect(result.top_exporters).toHaveLength(0);
@@ -229,6 +229,23 @@ describe('faostat_commodity_profile notice (canvas on, merged set fits inline)',
     expect(wire.text).not.toMatch(/CANVAS_PROVIDER_TYPE/);
     // format() cannot tell this case from a disabled canvas, so its line is neutral.
     expect(wire.formatted).toContain(NO_TABLE_LINE);
+  });
+
+  it('keeps the call year bounds in the row-level pointer, so following it reads only the profiled window', async () => {
+    setCanvas(failingCanvas());
+    let wire: WireProfile;
+    try {
+      wire = await profileWire('profile-staging-failed-bounded', {
+        year_start: 2021,
+        year_end: 2021,
+      });
+    } finally {
+      setCanvas(canvas);
+    }
+
+    expect(wire.notice).toContain(
+      'call faostat_query_observations with item codes 15 on QCL (element codes 5510) with year_start 2021 and year_end 2021.',
+    );
   });
 
   it('carries the enable-the-canvas advice on both surfaces when the canvas is disabled (#31)', async () => {
@@ -434,10 +451,10 @@ describe('faostat_commodity_profile staged-set notice (trade unavailable) (#19)'
 
     const notice = getEnrichment(ctx).notice as string;
     expect(notice).toContain(result.table_name as string);
-    // A caller reading "production + trade" writes SQL against trade element codes
-    // that are not in the table.
-    expect(notice).not.toMatch(/production \+ trade/i);
-    expect(notice).toMatch(/production rows only/i);
+    // A caller reading "QCL + TCL" writes SQL against trade element codes that are
+    // not in the table.
+    expect(notice).not.toMatch(/QCL \+ TCL/);
+    expect(notice).toMatch(/the table holds QCL rows only/);
   }, 30_000);
 
   it('points at describe-then-query on both surfaces, and no surface implies staged trade rows (#23)', async () => {
@@ -451,13 +468,13 @@ describe('faostat_commodity_profile staged-set notice (trade unavailable) (#19)'
       wire,
       `faostat_dataframe_describe (name ${tableName}, canvas_id ${canvasId})`,
     );
-    expect(wire.notice).toMatch(/production rows only/i);
+    expect(wire.notice).toMatch(/the table holds QCL rows only/);
 
     // format() sees only the output, which cannot say whether trade reached the
     // table — so its staged line names the table without calling it a merged set.
     expect(wire.formatted).toContain(tableName);
     expect(wire.text).not.toMatch(/merged/i);
-    expect(wire.text).not.toMatch(/production \+ trade/i);
+    expect(wire.text).not.toMatch(/QCL \+ TCL/);
   }, 30_000);
 
   it('hands faostat_dataframe_describe a name and canvas_id that return exactly the staged table (#23)', async () => {
@@ -532,7 +549,7 @@ describe('faostat_commodity_profile staged-set notice (trade included) (#19, #23
     expect(wire.structured.spilled).toBe(true);
     expect(wire.structured.truncated).toBe(false);
     expect((wire.structured.top_exporters as unknown[]).length).toBeGreaterThan(0);
-    expect(wire.notice).toMatch(/production \+ trade observations staged/i);
+    expect(wire.notice).toMatch(/Merged QCL \+ TCL observations staged/);
     expectDescribeThenQuery(
       wire,
       `faostat_dataframe_describe (name ${tableName}, canvas_id ${canvasId})`,
@@ -645,6 +662,91 @@ describe('faostat_commodity_profile truncation disclosure (trade included)', () 
 
     expect(wire.structured.truncated).toBe(true);
     expect((wire.structured.top_exporters as unknown[]).length).toBeGreaterThan(0);
-    expect(wire.notice).toMatch(/faostat_query_observations on QCL and TCL with item codes 15/);
+    // The pointer names the elements the rankings read in each domain, so following
+    // it returns the staged set's rows and not every element the item carries.
+    expect(wire.notice).toContain(
+      'faostat_query_observations with item codes 15 on QCL (element codes 5510) and TCL (element codes 5910) partitioned by year',
+    );
   }, 30_000);
+});
+
+describe('faostat_commodity_profile lag notice (#50)', () => {
+  let dir: string;
+  let mirror: FaostatMirror;
+
+  const wheat = { itemCode: 15, item: 'Wheat' };
+  const production = { ...wheat, elementCode: 5510, element: 'Production' };
+  const imports = { ...wheat, elementCode: 5610, element: 'Import quantity' };
+  const exports = { ...wheat, elementCode: 5910, element: 'Export quantity' };
+  const alpha = { areaCode: 10, area: 'Alpha' };
+  const bravo = { areaCode: 20, area: 'Bravo' };
+  const charlie = { areaCode: 30, area: 'Charlie' };
+
+  beforeAll(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'faostat-profile-lag-'));
+    // QCL runs to 2022 and TCL to 2021. Bravo stops early in both, Charlie in QCL;
+    // Alpha leads every ranking, so top_n 1 returns no lagging row.
+    const qcl = buildExplicitDomainZip([
+      { ...alpha, ...production, year: 2020, value: 98 },
+      { ...alpha, ...production, year: 2022, value: 100 },
+      { ...bravo, ...production, year: 2019, value: 50 },
+      { ...charlie, ...production, year: 2017, value: 1 },
+    ]);
+    const tcl = buildExplicitDomainZip(
+      [
+        { ...alpha, ...imports, year: 2021, value: 60 },
+        { ...bravo, ...imports, year: 2018, value: 50 },
+        { ...alpha, ...exports, year: 2021, value: 7 },
+      ],
+      TCL,
+    );
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string | URL) =>
+        chunkedResponse(String(url).includes(`_${TCL}_`) ? tcl : qcl, 1 << 16),
+      ),
+    );
+    mirror = initFaostatMirror({ dir, domains: [FIXTURE_DOMAIN, TCL] });
+    for (const domain of [FIXTURE_DOMAIN, TCL]) {
+      await mirror.runDomainSync(domain, 'init', {
+        signal: new AbortController().signal,
+        dataset: fixtureDataset(domain),
+      });
+    }
+  }, 30_000);
+
+  afterAll(async () => {
+    await mirror.close();
+    vi.unstubAllGlobals();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('names each lagging row returned, per ranking, with a year_start the caller can send', async () => {
+    const wire = await profileWire('profile-lag');
+    expect(wire.notice).toContain(
+      "Rows behind their ranking's latest year — each country ranks at its own latest year with data. In top_producers (latest year 2022): Bravo (20) 2019, 3 years behind; Charlie (30) 2017, 5 years behind. In top_importers (latest year 2021): Bravo (20) 2018, 3 years behind. year_start restricts every ranking to areas with data from that year on, and production_trend to those years: year_start 2022 leaves top_producers only areas reporting in 2022; year_start 2021 leaves top_importers only areas reporting in 2021.",
+    );
+    expect(wire.text).toContain(`> ${wire.notice}`);
+    // content[] shows each row's lag beside its year.
+    expect(wire.formatted).toContain('- Bravo (20): 50 t [2019, 3 yr behind, 1 obs, flags A]');
+    expect(wire.formatted).toContain('- Alpha (10): 100 t [2022, 0 yr behind, 1 obs, flags A]');
+  });
+
+  it('suggests a year_start past the one the call set, never the same one', async () => {
+    const wire = await profileWire('profile-lag-bounded', { year_start: 2019 });
+    // Bravo's 2019 survives the bound and still trails 2022; TCL's 2018 row does not.
+    expect(wire.notice).toContain(
+      'In top_producers (latest year 2022): Bravo (20) 2019, 3 years behind. year_start restricts every ranking to areas with data from that year on, and production_trend to those years: year_start 2022 leaves top_producers only areas reporting in 2022.',
+    );
+    expect(wire.notice).not.toMatch(/top_importers \(latest/);
+  });
+
+  it.each([
+    ['a year_start that leaves every area current', { year_start: 2020 }],
+    ['a top_n that returns no lagging row', { top_n: 1 }],
+  ])('leaves the lag part out for %s', async (_case, input) => {
+    const wire = await profileWire('profile-lag-none', input);
+    expect(wire.notice).not.toMatch(/behind/);
+    expect(wire.notice).not.toMatch(/year_start/);
+  });
 });

@@ -11,6 +11,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { getServerConfig } from '@/config/server-config.js';
+import { countInput } from '@/mcp-server/tools/count-input.js';
 import { getFaostatMirror } from '@/services/faostat-mirror/index.js';
 import {
   fetchManifest,
@@ -18,8 +19,15 @@ import {
   parseFileSizeBytes,
 } from '@/services/faostat-mirror/manifest.js';
 
-/** Cap on domains returned in one page. Exceeds the ~69-domain catalog, so a caller can opt into the whole thing. */
-const MAX_DOMAINS = 200;
+/** Domains per page. The cap exceeds the ~69-domain catalog, so a caller can opt into the whole thing. */
+const LIMIT = countInput({
+  tool: 'faostat_list_domains',
+  name: 'limit',
+  default: 20,
+  cap: 200,
+  description: (cap) =>
+    `Domains to return on this page, at most ${cap} per call — above the catalog size, so raise it to fetch everything at once. Domain descriptions are long; the default keeps a browse call small.`,
+});
 
 export const listDomainsTool = tool('faostat_list_domains', {
   title: 'faostat-mcp-server: list domains',
@@ -47,11 +55,12 @@ export const listDomainsTool = tool('faostat_list_domains', {
         'Offset to pass on the next call to fetch the following page. Present only when truncated is true; absent on the last page and for exact-code lookups.',
       ),
     indexedCount: z.number().describe('Domains currently indexed in the local mirror.'),
+    ...LIMIT.enrichment,
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance when a filter matched nothing, more pages remain, or no domains are indexed yet.',
+        'Guidance when limit was above its cap, a filter matched nothing, more pages remain, or no domains are indexed yet.',
       ),
   },
 
@@ -72,15 +81,7 @@ export const listDomainsTool = tool('faostat_list_domains', {
       .boolean()
       .default(false)
       .describe('When true, return only domains indexed in the local mirror (queryable now).'),
-    limit: z
-      .number()
-      .int()
-      .min(1)
-      .max(MAX_DOMAINS)
-      .default(20)
-      .describe(
-        'Maximum domains to return on this page (max 200 — above the catalog size, so raise it to fetch everything at once). Domain descriptions are long; the default keeps a browse call small.',
-      ),
+    limit: LIMIT.schema,
     offset: z
       .number()
       .int()
@@ -160,9 +161,11 @@ export const listDomainsTool = tool('faostat_list_domains', {
 
     const sorted = matched.slice().sort((a, b) => a.DatasetCode.localeCompare(b.DatasetCode));
     const total = sorted.length;
+    // An exact-code lookup is single-page, so limit never binds there and is not clamped.
+    const limit = exactCode ? undefined : LIMIT.clamp(ctx, input.limit);
     // Page before the per-domain mirror status reads so a page costs one status
     // lookup per returned domain, not one per match.
-    const page = exactCode ? sorted : sorted.slice(input.offset, input.offset + input.limit);
+    const page = limit ? sorted.slice(input.offset, input.offset + limit.effective) : sorted;
 
     const domains = await Promise.all(
       page.map(async (d) => {
@@ -203,7 +206,8 @@ export const listDomainsTool = tool('faostat_list_domains', {
 
     // Retrieval guidance and index-state guidance are independent — an empty page
     // on an unconfigured mirror needs both, so collect rather than branch past one.
-    const notices: string[] = [];
+    // A clamped limit leads; the paging sentence after it names the next offset.
+    const notices: string[] = limit?.clamped ? [limit.notice] : [];
     if (domains.length === 0) {
       notices.push(
         exactCode

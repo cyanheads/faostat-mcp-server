@@ -10,10 +10,17 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { countInput } from '@/mcp-server/tools/count-input.js';
 import { getFaostatMirror } from '@/services/faostat-mirror/index.js';
 
-/** Cap on returned matches. */
-const MAX_MATCHES = 200;
+/** Matches per page. */
+const LIMIT = countInput({
+  tool: 'faostat_resolve_codes',
+  name: 'limit',
+  default: 50,
+  cap: 200,
+  description: (cap) => `Matches to return on this page, at most ${cap} per call.`,
+});
 
 export const resolveCodesTool = tool('faostat_resolve_codes', {
   title: 'faostat-mcp-server: resolve codes',
@@ -35,11 +42,12 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       .describe(
         'Offset to pass on the next call to fetch the following page. Present only when truncated is true; absent on the last page and for exact-code lookups.',
       ),
+    ...LIMIT.enrichment,
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance when nothing matched, more pages remain, or the dimension is not yet indexed.',
+        'Guidance when limit was above its cap, nothing matched, more pages remain, or the dimension is not yet indexed.',
       ),
   },
 
@@ -79,6 +87,15 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       when: "The item or element lookup's mirror read — time queued behind other calls' reads plus execution — ran past the 45-second per-call ceiling.",
       recovery:
         'For element lookup, pass item_codes or item_codes_text to narrow unit discovery, or use an exact code; retry after other reads finish.',
+    },
+    // Raised by the mirror read pool once server shutdown has closed it.
+    {
+      reason: 'pool_closed',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      thrownBy: 'service',
+      retryable: true,
+      when: 'The server was shutting down and closed its mirror read workers while this call was queued or running.',
+      recovery: 'Retry once the server is back up; this call did not complete.',
     },
   ],
 
@@ -135,13 +152,7 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       .describe(
         'For element resolution only: restrict elements and units to these exact text items. Empty matches nothing; mutually exclusive with item_codes.',
       ),
-    limit: z
-      .number()
-      .int()
-      .min(1)
-      .max(MAX_MATCHES)
-      .default(50)
-      .describe('Maximum matches to return (max 200).'),
+    limit: LIMIT.schema,
     offset: z
       .number()
       .int()
@@ -223,6 +234,10 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       );
     }
 
+    // An exact-code lookup returns at most one match and never pages, so limit
+    // never binds there and is not clamped; the mirror ignores it on that path.
+    const exactCode = input.code !== undefined || input.code_text !== undefined;
+    const limit = exactCode ? undefined : LIMIT.clamp(ctx, input.limit);
     const { matches, total } = await mirror.resolve(input.domain, input.dimension, {
       ...(input.code !== undefined ? { code: input.code } : {}),
       ...(input.code_text !== undefined ? { codeText: input.code_text } : {}),
@@ -230,7 +245,7 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       ...(input.item_codes_text !== undefined ? { itemCodesText: input.item_codes_text } : {}),
       ...(input.query ? { query: input.query } : {}),
       ...(input.name_contains ? { nameContains: input.name_contains } : {}),
-      limit: input.limit,
+      limit: limit?.effective ?? 1,
       offset: input.offset,
       signal: mirror.readSignal(ctx.signal),
     });
@@ -242,6 +257,8 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
     const truncated = nextOffset < total;
     ctx.enrich({ totalMatches: total, truncated, ...(truncated ? { nextOffset } : {}) });
 
+    // A clamped limit leads; the paging sentence after it names the next offset.
+    const notices: string[] = limit?.clamped ? [limit.notice] : [];
     if (matches.length === 0) {
       const criterion =
         input.code !== undefined
@@ -254,16 +271,17 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
                 ? `name containing "${input.name_contains}"`
                 : 'the listing';
       const domainUpper = input.domain.toUpperCase();
-      ctx.enrich.notice(
+      notices.push(
         total > 0
           ? `Offset ${input.offset} is past the ${total} ${input.dimension} match(es) for ${criterion} in domain ${domainUpper}. Lower offset (0-based) to page back through the results.`
           : `No ${input.dimension} matched ${criterion} in domain ${domainUpper}. Broaden the term, check spelling, or omit query to list all ${input.dimension} codes.`,
       );
     } else if (truncated) {
-      ctx.enrich.notice(
+      notices.push(
         `Showing ${input.dimension} matches ${input.offset + 1}–${nextOffset} of ${total}. Call again with offset ${nextOffset} to fetch the next page.`,
       );
     }
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
 
     return {
       domain: input.domain.toUpperCase(),

@@ -5,25 +5,32 @@
  */
 
 import type { createApp } from '@cyanheads/mcp-ts-core';
+import { conflict } from '@cyanheads/mcp-ts-core/errors';
 import type { MirrorLogger } from '@cyanheads/mcp-ts-core/mirror';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const boundary = vi.hoisted(() => ({
-  app: vi.fn(),
-  init: vi.fn(),
-  close: vi.fn(async () => {}),
-  sync: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
-  schedule: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
-  start: vi.fn(),
-  isNode: true,
-  log: {
-    debug: vi.fn(),
-    info: vi.fn(),
-    notice: vi.fn(),
-    warning: vi.fn(),
-    error: vi.fn(),
-  },
-}));
+const boundary = vi.hoisted(() => {
+  const close = vi.fn<() => Promise<void>>(async () => {});
+  const sync = vi.fn<(...args: unknown[]) => Promise<void>>(async () => {});
+  return {
+    app: vi.fn(),
+    init: vi.fn(),
+    close,
+    sync,
+    /** The mirror `setup()` builds: the scheduled refresh drives it, `teardown()` closes it. */
+    mirror: { close, selectedDomains: () => ['QCL', 'TCL'], runDomainSync: sync },
+    schedule: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
+    start: vi.fn(),
+    isNode: true,
+    log: {
+      debug: vi.fn(),
+      info: vi.fn(),
+      notice: vi.fn(),
+      warning: vi.fn(),
+      error: vi.fn(),
+    },
+  };
+});
 
 vi.mock('@cyanheads/mcp-ts-core', async (original) => ({
   ...(await original<typeof import('@cyanheads/mcp-ts-core')>()),
@@ -41,7 +48,7 @@ vi.mock('@cyanheads/mcp-ts-core/utils', async (original) => ({
 }));
 vi.mock('@/services/faostat-mirror/index.js', () => ({
   initFaostatMirror: boundary.init,
-  getFaostatMirror: () => ({ selectedDomains: () => ['QCL', 'TCL'], runDomainSync: boundary.sync }),
+  getFaostatMirror: () => boundary.mirror,
 }));
 
 type Options = NonNullable<Parameters<typeof createApp>[0]>;
@@ -64,8 +71,10 @@ beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
   boundary.isNode = true;
-  boundary.init.mockReturnValue({ close: boundary.close });
+  boundary.init.mockReturnValue(boundary.mirror);
   boundary.schedule.mockResolvedValue(undefined);
+  boundary.sync.mockResolvedValue(undefined);
+  boundary.close.mockResolvedValue(undefined);
   for (const key of Object.keys(process.env).filter((name) => name.startsWith('FAOSTAT_'))) {
     vi.stubEnv(key, undefined);
   }
@@ -179,6 +188,82 @@ describe('startup lifecycle', () => {
       await options.teardown?.({} as Core);
     },
   );
+
+  /** Load with a refresh cron, run `setup()` on HTTP, and return the scheduled job. */
+  async function scheduledRefresh(): Promise<{ options: Options; job: () => Promise<void> }> {
+    vi.stubEnv('FAOSTAT_REFRESH_CRON', '0 6 * * *');
+    const options = await load();
+    options.setup?.(coreFor('http'));
+    await Promise.resolve();
+    const job = boundary.schedule.mock.calls[0]?.[2] as (() => Promise<void>) | undefined;
+    if (!job) throw new Error('Expected setup to schedule the refresh');
+    return { options, job };
+  }
+
+  it('stops a scheduled refresh in flight at teardown and closes the mirror after it settles', async () => {
+    const events: string[] = [];
+    let started = () => {};
+    const syncStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    // As the mirror's runner does: a run whose signal aborts rejects with the reason.
+    boundary.sync.mockImplementationOnce(async (_code, _mode, args) => {
+      const { signal } = args as { signal: AbortSignal };
+      events.push('sync started');
+      started();
+      await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+      events.push('sync stopped');
+      throw signal.reason;
+    });
+    boundary.close.mockImplementationOnce(async () => {
+      events.push('mirror closed');
+    });
+    const { options, job } = await scheduledRefresh();
+
+    const run = job().then(() => events.push('run settled'));
+    await syncStarted;
+    await options.teardown?.({} as Core);
+    events.push('teardown resolved');
+
+    expect(events).toEqual([
+      'sync started',
+      'sync stopped',
+      'run settled',
+      'mirror closed',
+      'teardown resolved',
+    ]);
+    await run;
+    expect(boundary.sync.mock.calls.map(([code]) => code)).toEqual(['QCL']);
+    expect(boundary.log.error).not.toHaveBeenCalled();
+  });
+
+  it('skips a domain whose sync lease another process holds and refreshes the next', async () => {
+    boundary.sync.mockRejectedValueOnce(
+      conflict('Mirror sync is already in progress in another process or instance.', {
+        reason: 'sync_locked',
+      }),
+    );
+    const { options, job } = await scheduledRefresh();
+
+    await expect(job()).resolves.toBeUndefined();
+    expect(boundary.sync.mock.calls.map(([code]) => code)).toEqual(['QCL', 'TCL']);
+    expect(boundary.log.info).toHaveBeenCalledWith(
+      expect.stringContaining('QCL'),
+      expect.objectContaining({ operation: 'faostatMirrorSync' }),
+    );
+    expect(boundary.log.error).not.toHaveBeenCalled();
+    await options.teardown?.({} as Core);
+  });
+
+  it('syncs nothing on a tick after teardown, and a second teardown is a no-op', async () => {
+    const { options, job } = await scheduledRefresh();
+    await options.teardown?.({} as Core);
+    await options.teardown?.({} as Core);
+    expect(boundary.close).toHaveBeenCalledTimes(1);
+    // The framework stops the cron only after teardown returns, so a tick can still fire.
+    await job();
+    expect(boundary.sync).not.toHaveBeenCalled();
+  });
 
   it('accepts a missing .env but propagates other environment-file errors', async () => {
     vi.mocked(process.loadEnvFile).mockImplementation(() => {

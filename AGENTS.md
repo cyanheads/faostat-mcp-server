@@ -2,8 +2,8 @@
 
 **Server:** faostat-mcp-server
 **Version:** 0.6.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0 (via the framework)
 **Zod:** ^4.6.7
 
@@ -106,7 +106,7 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
 
 ### Analytical tools — DataCanvas staging
 
-`faostat_query_observations` and `faostat_commodity_profile` inline a small preview and **spill** large result sets to a DuckDB-backed canvas table via the staging helpers in `src/services/canvas-staging.ts`. The returned `canvas_id` + `table_name` are then read through the mandatory `faostat_dataframe_describe` / `faostat_dataframe_query` pair — without that pair the spilled token is dead output. `faostat_dataframe_drop` removes one staged table ahead of its TTL; it is opt-in, so `src/index.ts` registers it through `dataframeDropRegistration()`, which wraps it in `disabledTool()` unless `FAOSTAT_DATAFRAME_DROP_ENABLED=true`, and the server `instructions` name it only when it is live. Guard with `canvasEnabled()` and surface `canvas_disabled` when staging is off.
+`faostat_query_observations` returns one page of up to `limit` rows from `offset` (with `nextOffset` while rows remain, up to the 100,000-row `OFFSET_CAP`) and, with DataCanvas on, a first page whose match exceeds `limit` also **spills** the whole match to a DuckDB-backed canvas table; `faostat_commodity_profile` inlines its summaries and spills its row-level set. Both stage through the helpers in `src/services/canvas-staging.ts`. The returned `canvas_id` + `table_name` are then read through the mandatory `faostat_dataframe_describe` / `faostat_dataframe_query` pair — without that pair the spilled token is dead output. `faostat_dataframe_drop` removes one staged table ahead of its TTL; it is opt-in, so `src/index.ts` registers it through `dataframeDropRegistration()`, which wraps it in `disabledTool()` unless `FAOSTAT_DATAFRAME_DROP_ENABLED=true`, and the server `instructions` name it only when it is live. Guard with `canvasEnabled()`: with staging off, `faostat_query_observations` pages with `offset`, `faostat_commodity_profile` states it in a notice, and the `faostat_dataframe_*` tools surface `canvas_disabled`. The session canvas is acquired through the framework's `acquireShared` (one canvas per tenant, even under concurrent first calls); `faostat_dataframe_describe` and `faostat_dataframe_drop` never mint one.
 
 `schema` is required: pass `OBSERVATION_TABLE_SCHEMA` (the `streamObservations` columns, including item text codes, periods, value qualifiers, and sources) or `PROFILE_TABLE_SCHEMA` (those plus `domain`). The staged types are declared, never inferred from the preview rows — inference types `value` from whatever the preview window holds, and a whole-number window truncates every later fractional value.
 
@@ -117,15 +117,16 @@ import {
 
 // One per call, before its first mirror read: the call's signal plus the 45 s query_timeout ceiling.
 const signal = mirror.readSignal(ctx.signal);
-if (shouldSpill && !canvasEnabled()) {
-  throw ctx.fail('canvas_disabled', `Result has ${total} rows — too large to inline.`);
+// nextOffset is set by the page read while rows remain past the page.
+if (input.offset === 0 && nextOffset !== undefined && canvasEnabled()) {
+  const staged = await stageObservations(ctx, mirror.streamObservations(code, filters, STAGE_MAX_ROWS + 1, signal), {
+    sourceTool: 'faostat_query_observations',
+    schema: OBSERVATION_TABLE_SCHEMA,
+    previewLimit: limit.effective,
+    queryParams: { domain: code, /* … */ },
+  });
+  // staged.spilled, staged.canvasId, staged.tableName, staged.rowCount
 }
-const staged = await stageObservations(ctx, mirror.streamObservations(code, filters, STAGE_MAX_ROWS + 1, signal), {
-  sourceTool: 'faostat_query_observations',
-  schema: OBSERVATION_TABLE_SCHEMA,
-  queryParams: { domain: code, /* … */ },
-});
-// staged.spilled, staged.canvasId, staged.tableName, staged.previewRows
 ```
 
 Declare a tool's `canvas_id` **input** field with `CanvasIdSchema` from `@cyanheads/mcp-ts-core/canvas`, plus a local `.describe()` naming the tool that produced the id. The minted `^[A-Za-z0-9_-]{10}$` shape then reaches `inputSchema`, so an impossible value is rejected at argument validation rather than surfacing as a canvas miss. **Output** `canvas_id` fields stay `z.string()` — they echo a value the server minted, not one it validates.
@@ -150,22 +151,30 @@ const ServerConfigSchema = z.object({
     .describe('Cron for the in-process incremental refresh (HTTP transport only).'),
   dataframeDropEnabled: z.stringbool().default(false)
     .describe('Register faostat_dataframe_drop live; otherwise it is registered disabled.'),
+  clampLimits: z.stringbool().default(true)
+    .describe('Serve a count input (limit, top_n, row_limit) above its cap at the cap; false rejects it.'),
 });
 
-let _config: z.infer<typeof ServerConfigSchema> | undefined;
-export function getServerConfig() {
-  _config ??= parseEnvConfig(ServerConfigSchema, {
-    bulkBaseUrl: 'FAOSTAT_BULK_BASE_URL',
-    domains: 'FAOSTAT_DOMAINS',
-    mirrorPath: 'FAOSTAT_MIRROR_PATH',
-    refreshCron: 'FAOSTAT_REFRESH_CRON',
-    dataframeDropEnabled: 'FAOSTAT_DATAFRAME_DROP_ENABLED',
-  });
+export type ServerConfig = z.infer<typeof ServerConfigSchema>;
+
+/** The environment variable each config field reads. */
+const ENV_VARS = {
+  bulkBaseUrl: 'FAOSTAT_BULK_BASE_URL',
+  domains: 'FAOSTAT_DOMAINS',
+  mirrorPath: 'FAOSTAT_MIRROR_PATH',
+  refreshCron: 'FAOSTAT_REFRESH_CRON',
+  dataframeDropEnabled: 'FAOSTAT_DATAFRAME_DROP_ENABLED',
+  clampLimits: 'FAOSTAT_CLAMP_LIMITS',
+} as const satisfies Record<keyof ServerConfig, string>;
+
+let _config: ServerConfig | undefined;
+export function getServerConfig(): ServerConfig {
+  _config ??= parseEnvConfig(ServerConfigSchema, ENV_VARS);
   return _config;
 }
 ```
 
-`src/index.ts` loads `./.env` and reads the drop flag with `dataframeDropRequested()` before `createApp()`, since the flag decides how a tool registers. That read never throws; the full config is validated by `getServerConfig()` in `setup()`, so a bad value fails behind the framework's startup banner.
+`src/index.ts` loads `./.env` and, before `createApp()`, reads the drop flag with `dataframeDropRequested()`, the clamp switch with `clampLimitsRequested()`, and the canvas row limit with `canvasRowLimit()` (it caps `faostat_dataframe_query`'s `row_limit`), since each decides how a tool registers. Those reads never throw; the full config is validated by `getServerConfig()` in `setup()`, so a bad value fails behind the framework's startup banner.
 
 `parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`FAOSTAT_DOMAINS`) not the path (`domains`). Throws `ConfigurationError`, which the framework prints as a clean startup banner. `CANVAS_PROVIDER_TYPE` is a core var (already in `AppConfig`), not part of this schema; `src/index.ts` uses the framework's `normalizeEnv` to treat blank, whitespace-only, and unsubstituted placeholder values as unset before defaulting to `duckdb`.
 
@@ -183,18 +192,18 @@ await createApp({
   title: 'faostat-mcp-server',
   sessionMode: 'stateless',
   tools: [listDomainsTool, resolveCodesTool, queryObservationsTool,
-          commodityProfileTool, dataframeQueryTool, dataframeDescribeTool,
+          commodityProfileTool, dataframeQueryRegistration(canvasRowLimit()), dataframeDescribeTool,
           dataframeDropRegistration(dataframeDropEnabled)],
   instructions: 'Global food & agriculture statistics from the UN FAOSTAT … Workflow: ' +
     'faostat_list_domains → faostat_resolve_codes → faostat_query_observations …',
   setup(core) { /* wire canvas + mirror, schedule HTTP refresh */ },
-  async teardown() { await mirror?.close(); },
+  async teardown() { await refresh?.stop(); await mirror?.close(); },
 });
 ```
 
-`sessionMode` declares the HTTP session posture in `src/` rather than leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). `stateless` is correct here because no handler calls `ctx.requestInput` — add `require: 'stateful'` only if one ever does, so startup fails loudly instead of serving a mode where a 2025-era client can never answer the prompt. `teardown(core)` is the `setup()` counterpart: it closes the mirror's per-domain SQLite handles and the shared dimension database, which nothing else releases. It runs after the transport stops and before the logger closes, on every shutdown path. The refresh cron needs no hook — the framework calls `schedulerService.destroyAll()` itself.
+`sessionMode` declares the HTTP session posture in `src/` rather than leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). `stateless` is correct here because no handler calls `ctx.requestInput` — add `require: 'stateful'` only if one ever does, so startup fails loudly instead of serving a mode where a 2025-era client can never answer the prompt. `teardown(core)` is the `setup()` counterpart: it closes the mirror's per-domain SQLite handles and the shared dimension database, which nothing else releases. It runs after the transport stops and before the logger closes, on every shutdown path. It first awaits `refresh?.stop()`, which aborts a scheduled refresh in flight and waits for it to settle — `schedulerService.destroyAll()` runs only after the hook and stops future ticks, not a running one — and a run stopped mid-build stops waiting at once, so shutdown reaches `mirror.close()` well inside the framework's 10 s backstop.
 
-`instructions` is optional server-level orientation, sent on every `initialize` as session-level context — here it carries the discover → resolve → query workflow, the aggregate-exclusion default, the canvas spillover path, and the data-quality-flag reminder, so the guidance isn't duplicated across every tool description. The canonical in-code identity block is `name` + `title` only — never duplicate `description` into `createApp()` (it derives from `package.json`).
+`instructions` is optional server-level orientation, sent on every `initialize` as session-level context — here it carries the discover → resolve → query workflow, the aggregate-exclusion default, the paging and canvas staging path, and the data-quality-flag reminder, so the guidance isn't duplicated across every tool description. The canonical in-code identity block is `name` + `title` only — never duplicate `description` into `createApp()` (it derives from `package.json`).
 
 ---
 
@@ -275,12 +284,14 @@ src/
       faostat-mirror.ts                 # FaostatMirror — per-domain MirrorService + dimension store
       read-pool.ts                      # ReadPool — cube reads + statistics builds on 2 worker threads, per-call query_timeout ceiling
       read-worker.ts                    # Worker entry — runs a read or an ANALYZE; self-contained (package + node: imports only)
+      scheduled-refresh.ts              # ScheduledRefresh — the HTTP refresh cron's job: per-domain deadline + shutdown stop, skips sync_locked
       ingester.ts                       # Streaming bulk-ZIP → SQLite ingester
       manifest.ts                       # Bulk manifest fetch/parse (datasets_E.json)
       csv.ts, dimensions-store.ts, http.ts, types.ts
   mcp-server/
     tools/
       markdown-cell.ts                  # markdownCell() — table-cell escaping shared by the format()s
+      count-input.ts                    # countInput() / withStrictCountInputs() — limit, top_n, row_limit served at their cap, or rejected when FAOSTAT_CLAMP_LIMITS=false
       definitions/
         list-domains.tool.ts  resolve-codes.tool.ts  query-observations.tool.ts
         commodity-profile.tool.ts  dataframe-query.tool.ts  dataframe-describe.tool.ts
@@ -377,7 +388,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run start:stdio` | Production mode (stdio) |
 | `bun run start:http` | Production mode (HTTP) |
 | `bun run mirror:init` | One-time bootstrap — download and index the `FAOSTAT_DOMAINS` set into the local mirror. Idempotent, resumable per domain. Required before the data tools answer queries. |
-| `bun run mirror:refresh` | Re-sync domains whose upstream `DateUpdate` has advanced (skips unchanged), and build query-planner statistics (`ANALYZE`) for any domain that has none, unchanged ones included. Run out-of-band on stdio; HTTP transport schedules it via `FAOSTAT_REFRESH_CRON`. |
+| `bun run mirror:refresh` | Re-sync domains whose upstream `DateUpdate` has advanced (skips unchanged), and build query-planner statistics (`ANALYZE`) for any domain whose statistics are missing or do not cover one of its indexes, unchanged ones included. Run out-of-band on stdio; HTTP transport schedules it via `FAOSTAT_REFRESH_CRON`. |
 | `bun run mirror:verify` | Report per-domain sync status, local row counts, checkpoints, and shared dimension population. |
 | `bun run lint:mcp` | Validate MCP tool definitions against the spec (format-parity, schema shape, naming). Rule catalog: `api-linter` skill. |
 | `bun run lint:packaging` | Packaging surface checks — registry/bundle env parity, npm launch shape, bundle exclusions, plugin manifests, and published `skills/` (run by devcheck). |
@@ -393,7 +404,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 `bun run bundle` produces a `.mcpb` extension bundle for Claude Desktop. Root development paths need root-anchored `.mcpbignore` lines; root `skills/` ships. The cleaner prunes dev dependencies and strips dependency-root agent docs, platform-specific DuckDB bindings, node-gyp generator/intermediate files, and build-only framework/SQLite package files. Nested SDK runtime `dist/ext/skills/` modules and compiled `*.node` addons stay. `manifest.json` disables canvas in the portable bundle; npm and Docker retain DuckDB. MCPB uses stdio.
 
-**Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match.
+**Adding an env var:** list it in `server.json` (registry discovery, `environmentVariables[]`); add it to `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`) only when the bundle should surface it, since `lint:packaging` (run by `devcheck`) passes with a variable in `server.json` alone. It requires every `user_config` option to be wired into `mcp_config.env` as `"X": "${user_config.X}"` and listed in `server.json`, an optional string option to carry `"default": ""`, and every required `server.json` variable (no default) to be a key in `mcp_config.env`.
 
 **README install badges** (Claude Desktop `.mcpb`, Cursor, VS Code) and the `base64` / `encodeURIComponent` config-generation commands are ship-time concerns — run the `polish-docs-meta` skill, which carries the badge format, layout, and generation snippets in `framework-skills/polish-docs-meta/references/readme.md`.
 
@@ -466,4 +477,6 @@ import { canvasEnabled, stageObservations } from '@/services/canvas-staging.js';
 - [ ] `.codex-plugin/mcp.json` server name key matches `package.json` name (no API keys — FAOSTAT is keyless)
 - [ ] `.claude-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; inline `mcpServers` entry with the server name key
 - [ ] Root `plugin.json` and `mcp.json` follow Agent Plugins 1.0.0; unscoped display name, full npm install name, fixed env matching `.codex-plugin/mcp.json`; keep the Codex overlay's `mcpServers` pointer
+- [ ] Any new root dev path has a root-anchored line in `.mcpbignore`; `bun run bundle` and `lint:packaging` pass
+- [ ] If the server publishes a skill in root `skills/`: `lint:packaging` passes, and `field-test` verified every gate and identifier claim in it against live tool behavior
 - [ ] `bun run devcheck` passes

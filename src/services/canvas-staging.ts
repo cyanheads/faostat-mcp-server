@@ -59,7 +59,12 @@ const CANVAS_ID_KEY = 'canvas-id';
 const TABLE_CHARSET = 'abcdefghijklmnopqrstuvwxyz0123456789';
 /** Per-table TTL: canvas tables are ephemeral working slices. */
 const TABLE_TTL_MS = 2 * 60 * 60 * 1000;
-/** Inline preview character budget (≈25k tokens). */
+/**
+ * Characters of rows `spillover()` buffers before it streams the rest of the source to
+ * a canvas table. A source that drains under it is registered from the buffer only when
+ * it outgrows the caller's `previewLimit`. It sizes that buffer and nothing else:
+ * callers page from their own read, never from `previewRows`.
+ */
 const PREVIEW_CHARS = 100_000;
 /**
  * Hard cap on rows staged into a single canvas table. Bounds both the JS-side
@@ -116,21 +121,46 @@ function mintTableName(): string {
   return `faostat_${idGenerator.generateRandomString(8, TABLE_CHARSET)}`;
 }
 
-/** Acquire the tenant's shared canvas, reusing the stored id when still live. */
-async function acquireShared(ctx: Context): Promise<CanvasInstance> {
-  const canvas = getCanvas();
-  if (!canvas) throw new Error('DataCanvas is not enabled. Set CANVAS_PROVIDER_TYPE=duckdb.');
-  const stored = await ctx.state.get<string>(CANVAS_ID_KEY);
-  if (stored) {
-    try {
-      return await canvas.acquire(stored, ctx);
-    } catch {
-      await ctx.state.delete(CANVAS_ID_KEY);
-    }
-  }
-  const instance = await canvas.acquire(undefined, ctx);
-  await ctx.state.set(CANVAS_ID_KEY, instance.canvasId);
-  return instance;
+/**
+ * Delete every `df-meta/` record — the `onReplace` hook of the shared canvas. It
+ * runs under the framework's per-tenant lock whenever the slot holds no live
+ * canvas, before a replacement is minted and stored, so no record of the new
+ * canvas exists yet. Every canvas this layer mints comes from that slot, and one
+ * is minted only when the last has died, so with the slot dead or empty no
+ * recorded canvas is live: purging by key covers both the dead id the framework
+ * passes and the `undefined` it passes when the stored id expired with a canvas
+ * that reached its absolute cap.
+ */
+async function purgeStagedRecords(ctx: Context): Promise<void> {
+  const keys: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await ctx.state.list(META_PREFIX, cursor ? { cursor } : {});
+    keys.push(...page.items.map((item) => item.key));
+    cursor = page.cursor;
+  } while (cursor);
+  if (keys.length > 0) await ctx.state.deleteMany(keys);
+}
+
+/**
+ * The tenant's shared canvas, minted once when none is live — concurrent first
+ * calls queue on the framework's lock and receive the one it mints (#58). The key
+ * is the one 0.6.0 stored the bare id under, so a stored canvas is still found.
+ */
+function sharedCanvas(canvas: DataCanvas, ctx: Context): Promise<CanvasInstance> {
+  return canvas.acquireShared(ctx, {
+    stateKey: CANVAS_ID_KEY,
+    onReplace: () => purgeStagedRecords(ctx),
+  });
+}
+
+/** The tenant's live shared canvas, or `undefined` — never mints one. */
+function liveSharedCanvas(canvas: DataCanvas, ctx: Context): Promise<CanvasInstance | undefined> {
+  return canvas.acquireShared(ctx, {
+    stateKey: CANVAS_ID_KEY,
+    create: false,
+    onReplace: () => purgeStagedRecords(ctx),
+  });
 }
 
 /**
@@ -158,9 +188,9 @@ async function acquireExplicit(
 }
 
 /**
- * Spill an observation row stream to a canvas table. Inlines a preview and, when
- * the stream overflows the preview budget, registers the full set under a fresh
- * `faostat_<id>` table with a 2h TTL + provenance. Returns a degraded
+ * Spill an observation row stream to a canvas table. Buffers rows up to the
+ * character budget and, when the stream overflows it, registers the full set under
+ * a fresh `faostat_<id>` table with a 2h TTL + provenance. Returns a degraded
  * (non-spilled) result if the canvas op fails — except that a caller-named
  * `canvasId` that does not resolve fails the call with `canvas_not_found` (#35).
  * Omitted, the session canvas is used, and a dead one is replaced silently.
@@ -209,7 +239,7 @@ export async function stageObservations<T extends Record<string, unknown>>(
     }
   }
   try {
-    const instance = named ?? (await acquireShared(ctx));
+    const instance = named ?? (await sharedCanvas(canvas, ctx));
 
     const tableName = opts.tableName ?? mintTableName();
     const result = await spillover({
@@ -310,9 +340,9 @@ export async function stageObservations<T extends Record<string, unknown>>(
  * expired entries. An explicit `canvasId` resolves that canvas — throwing
  * `canvas_not_found` for an unknown/other-tenant id, which the tool's declared
  * recovery completes (see {@link acquireExplicit}) — and scopes the listing to it;
- * omitted uses the session's shared canvas. Filtering on the resolved canvas is
- * what stops a valid-but-different `canvas_id` from leaking another canvas's table
- * metadata.
+ * omitted uses the session's shared canvas, and lists nothing when none is live.
+ * Filtering on the resolved canvas is what stops a valid-but-different `canvas_id`
+ * from leaking another canvas's table metadata.
  */
 export async function describeStaged(
   ctx: Context,
@@ -323,7 +353,8 @@ export async function describeStaged(
   await sweepExpired(ctx);
   const instance = opts.canvasId
     ? await acquireExplicit(canvas, opts.canvasId, ctx)
-    : await acquireShared(ctx);
+    : await liveSharedCanvas(canvas, ctx);
+  if (!instance) return [];
   if (opts.tableName) {
     const meta = await ctx.state.get<StagedTableMeta>(`${META_PREFIX}${opts.tableName}`);
     return meta && meta.canvasId === instance.canvasId ? [meta] : [];
@@ -349,9 +380,9 @@ export async function describeStaged(
  * table by that name existed on the resolved canvas. An explicit `canvasId` resolves
  * that canvas — throwing `canvas_not_found` for an unknown/other-tenant id, which the
  * tool's declared recovery completes (see {@link acquireExplicit}); omitted uses the
- * session's shared canvas. Only that canvas's table is dropped and only metadata
- * recorded for it is cleared, so a valid-but-different `canvas_id` reaches nothing
- * staged elsewhere.
+ * session's shared canvas, and drops nothing when none is live. Only that canvas's
+ * table is dropped and only metadata recorded for it is cleared, so a
+ * valid-but-different `canvas_id` reaches nothing staged elsewhere.
  */
 export async function dropStaged(
   ctx: Context,
@@ -363,7 +394,8 @@ export async function dropStaged(
   await sweepExpired(ctx);
   const instance = opts.canvasId
     ? await acquireExplicit(canvas, opts.canvasId, ctx)
-    : await acquireShared(ctx);
+    : await liveSharedCanvas(canvas, ctx);
+  if (!instance) return false;
   const dropped = await instance.drop(tableName);
   const metaKey = `${META_PREFIX}${tableName}`;
   const meta = await ctx.state.get<StagedTableMeta>(metaKey);
@@ -419,8 +451,8 @@ const DUCKDB_INVALID_SQL_REASONS = new Set<string>(Object.values(DUCKDB_ERROR_RE
  * Run a read-only SELECT against the tenant's shared canvas. System catalogs are
  * denied so a caller can't enumerate every staged handle. Normalizes the SQL
  * gate's rejections to this tool's declared contract: `missing_table` (with
- * FAOSTAT-facing recovery), `system_catalog_access` (passed through), the
- * framework-native `invalid_sql` (passed through, preserving `data.binderMessage`),
+ * FAOSTAT-facing recovery), `system_catalog_access` (with the gate's hint dropped so
+ * the tool's declared recovery fills in), the framework-native `invalid_sql` (passed through, preserving `data.binderMessage`),
  * and a stable `invalid_sql` for every other malformed / non-read-only statement —
  * including the gate's own `non_select_statement` / `multi_statement` McpErrors,
  * which otherwise reach the client with an undeclared `data.reason`.
@@ -437,10 +469,10 @@ export async function queryStaged(
   // `canvas_not_found` (NotFound) with no hint of its own, so the tool's declared
   // recovery fills in. It is left to bubble (it fires here, outside the try below,
   // so it is never remapped to invalid_sql). Omitted falls back to the session's
-  // shared canvas.
+  // shared canvas, minted when none is live so SQL naming no staged table still runs.
   const instance = opts.canvasId
     ? await acquireExplicit(canvas, opts.canvasId, ctx)
-    : await acquireShared(ctx);
+    : await sharedCanvas(canvas, ctx);
   try {
     const result = await instance.query(sql, {
       rowLimit: opts.rowLimit,
@@ -466,8 +498,14 @@ export async function queryStaged(
           },
         });
       }
-      // system_catalog_access is a declared contract reason — let it through as-is.
-      if (reason === SQL_GATE_REASONS.systemCatalogAccess) throw err;
+      // system_catalog_access is a declared contract reason. The gate's own hint only
+      // says to query staged tables, and a hint set on the error outranks a declared
+      // one, so it is dropped: the tool's declared recovery, which also says to rename
+      // an alias or CTE spelled like a metadata view, reaches both surfaces instead.
+      if (reason === SQL_GATE_REASONS.systemCatalogAccess) {
+        const { recovery: _gateHint, ...rest } = data ?? {};
+        throw new McpError(err.code, err.message, rest, { cause: err });
+      }
       // Every other gate reason, plus the engine's own caller-side rejections, means
       // the SQL is not a valid read-only SELECT (or failed executing). Remap to the
       // stable contract reason, preserving the message and — when the framework
@@ -503,16 +541,19 @@ export async function queryStaged(
 }
 
 /**
- * Drop staged tables whose TTL has elapsed. Best-effort, and against the shared
- * session canvas only: a table staged on a non-default canvas has its metadata
- * cleared here but the table itself is reclaimed by that canvas's own TTL / cap.
- * (Per-canvas sweeping is a lower-severity follow-up.)
+ * Drop staged tables whose TTL has elapsed, against the live shared session canvas
+ * only: a table staged on a non-default canvas has its metadata cleared here but
+ * the table itself is reclaimed by that canvas's own TTL / cap, and with no live
+ * shared canvas the tables went with it. Resolving that canvas never mints one;
+ * a failure to resolve it — the call's cancellation included — fails the call,
+ * while dropping a table stays best-effort. (Per-canvas sweeping is a
+ * lower-severity follow-up.)
  */
 async function sweepExpired(ctx: Context): Promise<void> {
   const canvas = getCanvas();
   if (!canvas) return;
   const nowIso = new Date().toISOString();
-  let instance: CanvasInstance | undefined;
+  let shared: Promise<CanvasInstance | undefined> | undefined;
   let cursor: string | undefined;
   do {
     const page = await ctx.state.list(META_PREFIX, {
@@ -522,7 +563,8 @@ async function sweepExpired(ctx: Context): Promise<void> {
     for (const item of page.items) {
       const meta = item.value as StagedTableMeta | undefined;
       if (!meta || meta.expiresAt > nowIso) continue;
-      instance ??= await acquireShared(ctx).catch(() => undefined);
+      shared ??= liveSharedCanvas(canvas, ctx);
+      const instance = await shared;
       if (instance) await instance.drop(meta.tableName).catch(() => {});
       await ctx.state.delete(item.key);
     }

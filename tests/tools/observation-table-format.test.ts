@@ -86,6 +86,7 @@ const renderTrend = (production_trend: TrendPoint[]) =>
     commodityProfileTool.format?.({
       item_query: 'wheat',
       resolved_items: [{ code: 15, name: 'Wheat' }],
+      ranking_elements: { top_producers: [], top_exporters: [], top_importers: [] },
       top_producers: [],
       top_exporters: [],
       top_importers: [],

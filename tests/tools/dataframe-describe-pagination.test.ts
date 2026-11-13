@@ -12,11 +12,17 @@
  * @module tests/tools/dataframe-describe-pagination
  */
 
+import { type AnyToolDefinition, z } from '@cyanheads/mcp-ts-core';
 import { createCanvasService, type DataCanvas } from '@cyanheads/mcp-ts-core/canvas';
 import { parseConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createMockContext,
+  getEnrichment,
+  type MockContextLogger,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { withStrictCountInputs } from '@/mcp-server/tools/count-input.js';
 import { dataframeDescribeTool } from '@/mcp-server/tools/definitions/dataframe-describe.tool.js';
 import { setCanvas } from '@/services/canvas-accessor.js';
 import { OBSERVATION_TABLE_SCHEMA, stageObservations } from '@/services/canvas-staging.js';
@@ -171,7 +177,11 @@ describe('faostat_dataframe_describe bounded listing', () => {
     expect(enrichment.totalMatches).toBe(0);
     expect(enrichment.truncated).toBe(false);
     expect(enrichment.notice).toMatch(/No tables are staged/i);
-    expect(enrichment.notice).toMatch(/faostat_query_observations/);
+    // Observations stage on a first page whose match exceeds limit, not on a size budget.
+    expect(enrichment.notice).toContain(
+      'A first faostat_query_observations page (offset 0) whose match exceeds limit',
+    );
+    expect(enrichment.notice).toMatch(/faostat_commodity_profile/);
   });
 
   it('renders only the current page into content[], so both surfaces agree', async () => {
@@ -189,5 +199,75 @@ describe('faostat_dataframe_describe bounded listing', () => {
     for (const name of staged.filter((n) => !shown.includes(n))) {
       expect(text).not.toContain(`### ${name}`);
     }
+  });
+});
+
+/**
+ * The staged-table metadata lives in one mock context's `ctx.state`, which the contract
+ * runner cannot share, so these read the handler's result and its enrichment — the
+ * fields the framework merges into `structuredContent` and renders as the `content[]`
+ * trailer (that rendering is pinned in `tests/tools/count-input.test.ts`) — beside
+ * `format()`.
+ */
+describe('faostat_dataframe_describe limit above the 100 cap (#56)', () => {
+  /** The rendered `content[]` body for a result. */
+  const render = (result: Parameters<NonNullable<typeof dataframeDescribeTool.format>>[0]) =>
+    (dataframeDescribeTool.format?.(result) ?? [])
+      .map((c) => (c.type === 'text' ? c.text : ''))
+      .join('\n');
+
+  it('serves limit 150 at 100 and names the next page', async () => {
+    const ctx = makeCtx('describe-clamp-wide');
+    await stageTables(ctx, 101);
+    const { result, enrichment } = await describe_(ctx, { limit: 150 });
+    expect(result.tables).toHaveLength(100);
+    expect(enrichment).toMatchObject({
+      requestedLimit: 150,
+      effectiveLimit: 100,
+      totalMatches: 101,
+      truncated: true,
+      nextOffset: 100,
+      notice:
+        'limit 150 is above the 100 cap; returned up to 100. Showing staged tables 1–100 of 101. Call again with offset 100 to fetch the next page.',
+    });
+    expect(render(result)).toContain('**100 staged table(s):**');
+    expect((ctx.log as MockContextLogger).calls.filter((c) => /cap/.test(c.msg))).toHaveLength(1);
+  });
+
+  it('carries no clamp fields or notice at the cap', async () => {
+    const ctx = makeCtx('describe-clamp-at-cap');
+    await stageTables(ctx, 3);
+    const { result, enrichment } = await describe_(ctx, { limit: 100 });
+    expect(result.tables).toHaveLength(3);
+    expect(enrichment).not.toHaveProperty('requestedLimit');
+    expect(enrichment).not.toHaveProperty('effectiveLimit');
+    expect(enrichment).not.toHaveProperty('notice');
+    expect((ctx.log as MockContextLogger).calls.filter((c) => /cap/.test(c.msg))).toEqual([]);
+  });
+
+  it('reports no clamp on a name lookup, which limit never binds', async () => {
+    const ctx = makeCtx('describe-clamp-name');
+    const [name] = await stageTables(ctx, 1);
+    const { result, enrichment } = await describe_(ctx, { name, limit: 150 });
+    expect(result.tables).toHaveLength(1);
+    expect(enrichment).not.toHaveProperty('requestedLimit');
+    expect(enrichment).not.toHaveProperty('notice');
+  });
+
+  it('advertises limit with no maximum, and with maximum 100 when registered strict', () => {
+    const limitOf = (definition: AnyToolDefinition) =>
+      z.toJSONSchema(definition.input, { io: 'input' }).properties?.limit;
+    expect(limitOf(dataframeDescribeTool)).toEqual({
+      type: 'integer',
+      minimum: 1,
+      default: 20,
+      description: expect.stringContaining('at most 100 per call'),
+    });
+    expect(limitOf(withStrictCountInputs(dataframeDescribeTool))).toMatchObject({
+      type: 'integer',
+      minimum: 1,
+      maximum: 100,
+      default: 20,
+    });
   });
 });

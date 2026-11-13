@@ -11,10 +11,18 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { countInput } from '@/mcp-server/tools/count-input.js';
 import { canvasEnabled, describeStaged } from '@/services/canvas-staging.js';
 
-/** Cap on staged tables returned in one page. */
-const MAX_TABLES = 100;
+/** Staged tables per page. */
+const LIMIT = countInput({
+  tool: 'faostat_dataframe_describe',
+  name: 'limit',
+  default: 20,
+  cap: 100,
+  description: (cap) =>
+    `Staged tables to return on this page, at most ${cap} per call. Each entry carries a full column schema, so the default keeps a discovery call small.`,
+});
 
 export const dataframeDescribeTool = tool('faostat_dataframe_describe', {
   title: 'faostat-mcp-server: dataframe describe',
@@ -38,10 +46,13 @@ export const dataframeDescribeTool = tool('faostat_dataframe_describe', {
       .describe(
         'Offset to pass on the next call to fetch the following page. Present only when truncated is true; absent on the last page and for `name` lookups.',
       ),
+    ...LIMIT.enrichment,
     notice: z
       .string()
       .optional()
-      .describe('Guidance when nothing is staged yet or more pages remain.'),
+      .describe(
+        'Guidance when limit was above its cap, nothing is staged yet, or more pages remain.',
+      ),
   },
 
   errors: [
@@ -80,15 +91,7 @@ export const dataframeDescribeTool = tool('faostat_dataframe_describe', {
       .describe(
         'Optional table name (faostat_xxxxxxxx) to describe a single staged table. Takes precedence over `offset` / `limit`, which are ignored for a name lookup (always single-page).',
       ),
-    limit: z
-      .number()
-      .int()
-      .min(1)
-      .max(MAX_TABLES)
-      .default(20)
-      .describe(
-        'Maximum staged tables to return on this page (max 100). Each entry carries a full column schema, so the default keeps a discovery call small.',
-      ),
+    limit: LIMIT.schema,
     offset: z
       .number()
       .int()
@@ -152,25 +155,29 @@ export const dataframeDescribeTool = tool('faostat_dataframe_describe', {
     }
 
     // A `name` lookup resolves at most one table and is never paged, so `limit`
-    // cannot bind there — `truncated` must stay false rather than describe a
-    // ceiling that did not apply.
+    // cannot bind there — it is not clamped, and `truncated` must stay false rather
+    // than describe a ceiling that did not apply.
     const total = entries.length;
-    const page = input.name ? entries : entries.slice(input.offset, input.offset + input.limit);
+    const limit = input.name ? undefined : LIMIT.clamp(ctx, input.limit);
+    const page = limit ? entries.slice(input.offset, input.offset + limit.effective) : entries;
     const nextOffset = input.offset + page.length;
-    const truncated = !input.name && nextOffset < total;
+    const truncated = limit !== undefined && nextOffset < total;
     ctx.enrich({ totalMatches: total, truncated, ...(truncated ? { nextOffset } : {}) });
 
+    // A clamped limit leads; the paging sentence after it names the next offset.
+    const notices: string[] = limit?.clamped ? [limit.notice] : [];
     if (page.length === 0) {
-      ctx.enrich.notice(
+      notices.push(
         total > 0
           ? `Offset ${input.offset} is past the ${total} staged table(s). Lower offset (0-based) to page back through the listing.`
-          : 'No tables are staged on this canvas. Run faostat_query_observations or faostat_commodity_profile first — a result larger than the inline budget stages one.',
+          : 'No tables are staged on this canvas. A first faostat_query_observations page (offset 0) whose match exceeds limit stages one, as does a faostat_commodity_profile whose observation set is too large to inline.',
       );
     } else if (truncated) {
-      ctx.enrich.notice(
+      notices.push(
         `Showing staged tables ${input.offset + 1}–${nextOffset} of ${total}. Call again with offset ${nextOffset} to fetch the next page.`,
       );
     }
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
 
     return {
       tables: page.map((meta) => ({

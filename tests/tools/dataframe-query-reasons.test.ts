@@ -16,18 +16,32 @@
  * Runs a real DuckDB canvas with one staged table, then drives the gate through
  * the handler and asserts the surfaced `data.reason` matches the declared
  * contract. Also covers row_limit truncation disclosure (#10 — `truncated` and a
- * materialized `row_count`) and `canvas_id` selection (#11 — own-canvas sanity,
- * unknown token → `canvas_not_found`, and a second distinct canvas selected by id).
+ * materialized `row_count`), `canvas_id` selection (#11 — own-canvas sanity,
+ * unknown token → `canvas_not_found`, and a second distinct canvas selected by id),
+ * and `row_limit` above its cap (#56 — served at the canvas's configured row limit,
+ * whatever that is, never failing on the canvas's own bound).
  * @module tests/tools/dataframe-query-reasons
  */
 
+import { type AnyToolDefinition, z } from '@cyanheads/mcp-ts-core';
 import { createCanvasService, type DataCanvas } from '@cyanheads/mcp-ts-core/canvas';
 import { parseConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createMockContext,
+  getEnrichment,
+  type MockContextLogger,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { dataframeQueryTool } from '@/mcp-server/tools/definitions/dataframe-query.tool.js';
+import { withStrictCountInputs } from '@/mcp-server/tools/count-input.js';
+import {
+  dataframeQueryRegistration,
+  dataframeQueryTool,
+} from '@/mcp-server/tools/definitions/dataframe-query.tool.js';
 import { setCanvas } from '@/services/canvas-accessor.js';
+import { PROFILE_TABLE_SCHEMA } from '@/services/canvas-staging.js';
+import { renderCell } from '../helpers/markdown-table.js';
 
 let canvas: DataCanvas;
 
@@ -140,6 +154,86 @@ describe('faostat_dataframe_query error-contract reasons', () => {
     await expect(run(`SELECT * FROM information_schema.tables`)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'system_catalog_access' },
+    });
+  });
+
+  /**
+   * The SQL gate reads names, not their role: a name spelled like a DuckDB internal
+   * metadata view is refused wherever it stands as an identifier. Each statement is
+   * built twice: once with the view's spelling, once with the identifier renamed.
+   */
+  describe('a name spelled like an internal metadata view', () => {
+    const declared = dataframeQueryTool.errors?.find(
+      (e) => e.reason === 'system_catalog_access',
+    )?.recovery;
+
+    /** Run `sql` through the contract runner against this test's staged canvas. */
+    const contract = async (sql: string) => {
+      const canvasId = await ctx.state.get<string>('canvas-id');
+      if (!canvasId || !ctx.tenantId) throw new Error('Expected a staged session canvas');
+      return surfaces(
+        await runToolContract(
+          dataframeQueryTool,
+          { sql, canvas_id: canvasId },
+          { context: { tenantId: ctx.tenantId } },
+        ),
+      );
+    };
+
+    it('is declared with a recovery that says to rename it', () => {
+      expect(declared).toContain('rename any column alias, CTE, or table alias');
+    });
+
+    it.each([
+      [
+        'a bare column alias',
+        'duckdb_tables',
+        (t: string, n: string) => `SELECT area AS ${n} FROM ${t}`,
+      ],
+      [
+        'a double-quoted column alias',
+        'duckdb_tables',
+        (t: string, n: string) => `SELECT area AS "${n}" FROM ${t}`,
+      ],
+      [
+        'an upper-case column alias',
+        'duckdb_tables',
+        (t: string, n: string) => `SELECT area AS ${n.toUpperCase()} FROM ${t}`,
+      ],
+      [
+        'a CTE name',
+        'pg_tables',
+        (t: string, n: string) => `WITH ${n} AS (SELECT area FROM ${t}) SELECT area FROM ${n}`,
+      ],
+      [
+        'a table alias',
+        'pg_tables',
+        (t: string, n: string) => `SELECT ${n}.area FROM ${t} AS ${n}`,
+      ],
+    ])(
+      'as %s is refused with the declared recovery, and answers once renamed',
+      async (_role, view, build) => {
+        const refused = await contract(build(tableName, view));
+        expect(refused.structured.error).toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          data: { reason: 'system_catalog_access', recovery: { hint: declared } },
+        });
+        // content[] escapes Markdown punctuation (`faostat\_\<id>`); compare what renders.
+        expect(renderCell(refused.text)).toContain(`Recovery: ${declared}`);
+
+        const renamed = await contract(build(tableName, 'picked'));
+        expect(renamed.structured.error).toBeUndefined();
+        expect(renamed.structured.rows).toHaveLength(5);
+      },
+    );
+
+    it('inside a string literal is not refused', async () => {
+      const { structured } = await contract(
+        `SELECT area, 'duckdb_tables' AS label FROM ${tableName} WHERE area <> 'pg_tables'`,
+      );
+      expect(structured.error).toBeUndefined();
+      expect(structured.rows).toHaveLength(5);
+      expect(structured.rows?.[0]).toMatchObject({ label: 'duckdb_tables' });
     });
   });
 
@@ -259,6 +353,223 @@ describe('faostat_dataframe_query error-contract reasons', () => {
     // The session canvas cannot see the second canvas's table — isolation holds.
     await expect(run('SELECT area FROM faostat_second_tbl')).rejects.toMatchObject({
       data: { reason: 'missing_table' },
+    });
+  });
+});
+
+describe('faostat_dataframe_query sql description', () => {
+  it('names every column a staged table can carry', () => {
+    const listed = new Set(dataframeQueryTool.input.shape.sql.description?.match(/\b[a-z_]+\b/g));
+    const missing = PROFILE_TABLE_SCHEMA.map((column) => column.name).filter(
+      (name) => !listed.has(name),
+    );
+    expect(missing).toEqual([]);
+  });
+});
+
+/** What a client reads from a `runToolContract` result: both surfaces. */
+function surfaces(wire: Awaited<ReturnType<typeof runToolContract>>) {
+  const structured = (wire.structuredContent ?? {}) as Record<string, unknown> & {
+    rows?: unknown[];
+    notice?: string;
+  };
+  const text = wire.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
+  return { structured, text };
+}
+
+/** The `row_limit` input as `tools/list` advertises it. */
+const rowLimitOf = (definition: AnyToolDefinition) =>
+  z.toJSONSchema(definition.input, { io: 'input' }).properties?.row_limit;
+
+/** The truncation sentence for `rows` returned, with the raise-row_limit route when it applies. */
+const truncationSentence = (rows: number, raiseTo?: number) =>
+  `Returned ${rows} rows — capped at row_limit, more rows exist (no exact total on this path). To reach the rest: page deterministically with ORDER BY plus SQL LIMIT/OFFSET${raiseTo === undefined ? '' : `, raise row_limit (at most ${raiseTo} per call)`}, or aggregate with GROUP BY.`;
+
+describe('faostat_dataframe_query row_limit above the default canvas row limit (#56)', () => {
+  /** The framework's default canvas row limit, which `dataframeQueryTool` is capped at. */
+  const CAP = 10_000;
+  const TENANT = 'df-row-limit';
+  let canvasId: string;
+  let sql: string;
+
+  beforeAll(async () => {
+    const ctx = makeCtx(TENANT);
+    const instance = await canvas.acquire(undefined, ctx);
+    canvasId = instance.canvasId;
+    function* rows(): Generator<Record<string, unknown>> {
+      for (let i = 1; i <= 20_000; i++) yield { area_code: i, flag: 'A' };
+    }
+    const { tableName } = await instance.registerTable('faostat_big_tbl', rows(), {
+      schema: [
+        { name: 'area_code', type: 'BIGINT' },
+        { name: 'flag', type: 'VARCHAR' },
+      ],
+    });
+    sql = `SELECT area_code, flag FROM ${tableName} ORDER BY area_code LIMIT 20000`;
+  });
+
+  const call = (args: { row_limit?: number; sql?: string }) =>
+    runToolContract(
+      dataframeQueryTool,
+      { canvas_id: canvasId, sql, ...args },
+      { context: { tenantId: TENANT } },
+    );
+
+  it('serves row_limit 50000 over SELECT … LIMIT 20000 as 10000 rows, truncated, on both surfaces', async () => {
+    const wire = await call({ row_limit: 50_000 });
+    expect(wire.isError).not.toBe(true);
+    const { structured, text } = surfaces(wire);
+    expect(structured.rows).toHaveLength(CAP);
+    expect(structured).toMatchObject({
+      row_count: CAP,
+      truncated: true,
+      requestedRowLimit: 50_000,
+      effectiveRowLimit: CAP,
+    });
+    const notice = `row_limit 50000 is above the 10000 cap; returned up to 10000. ${truncationSentence(CAP)}`;
+    expect(structured.notice).toBe(notice);
+    expect(text).toContain('**10000 rows** (truncated — capped at row_limit, more rows exist)');
+    expect(text).toContain('**requestedRowLimit:** 50000');
+    expect(text).toContain('**effectiveRowLimit:** 10000');
+    expect(text).toContain(`> ${notice}`);
+    expect(text).not.toContain('raise row_limit');
+  });
+
+  it('serves row_limit at the cap as asked, with no clamp fields and no raise route', async () => {
+    const wire = await call({ row_limit: CAP });
+    expect(wire.isError).not.toBe(true);
+    const { structured, text } = surfaces(wire);
+    expect(structured.rows).toHaveLength(CAP);
+    expect(structured.truncated).toBe(true);
+    expect(structured).not.toHaveProperty('requestedRowLimit');
+    expect(structured).not.toHaveProperty('effectiveRowLimit');
+    expect(structured.notice).toBe(truncationSentence(CAP));
+    expect(text).not.toContain('requestedRowLimit');
+    expect(text).toContain(`> ${truncationSentence(CAP)}`);
+    expect(text).not.toContain('raise row_limit');
+  });
+
+  it('names raising row_limit, up to the cap, while row_limit is below it', async () => {
+    const wire = await call({ row_limit: 2 });
+    const { structured, text } = surfaces(wire);
+    expect(structured.rows).toHaveLength(2);
+    expect(structured.notice).toBe(truncationSentence(2, CAP));
+    expect(text).toContain(`> ${truncationSentence(2, CAP)}`);
+  });
+
+  it('leads with the clamp sentence on an empty result too, logging the clamp once', async () => {
+    const ctx = makeCtx(TENANT);
+    const result = await dataframeQueryTool.handler(
+      dataframeQueryTool.input.parse({
+        canvas_id: canvasId,
+        sql: sql.replace('ORDER BY', 'WHERE area_code < 0 ORDER BY'),
+        row_limit: CAP + 1,
+      }),
+      ctx,
+    );
+    expect(result).toMatchObject({ rows: [], row_count: 0, truncated: false });
+    expect(getEnrichment(ctx)).toEqual({
+      requestedRowLimit: CAP + 1,
+      effectiveRowLimit: CAP,
+      notice:
+        'row_limit 10001 is above the 10000 cap; returned up to 10000. Query returned 0 rows. Verify table names with faostat_dataframe_describe and check the WHERE conditions.',
+    });
+    const clampLines = (ctx.log as MockContextLogger).calls.filter((c) =>
+      c.msg.startsWith('Count input above its cap'),
+    );
+    expect(clampLines).toHaveLength(1);
+  });
+
+  it('advertises row_limit with no maximum, and with maximum 10000 when registered strict', () => {
+    const description = 'Hard cap on rows in the response, at most 10000 per call.';
+    expect(rowLimitOf(dataframeQueryTool)).toEqual({
+      type: 'integer',
+      minimum: 1,
+      default: 1000,
+      description,
+    });
+    expect(rowLimitOf(withStrictCountInputs(dataframeQueryTool))).toEqual({
+      type: 'integer',
+      minimum: 1,
+      maximum: CAP,
+      default: 1000,
+      description,
+    });
+  });
+});
+
+/**
+ * A deployment that sets `CANVAS_DEFAULT_ROW_LIMIT` below 10000: the canvas refuses
+ * a larger row limit with `invalid_query_bounds`, so the tool `src/index.ts` registers
+ * for it is capped there, and a larger `row_limit` — the default 1000 included — is
+ * served at that limit.
+ */
+describe('faostat_dataframe_query on a canvas configured to 50 rows (#56)', () => {
+  const LIMIT = 50;
+  const configured = dataframeQueryRegistration(LIMIT);
+  const sql = 'SELECT n FROM range(200) t(n) ORDER BY n';
+  let small: DataCanvas;
+
+  beforeAll(() => {
+    const built = createCanvasService(
+      parseConfig({ CANVAS_PROVIDER_TYPE: 'duckdb', CANVAS_DEFAULT_ROW_LIMIT: String(LIMIT) }),
+    );
+    if (!built) throw new Error('expected a DuckDB canvas to be constructed for the test');
+    small = built;
+    setCanvas(small);
+  });
+
+  afterAll(async () => {
+    setCanvas(canvas);
+    await small.shutdown(createMockContext({ tenantId: 'teardown-small' }));
+  });
+
+  const call = (args: { row_limit?: number }) =>
+    runToolContract(configured, { sql, ...args }, { context: { tenantId: 'df-small' } });
+
+  it('serves row_limit 80 at the configured 50 with the clamp notice, never invalid_query_bounds', async () => {
+    const wire = await call({ row_limit: 80 });
+    expect(wire.isError).not.toBe(true);
+    const { structured, text } = surfaces(wire);
+    expect(structured.rows).toHaveLength(LIMIT);
+    expect(structured).toMatchObject({
+      truncated: true,
+      requestedRowLimit: 80,
+      effectiveRowLimit: LIMIT,
+    });
+    const notice = `row_limit 80 is above the 50 cap; returned up to 50. ${truncationSentence(LIMIT)}`;
+    expect(structured.notice).toBe(notice);
+    expect(text).toContain('**requestedRowLimit:** 80');
+    expect(text).toContain('**effectiveRowLimit:** 50');
+    expect(text).toContain(`> ${notice}`);
+  });
+
+  it('defaults row_limit to the configured limit, with no clamp', async () => {
+    const wire = await call({});
+    expect(wire.isError).not.toBe(true);
+    const { structured } = surfaces(wire);
+    expect(structured.rows).toHaveLength(LIMIT);
+    expect(structured).not.toHaveProperty('requestedRowLimit');
+    expect(structured.notice).toBe(truncationSentence(LIMIT));
+  });
+
+  it('states the configured limit in the default, description, strict maximum, and truncated description', () => {
+    const description = 'Hard cap on rows in the response, at most 50 per call.';
+    expect(rowLimitOf(configured)).toEqual({
+      type: 'integer',
+      minimum: 1,
+      default: LIMIT,
+      description,
+    });
+    expect(rowLimitOf(withStrictCountInputs(configured))).toEqual({
+      type: 'integer',
+      minimum: 1,
+      maximum: LIMIT,
+      default: LIMIT,
+      description,
+    });
+    expect(z.toJSONSchema(configured.output).properties?.truncated).toMatchObject({
+      description: expect.stringContaining('raise row_limit (at most 50 per call)'),
     });
   });
 });

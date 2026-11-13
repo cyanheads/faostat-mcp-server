@@ -14,8 +14,10 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { type AnyToolDefinition, z } from '@cyanheads/mcp-ts-core';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { withStrictCountInputs } from '@/mcp-server/tools/count-input.js';
 import { resolveCodesTool } from '@/mcp-server/tools/definitions/resolve-codes.tool.js';
 import { type FaostatMirror, initFaostatMirror } from '@/services/faostat-mirror/index.js';
 import {
@@ -202,5 +204,112 @@ describe('faostat_resolve_codes pagination (#7)', () => {
     expect(text).toContain(
       resolveCodesTool.errors?.find((entry) => entry.reason === 'index_not_ready')?.recovery,
     );
+  });
+});
+
+describe('faostat_resolve_codes limit above the 200 cap (#56)', () => {
+  /** More areas than the cap, so a page at the cap leaves another page behind. */
+  const WIDE_COUNTRY_COUNT = 205;
+  let dir: string;
+  let mirror: FaostatMirror;
+
+  beforeAll(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'faostat-resolve-clamp-'));
+    const { zip } = buildMidSizeDomainZip({ countryCount: WIDE_COUNTRY_COUNT });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => chunkedResponse(zip, 1 << 16)),
+    );
+    mirror = initFaostatMirror({ dir, domains: [FIXTURE_DOMAIN] });
+    await mirror.runDomainSync(FIXTURE_DOMAIN, 'init', {
+      signal: new AbortController().signal,
+      dataset: fixtureDataset(),
+    });
+  });
+
+  afterAll(async () => {
+    await mirror.close();
+    vi.unstubAllGlobals();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** The tool's result on both surfaces. */
+  async function wire(limit: number) {
+    const result = await runToolContract(resolveCodesTool, {
+      domain: FIXTURE_DOMAIN,
+      dimension: 'area',
+      limit,
+    });
+    expect(result.isError).not.toBe(true);
+    return {
+      structured: result.structuredContent as Record<string, unknown> & { matches: unknown[] },
+      text: result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n'),
+    };
+  }
+
+  it('serves limit 500 at 200 and names the next page on both surfaces', async () => {
+    const { structured, text } = await wire(500);
+    expect(structured.matches).toHaveLength(200);
+    const notice =
+      'limit 500 is above the 200 cap; returned up to 200. Showing area matches 1–200 of 205. Call again with offset 200 to fetch the next page.';
+    expect(structured).toMatchObject({
+      requestedLimit: 500,
+      effectiveLimit: 200,
+      totalMatches: WIDE_COUNTRY_COUNT,
+      truncated: true,
+      nextOffset: 200,
+      notice,
+    });
+    expect(text).toContain('**200 area code(s) in QCL:**');
+    expect(text).toContain('**requestedLimit:** 500');
+    expect(text).toContain('**effectiveLimit:** 200');
+    expect(text).toContain(`> ${notice}`);
+  });
+
+  it('carries no clamp fields at the cap', async () => {
+    const { structured, text } = await wire(200);
+    expect(structured.matches).toHaveLength(200);
+    expect(structured).not.toHaveProperty('requestedLimit');
+    expect(structured).not.toHaveProperty('effectiveLimit');
+    expect(structured.notice).toBe(
+      'Showing area matches 1–200 of 205. Call again with offset 200 to fetch the next page.',
+    );
+    expect(text).not.toContain('cap;');
+  });
+
+  it('does not clamp an exact-code lookup, where limit never binds', async () => {
+    const result = await runToolContract(resolveCodesTool, {
+      domain: FIXTURE_DOMAIN,
+      dimension: 'area',
+      code: 5,
+      limit: 500,
+    });
+    expect(result.isError).not.toBe(true);
+    const structured = result.structuredContent as Record<string, unknown> & {
+      matches: { code: number }[];
+    };
+    expect(structured.matches.map((m) => m.code)).toEqual([5]);
+    expect(structured).not.toHaveProperty('requestedLimit');
+    expect(structured).not.toHaveProperty('effectiveLimit');
+    expect(structured).not.toHaveProperty('notice');
+    const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+    expect(text).not.toContain('cap;');
+  });
+
+  it('advertises limit with no maximum, and with maximum 200 when registered strict', () => {
+    const limitOf = (definition: AnyToolDefinition) =>
+      z.toJSONSchema(definition.input, { io: 'input' }).properties?.limit;
+    expect(limitOf(resolveCodesTool)).toEqual({
+      type: 'integer',
+      minimum: 1,
+      default: 50,
+      description: expect.stringContaining('at most 200 per call'),
+    });
+    expect(limitOf(withStrictCountInputs(resolveCodesTool))).toMatchObject({
+      type: 'integer',
+      minimum: 1,
+      maximum: 200,
+      default: 50,
+    });
   });
 });

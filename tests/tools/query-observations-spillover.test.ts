@@ -22,7 +22,10 @@
  * disclose the shortfall rather than pass a capped page off as the whole result.
  * A caller-named `canvas_id` that does not resolve is not that path: it fails the
  * call with `canvas_not_found` and the tool's declared recovery (#35), while a
- * failure after the named canvas resolves still degrades.
+ * failure after the named canvas resolves still degrades. The page itself is the
+ * caller's `limit` read from the mirror, never the staging helper's char-budget
+ * preview, and `nextOffset` reaches the rows past it with or without a table
+ * (#52; the paging cases live in `query-observations-paging.test.ts`).
  * Every branch that returns a `canvas_id` points at `faostat_dataframe_describe`
  * before `faostat_dataframe_query` (#23); those cases run through
  * `runToolContract` so the notice is read from `structuredContent` and from the
@@ -195,10 +198,9 @@ describe('faostat_query_observations spillover dead band', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('keeps a result within the inline budget inline — the probe never spills at the boundary', async () => {
-    // Exactly INLINE_PREVIEW_ROWS (50) country rows: the LIMIT probe returns the
-    // exact count and the tool stays inline without staging to a canvas — the same
-    // decision the old COUNT(*) made, now without scanning the whole cube.
+  it('keeps a match of exactly limit rows on the page — the probe never stages at the boundary (#52)', async () => {
+    // Exactly `limit` (50) country rows: the probe reads limit + 1, finds no row
+    // past the page, and the tool answers in full without staging to a canvas.
     const total = await syncDomain(50, 0);
     expect(total).toBe(50);
 
@@ -212,6 +214,7 @@ describe('faostat_query_observations spillover dead band', () => {
       element_codes: [5510],
       year_start: 2020,
       year_end: 2020,
+      limit: 50,
     });
 
     const result = await queryObservationsTool.handler(input, ctx);
@@ -220,8 +223,9 @@ describe('faostat_query_observations spillover dead band', () => {
     expect(result.spilled).toBe(false);
     expect(result.canvas_id).toBeUndefined();
     expect(result.table_name).toBeUndefined();
-    // Exact total surfaced from the probe (not a floor) — the match fit the budget.
+    // Exact total from the drained page (not a floor), and no page after it.
     expect(getEnrichment(ctx).totalCount).toBe(50);
+    expect(getEnrichment(ctx).nextOffset).toBeUndefined();
   });
 
   it('returns a mid-size result whole inline when it fits under limit (no dropped rows, no false canvas notice)', async () => {
@@ -297,6 +301,8 @@ describe('faostat_query_observations spillover dead band', () => {
     expect(result.truncated).toBe(false);
     expect(result.staged_row_count).toBe(300);
     expect(getEnrichment(ctx).totalCount).toBe(300);
+    // The rows past the page are also one call away without SQL (#52).
+    expect(getEnrichment(ctx).nextOffset).toBe(200);
 
     // Every matched row — including the 100 past the inline page — is on the table.
     const instance = await canvas.acquire(result.canvas_id, ctx);
@@ -370,14 +376,11 @@ describe('faostat_query_observations spillover dead band', () => {
     expect(text).toMatch(new RegExp(String(result.table_name)));
   });
 
-  it('discloses the shortfall when staging fails and the response falls back to an inline page', async () => {
+  it('pages on when staging fails: the page, an exact total, and nextOffset (#52)', async () => {
     // Registering the 300-row set on the session canvas fails after the canvas was
-    // acquired, so the staging layer returns undefined and the handler falls back to
-    // the inline page. The probe fetches max(limit, 50) rows, so at the default
-    // limit the page length equals the reported total — the row comparison alone
-    // cannot see the shortfall, and without the totalIsExact trigger this returned
-    // 200 of 300 rows announcing itself as the whole exact result, with no table
-    // holding the rest.
+    // acquired, so the staging layer returns undefined. The page still answers, the
+    // match is counted, and the rows past the page are one offset away — no table
+    // holds them, and the notice says so.
     const total = await syncDomain(300, 0);
     expect(total).toBe(300);
     const registerTable = failNextRegisterTable();
@@ -394,12 +397,15 @@ describe('faostat_query_observations spillover dead band', () => {
     expect(result.observations).toHaveLength(200);
     expect(result.spilled).toBe(false);
     expect(result.table_name).toBeUndefined();
+    expect(getEnrichment(ctx).totalCount).toBe(300);
+    expect(getEnrichment(ctx).nextOffset).toBe(200);
 
-    // The notice names the shortfall as a floor and says no table holds the rest.
+    // The notice names the failure and the offset that continues past the page.
     const notice = getEnrichment(ctx).notice as string;
-    expect(notice).toMatch(/more than 200/);
     expect(notice).toMatch(/failed/i);
-    expect(notice).toMatch(/raise limit/i);
+    expect(notice).toContain('Showing observations 1–200 of 300');
+    expect(notice).toContain('Continue with offset 200');
+    expect(notice).not.toMatch(/raise limit/i);
   });
 
   it('keeps the staging-failed fallback neutral on content[] — no canvas advice, no canvas pointer (#31)', async () => {
@@ -469,8 +475,8 @@ describe('faostat_query_observations spillover dead band', () => {
   });
 
   it('answers an inline-sized match without consulting the canvas_id (#35)', async () => {
-    // The id names where to stage; a match within the inline budget stages
-    // nothing, so a dead id does not fail a complete answer.
+    // The id names where to stage; a match within limit stages nothing, so a
+    // dead id does not fail a complete answer.
     await syncDomain(50, 0);
     const wire = await queryWire('spill-unknown-canvas-inline', {
       ...WHEAT_2020,
@@ -540,8 +546,9 @@ describe('faostat_query_observations spillover dead band', () => {
   });
 
   it('still spills to a canvas table when the result overflows the char budget', async () => {
-    // 1200 countries (~120k+ serialized chars) overflows the 100k inline budget,
-    // so the helper registers a canvas table and returns a token + preview.
+    // 1200 countries exceed the default limit, so the first page stages the whole
+    // match; at ~120k+ serialized chars they also overflow the 100k char budget, so
+    // the helper streams them to the table rather than registering its buffer.
     const total = await syncDomain(1200, 0);
     expect(total).toBe(1200);
 
@@ -566,7 +573,7 @@ describe('faostat_query_observations spillover dead band', () => {
     expect(result.spilled).toBe(true);
     expect(result.canvas_id).toBeDefined();
     expect(result.table_name).toBeDefined();
-    // The preview is a slice, not the whole set — the full set lives on the table.
+    // The page is a slice, not the whole set — the full set lives on the table.
     expect(result.observations.length).toBeLessThan(1200);
     expect(result.observations.length).toBeGreaterThan(0);
 
@@ -681,7 +688,7 @@ describe('faostat_query_observations canvas pointers in the definition (#23)', (
       expect(field.description).toMatch(/faostat_dataframe_describe[\s\S]*faostat_dataframe_query/);
     }
     expect(queryObservationsTool.description).toMatch(
-      /spill to a DataCanvas table[^.]*faostat_dataframe_describe[^.]*faostat_dataframe_query/,
+      /stages the whole match to a DataCanvas table[^.]*faostat_dataframe_describe[^.]*faostat_dataframe_query/,
     );
   });
 

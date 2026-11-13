@@ -18,6 +18,10 @@
  * in, first out, but never takes a worker while another build runs: a queued build
  * lets reads pass it, and the two workers never both hold a build, so reads always
  * keep one.
+ *
+ * A job the pool rejects because it is closing or closed carries
+ * `reason: 'pool_closed'`, which {@link isPoolClosed} reads, so a caller tells
+ * shutdown apart from a failure of the job itself (#46).
  * @module services/faostat-mirror/read-pool
  */
 
@@ -142,6 +146,26 @@ function fromFailure({ code, message, name }: WorkerFailure): Error {
   return Object.assign(new Error(message), { name });
 }
 
+/** `data.reason` on every rejection the pool hands out because it is closing or closed. */
+const POOL_CLOSED = 'pool_closed';
+
+/**
+ * The pool's shutdown rejection: a retryable `ServiceUnavailable` the tools declare,
+ * recognized by {@link isPoolClosed}.
+ */
+function poolClosed(message: string): McpError {
+  return serviceUnavailable(message, { reason: POOL_CLOSED, retryable: true });
+}
+
+/**
+ * True when `error` is the pool's own shutdown rejection — a job queued or running
+ * when {@link ReadPool.close} ran, or one asked of the pool after — rather than a
+ * failure of the job.
+ */
+export function isPoolClosed(error: unknown): boolean {
+  return error instanceof McpError && error.data?.reason === POOL_CLOSED;
+}
+
 export class ReadPool {
   private closed = false;
   private readonly entry: URL;
@@ -164,9 +188,7 @@ export class ReadPool {
    * or already running.
    */
   all<TRow>(job: ReadJob, signal?: AbortSignal): Promise<TRow[]> {
-    if (this.closed) {
-      return Promise.reject(serviceUnavailable('The mirror read pool is closed.'));
-    }
+    if (this.closed) return Promise.reject(poolClosed('The mirror read pool is closed.'));
     if (signal?.aborted) return Promise.reject(abortError(signal));
     return new Promise<TRow[]>((resolve, reject) => {
       const read = this.enqueue({ op: 'all', ...job }, resolve as (rows: unknown) => void, reject);
@@ -184,15 +206,14 @@ export class ReadPool {
    * long the `ANALYZE` statement ran, in ms. Takes no signal, so it is never cut off:
    * it rejects only with the driver's error (a writer holding the lock past
    * `busy_timeout`, a read-only file), with `DatabaseError` when the worker cannot
-   * open the file, or when the pool closes first. The caller reports success to the
-   * other workers with {@link invalidate}.
+   * open the file, with `ServiceUnavailable` when its worker dies, or with the
+   * pool's shutdown rejection ({@link isPoolClosed}) when the pool closes before it
+   * returns. The caller reports success to the other workers with {@link invalidate}.
    * When `areaYearIndex` is true, installs the cube's `(area_code, year)` index
    * before ANALYZE in the same job, under the same single-build scheduling limit.
    */
   analyze(file: string, table: string, areaYearIndex = false): Promise<number> {
-    if (this.closed) {
-      return Promise.reject(serviceUnavailable('The mirror read pool is closed.'));
-    }
+    if (this.closed) return Promise.reject(poolClosed('The mirror read pool is closed.'));
     return new Promise<number>((resolve, reject) => {
       this.enqueue(
         { op: 'analyze', file, table, areaYearIndex },
@@ -225,14 +246,15 @@ export class ReadPool {
   }
 
   /**
-   * Reject every queued and running job, close idle workers and wait for them to
-   * exit. A worker mid-statement is retired rather than awaited — neither driver
-   * can interrupt it, and under Node the process exit still waits for it.
+   * Reject every queued and running job with the pool's shutdown rejection
+   * ({@link isPoolClosed}), close idle workers and wait for them to exit. A worker
+   * mid-statement is retired rather than awaited — neither driver can interrupt it,
+   * and under Node the process exit still waits for it.
    */
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    const closing = () => serviceUnavailable('The mirror read pool closed before the job ran.');
+    const closing = () => poolClosed('The mirror read pool closed before the job ran.');
     for (const job of this.queue.splice(0)) this.fail(job, closing());
     const exits: Promise<unknown>[] = [];
     for (const slot of this.slots) {
