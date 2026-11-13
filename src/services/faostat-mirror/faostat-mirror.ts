@@ -565,8 +565,7 @@ export class FaostatMirror {
    * True when planner statistics cover the cube's indexes: the worker-installed
    * area/year index has a `sqlite_stat1` row, so it exists and was analyzed, and so
    * does every other full index. A refresh that adds an index to an unchanged
-   * upstream applies no rows, so this check is what finds that index unanalyzed —
-   * the state that sent rankings down a per-country walk of the unit/element index
+   * upstream applies no rows, so this check is what finds that index unanalyzed
    * (#59). Partial indexes are left out: an empty one gets a `0 0` row on the
    * SQLite builds measured, but a partial index fills only through a sync that
    * applies rows, and that sync builds. A full index over an empty table never gets
@@ -661,12 +660,10 @@ export class FaostatMirror {
 
   /**
    * Count the observations {@link queryObservations} matches, reading at most
-   * `cap + 1` of them: a result of `cap` or less is the exact count, and `cap + 1`
-   * means more than `cap` matched. The bound keeps the cost at `cap + 1` rows
-   * whatever the match: an exact `COUNT(*)` reads all of it — 1.2M rows and
-   * seconds for one element of QCL, several times that on TCL. The match is read
-   * unordered, so the planner picks the cheapest index for the filters. Runs on
-   * {@link reads} under the call's {@link readSignal}.
+   * `cap + 1` of them whatever the match: a result of `cap` or less is the exact
+   * count, and `cap + 1` means more than `cap` matched. The match is read unordered,
+   * so the planner picks the cheapest index for the filters. Runs on {@link reads}
+   * under the call's {@link readSignal}.
    */
   async countObservations(
     code: string,
@@ -729,10 +726,8 @@ export class FaostatMirror {
    *
    * The match is read once (#59). A self-join of the match to its per-group latest
    * year read the cube a second time, through whichever index the store's
-   * statistics made look cheapest: with every index analyzed but the unit/element
-   * one, that second read walked the item's whole unit/element slice once per
-   * ranked country and ran past the call ceiling. With one read, the item-bounded
-   * access path is the only plan choice, whatever statistics the store holds.
+   * statistics favored. With one read, the item-bounded access path is the only
+   * plan choice, whatever statistics the store holds.
    *
    * Assumes the domain is selected and ready (callers gate first).
    */
@@ -821,9 +816,8 @@ export class FaostatMirror {
    * the code). Every row counts, whatever its year or value. This is the profile's
    * element selection (#51), so it runs on every profile: the item composite's
    * `(item_code, element_code)` prefix answers `DISTINCT element_code` without
-   * visiting a table row — sub-millisecond for the heaviest TCL item, where the
-   * unit-reading element scope behind {@link resolve} reads every row of the item.
-   * Opens ungated like {@link domainItemCodes}: a covering read needs no statistics
+   * visiting a table row; the element scope behind {@link resolve} reads units too,
+   * so it is not reused here. Opens ungated like {@link domainItemCodes}: a covering read needs no statistics
    * to find its index. `itemCodes` must be non-empty.
    */
   async itemElements(
@@ -1045,9 +1039,8 @@ export class FaostatMirror {
    * stopped before the build would start starts none, and one stopped while it waits
    * stops waiting, leaving the build to the pool, which {@link close} ends without
    * recording an outcome (#46). Either way it rejects with the abort reason, as a run
-   * stopped mid-sync does, so a shutdown never waits out the minute or more `ANALYZE`
-   * takes on the largest cube; a later sync or data read builds instead, as after a
-   * build that failed.
+   * stopped mid-sync does, so a shutdown never waits out a statistics build; a later
+   * sync or data read builds instead, as after a build that failed.
    *
    * `ANALYZE` holds the file's write lock for its whole run, so a sync and a build
    * of the same domain never overlap (#24): the sync waits out a build already in

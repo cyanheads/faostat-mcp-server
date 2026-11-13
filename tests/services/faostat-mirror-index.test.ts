@@ -1310,12 +1310,11 @@ describe('FaostatMirror multi-item read plan (#33)', () => {
  * Ranking read plan (#59). A ranking needs each country's latest year, and the
  * statement that found it by joining the item-bounded match to its own per-group
  * maximum read the cube twice — the joined side through whatever access path the
- * store's statistics made look cheapest. With every index analyzed except
- * `unit_element_idx`, the state a refresh leaves when it adds that index to an
- * unchanged upstream, the joined side sought `(unit, element_code)` and walked the
- * item's whole unit/element slice once per ranked country; with only the legacy
- * indexes analyzed it sought `(area_code, year)`. The single-pass statement reads
- * the match once, so its access path is the only plan choice left.
+ * store's statistics favored. With every index analyzed except `unit_element_idx`,
+ * the state a refresh leaves when it adds that index to an unchanged upstream, the
+ * joined side sought `(unit, element_code)`; with only the legacy indexes analyzed
+ * it sought `(area_code, year)`. The single-pass statement reads the match once, so
+ * its access path is the only plan choice left.
  *
  * The fixture is small, so the planner's choices come from `sqlite_stat1` seeded to
  * the real mirror's figures in each statistics state and reloaded with `ANALYZE

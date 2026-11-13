@@ -33,11 +33,10 @@ import { getFaostatMirror } from '@/services/faostat-mirror/index.js';
 export const TOTAL_COUNT_CAP = STAGE_MAX_ROWS;
 
 /**
- * The deepest `offset` the tool accepts. A page read costs time in proportion to its
- * offset, since the store reads every matched row before the page, so offset paging
- * reaches the first 100,000 rows of a match plus one page and a larger match is
- * partitioned by year or codes instead. Twice {@link STAGE_MAX_ROWS}, so the rows past
- * a staged table truncated at the staging cap stay reachable by `offset`.
+ * The deepest `offset` the tool accepts: offset paging reaches the first 100,000 rows
+ * of a match plus one page, and a larger match is partitioned by year or codes
+ * instead. Twice {@link STAGE_MAX_ROWS}, so the rows past a staged table truncated at
+ * the staging cap stay reachable by `offset`.
  */
 export const OFFSET_CAP = 2 * STAGE_MAX_ROWS;
 
