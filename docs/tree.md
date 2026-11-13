@@ -1,6 +1,6 @@
 # faostat-mcp-server - Directory Structure
 
-Generated on: 2026-11-03 21:29:16
+Generated on: 2026-11-13 18:58:20
 
 ```text
 faostat-mcp-server/
@@ -30,6 +30,7 @@ faostat-mcp-server/
 │   ├── 0.4.x/
 │   ├── 0.5.x/
 │   ├── 0.6.x/
+│   ├── 0.7.x/
 │   └── template.md
 ├── docs/
 │   └── design.md
@@ -165,6 +166,7 @@ faostat-mcp-server/
 │   │       │   ├── list-domains.tool.ts
 │   │       │   ├── query-observations.tool.ts
 │   │       │   └── resolve-codes.tool.ts
+│   │       ├── count-input.ts
 │   │       └── markdown-cell.ts
 │   ├── services/
 │   │   ├── faostat-mirror/
@@ -177,6 +179,7 @@ faostat-mcp-server/
 │   │   │   ├── manifest.ts
 │   │   │   ├── read-pool.ts
 │   │   │   ├── read-worker.ts
+│   │   │   ├── scheduled-refresh.ts
 │   │   │   └── types.ts
 │   │   ├── canvas-accessor.ts
 │   │   └── canvas-staging.ts
@@ -208,12 +211,15 @@ faostat-mcp-server/
 │   │   ├── ingester-status.test.ts
 │   │   ├── manifest.test.ts
 │   │   ├── observation-identity.test.ts
-│   │   └── observation-migration.test.ts
+│   │   ├── observation-migration.test.ts
+│   │   └── scheduled-refresh.test.ts
 │   └── tools/
 │       ├── commodity-profile-aggregation.test.ts
+│       ├── commodity-profile-elements.test.ts
 │       ├── commodity-profile-notice.test.ts
 │       ├── commodity-profile-selection.test.ts
 │       ├── commodity-profile-year-range.test.ts
+│       ├── count-input.test.ts
 │       ├── dataframe-canvas-id-optional.test.ts
 │       ├── dataframe-describe-pagination.test.ts
 │       ├── dataframe-describe-provenance.test.ts
@@ -225,6 +231,7 @@ faostat-mcp-server/
 │       ├── list-domains-pagination.test.ts
 │       ├── list-domains-upstream-errors.test.ts
 │       ├── observation-table-format.test.ts
+│       ├── query-observations-paging.test.ts
 │       ├── query-observations-spillover.test.ts
 │       ├── query-observations-validation.test.ts
 │       ├── resolve-codes-domain-scope.test.ts

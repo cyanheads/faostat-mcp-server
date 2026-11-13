@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-11-13 · ⚠️ Breaking
+
+faostat_query_observations pages by offset with or without DataCanvas, live-animal profiles rank on Stocks, years_behind marks lagging ranking rows, over-cap counts are served at the cap, and concurrent stagings share one canvas. Breaking: a SQL alias, CTE name, or table alias spelled like a DuckDB metadata view is refused.
+
 ## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-11-03 · ⚠️ Breaking
 
 Preserve FAOSTAT observation identities and discover item-specific metrics and units.
