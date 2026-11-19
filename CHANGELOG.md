@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.1](changelog/0.7.x/0.7.1.md) — 2026-11-19 · 🛡️ Security
+
+Area M49 codes on faostat_resolve_codes and faostat_query_observations, a trade_item_code input on faostat_commodity_profile, and a refresh that removes the rows FAO dropped from a domain file. Fixes FBS item resolution, stale planner statistics, and lowercase text item codes; full-text search time now grows linearly with query length.
+
 ## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-11-13 · ⚠️ Breaking
 
 faostat_query_observations pages by offset with or without DataCanvas, live-animal profiles rank on Stocks, years_behind marks lagging ranking rows, over-cap counts are served at the cap, and concurrent stagings share one canvas. Breaking: a SQL alias, CTE name, or table alias spelled like a DuckDB metadata view is refused.
