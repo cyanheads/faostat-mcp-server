@@ -19,7 +19,10 @@
  * (#21) while a build the pool's shutdown ends is neither warned about nor
  * counted (#46), the dimension-code discovery read never schedules one (#22), a sync
  * rebuilds them when it applied rows or finds them missing or not covering an
- * index, and a build and a sync of the same domain never overlap.
+ * index, and a build and a sync of the same domain never overlap. Rows a sync
+ * changes leave the statistics stale until a build commits new ones, whether that
+ * build fails, is stopped, or never starts, and no read builds while another
+ * process's sync holds the store's lease (#60).
  * @module tests/services/faostat-mirror-index
  */
 
@@ -454,6 +457,58 @@ describe('FaostatMirror query-planner statistics (#3, #24)', () => {
       );
   });
 
+  it('builds the statistics ANALYZE of the whole cube table records, partial indexes included (#62)', async () => {
+    const synced = await mirror.getMirror(FIXTURE_DOMAIN)!.raw();
+    // Text identities and sources fill the partial indexes the numeric rows stay out of.
+    const insert = synced.prepare(
+      `INSERT INTO ${TABLE} (id, area_code, item_code, item_code_text, element_code, year, source_code, value) VALUES (?, ?, NULL, ?, 5510, ?, ?, ?)`,
+    );
+    synced.transaction(() => {
+      for (let i = 0; i < 90; i++)
+        insert.run(
+          `text-${i}`,
+          1 + (i % 9),
+          `F${i % 4}`,
+          2020 + (i % 2),
+          i % 3 ? 7 + (i % 5) : null,
+          i,
+        );
+    });
+    const reopened = await reopenWithoutStatistics();
+    await readCube(reopened);
+    await statisticsLand(reopened);
+
+    const handle = await reopened.getMirror(FIXTURE_DOMAIN)!.raw();
+    /** `sqlite_stat1`, and `sqlite_stat4` where the driver's SQLite keeps it, for the cube table. */
+    const statistics = () => ({
+      stat1: handle
+        .prepare<{ idx: string | null; stat: string }>(
+          'SELECT idx, stat FROM sqlite_stat1 WHERE tbl = ? ORDER BY idx',
+        )
+        .all(TABLE),
+      stat4: handle
+        .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat4'`)
+        .get()
+        ? handle
+            .prepare(
+              'SELECT idx, neq, nlt, ndlt, hex(sample) AS sample FROM sqlite_stat4 WHERE tbl = ? ORDER BY idx, nlt, sample',
+            )
+            .all(TABLE)
+        : [],
+    });
+    const built = statistics();
+    // A row per index, the partial ones with rows included.
+    expect(built.stat1.map((row) => row.idx)).toEqual(
+      handle
+        .prepare<{ name: string }>('SELECT name FROM pragma_index_list(?) ORDER BY name')
+        .all(TABLE)
+        .map((row) => row.name),
+    );
+    expect(built.stat1).toContainEqual({ idx: `${TABLE}_item_code_text_idx`, stat: '90 23' });
+    handle.exec(`ANALYZE ${TABLE}`);
+    expect(statistics()).toEqual(built);
+  });
+
   it('upgrades an existing analyzed mirror in the background without re-sync (#34)', async () => {
     const handle = await mirror.getMirror(FIXTURE_DOMAIN)!.raw();
     handle.exec(`DROP INDEX IF EXISTS ${TABLE}_area_code_year_idx`);
@@ -583,7 +638,7 @@ describe('FaostatMirror query-planner statistics (#3, #24)', () => {
     expect(await statRows(reopened)).toHaveLength(0);
     // The cap is recorded once, so the degraded plan does not persist silently (#46).
     expect(warnings.filter((message) => message.startsWith('ANALYZE failed'))).toEqual([
-      `ANALYZE failed 3 times for ${FIXTURE_DOMAIN} — reads stop retrying it this process (a sync will try again); its queries keep the planner's uninformed index choice`,
+      `ANALYZE failed 3 times for ${FIXTURE_DOMAIN} — reads stop retrying it this process (a sync will try again); its queries keep planning from the statistics already in place, or without any`,
     ]);
   });
 
@@ -709,6 +764,47 @@ describe('FaostatMirror query-planner statistics (#3, #24)', () => {
     expect(analyze).toHaveBeenCalledTimes(1);
     await statisticsLand(reopened);
   });
+
+  it.each([
+    { statistics: 'with', revision: 2 },
+    { statistics: 'without', revision: 2 },
+    { statistics: 'without', revision: 1 },
+  ])(
+    'reads the cube’s distinct item codes $statistics statistics on a revision-$revision store, as SELECT DISTINCT does',
+    async ({ statistics, revision }) => {
+      const synced = await mirror.getMirror(FIXTURE_DOMAIN)!.raw();
+      // Numeric items beside text identities, each leaving the other column NULL.
+      const insert = synced.prepare(
+        `INSERT INTO ${TABLE} (id, area_code, item_code, item_code_text, element_code, year, value) VALUES (?, 1, ?, ?, 5510, 2020, 1)`,
+      );
+      synced.transaction(() => {
+        for (const [i, code] of [44, 27, 1717, 44, 27].entries()) insert.run(`n-${i}`, code, null);
+        for (const [i, code] of ['F2', 'F10', 'F1', 'F2'].entries())
+          insert.run(`s-${i}`, null, code);
+      });
+      synced.exec(`UPDATE ingest_revision SET revision = ${revision}`);
+      const distinct = synced
+        .prepare<{ code: number | string | null }>(
+          revision === 2
+            ? `SELECT DISTINCT item_code AS code FROM ${TABLE} WHERE item_code IS NOT NULL UNION ALL SELECT DISTINCT item_code_text AS code FROM ${TABLE} WHERE item_code_text IS NOT NULL`
+            : `SELECT DISTINCT item_code AS code FROM ${TABLE}`,
+        )
+        .all()
+        .map((row) => row.code)
+        .filter((code) => code !== null);
+      expect(distinct).toHaveLength(revision === 2 ? 7 : 4);
+
+      const target = statistics === 'with' ? mirror : await reopenWithoutStatistics();
+      expect((await statRows(target)).length > 0).toBe(statistics === 'with');
+      const codes = await (
+        target as unknown as { domainItemCodes(domain: string): Promise<(number | string)[]> }
+      ).domainItemCodes(FIXTURE_DOMAIN);
+      const expected = revision === 2 ? [15, 27, 44, 1717, 'F1', 'F10', 'F2'] : [15, 27, 44, 1717];
+      expect(codes).toHaveLength(expected.length);
+      expect(new Set(codes)).toEqual(new Set(expected));
+      expect(new Set(codes)).toEqual(new Set(distinct));
+    },
+  );
 
   it('builds statistics on a sync that applied no rows when the domain has none (#24)', async () => {
     // A legacy mirror unchanged upstream: the ingester short-circuits on the
@@ -958,7 +1054,7 @@ describe('FaostatMirror query-planner statistics (#3, #24)', () => {
     expect((await sync).recordsApplied).toBeGreaterThan(0);
     expect(outcomes).toEqual(['failed']);
     expect(warnings).toContain(
-      `Could not ANALYZE ${TABLE} — queries fall back to the planner's uninformed index choice`,
+      `Could not ANALYZE ${TABLE} — queries keep planning from the statistics already in place, or without any`,
     );
   }, 30_000);
 
@@ -1035,6 +1131,354 @@ describe('FaostatMirror query-planner statistics (#3, #24)', () => {
     build.resolve(1);
     await flush();
     expect(outcomes).toEqual(['built']);
+  }, 30_000);
+
+  /**
+   * The state a rebuilding refresh leaves when its process stops during the post-sync
+   * build: the rows replaced, and the statistics of the rows before them still
+   * covering every index. A fresh instance then stands in for the next process.
+   */
+  async function reopenAfterInterruptedRebuild(): Promise<FaostatMirror> {
+    const build = deferBuilds(mirror);
+    const controller = new AbortController();
+    const stopped = new Error('Stopped for shutdown');
+    const sync = rebuildUnder(mirror, controller.signal);
+    await build.started;
+    controller.abort(stopped);
+    await expect(sync).rejects.toBe(stopped);
+    expect((await statRows(mirror)).length).toBeGreaterThan(0);
+    vi.restoreAllMocks();
+    await mirror.close();
+    mirror = openMirror();
+    return mirror;
+  }
+
+  /**
+   * Stand in for another process's sync of the domain: its lease on the store, with
+   * an expiry no clock reaches unless `expiresAt` says otherwise. Returns the release.
+   */
+  async function leaseFromAnotherProcess(
+    target: FaostatMirror,
+    expiresAt = Number.MAX_SAFE_INTEGER,
+  ): Promise<() => void> {
+    const handle = await target.getMirror(FIXTURE_DOMAIN)!.raw();
+    handle
+      .prepare(
+        'UPDATE mirror_sync_lease SET owner = ?, generation = generation + 1, expires_at = ? WHERE id = 1',
+      )
+      .run('another-process', expiresAt);
+    return () =>
+      handle.exec('UPDATE mirror_sync_lease SET owner = NULL, expires_at = NULL WHERE id = 1');
+  }
+
+  /** The store's statistics stale flag, as its row reads. */
+  async function staleFlag(target: FaostatMirror): Promise<unknown[]> {
+    const handle = await target.getMirror(FIXTURE_DOMAIN)!.raw();
+    return handle.prepare('SELECT stale FROM planner_statistics').all();
+  }
+
+  it('builds on the next data read after a rebuilding refresh whose build failed, within the retry budget (#60)', async () => {
+    // The refresh replaced every row, but the statistics from before it still cover
+    // every index, so only the record that rows changed can bring a rebuild.
+    const builds = obstructBuilds(mirror);
+    outcomes.length = 0;
+    expect((await syncInto(mirror, REBUILT)).recordsApplied).toBeGreaterThan(0);
+    expect(outcomes).toEqual(['failed']);
+    expect((await statRows(mirror)).length).toBeGreaterThan(0);
+
+    await readCube(mirror);
+    await flush();
+    expect(builds.attempts()).toBe(2);
+    builds.clear();
+    await readCube(mirror);
+    await statisticsLand(mirror);
+    expect(builds.attempts()).toBe(3);
+    expect(outcomes).toEqual(['failed', 'failed', 'built']);
+
+    await readCube(mirror);
+    await flush();
+    expect(builds.attempts()).toBe(3);
+  }, 30_000);
+
+  it('builds once on the next process’s first data read after a rebuilding refresh stopped during its build (#60)', async () => {
+    const reopened = await reopenAfterInterruptedRebuild();
+    const analyze = vi.spyOn(reopened.reads, 'analyze');
+
+    expect((await readCube(reopened)).rows.length).toBeGreaterThan(0);
+    expect(analyze).toHaveBeenCalledTimes(1);
+    await statisticsLand(reopened);
+    for (let i = 0; i < 3; i++) await readCube(reopened);
+    await flush();
+    expect(analyze).toHaveBeenCalledTimes(1);
+
+    // The build's commit is what marked the statistics current: a later process builds nothing.
+    await reopened.close();
+    mirror = openMirror();
+    const next = vi.spyOn(mirror.reads, 'analyze');
+    await readCube(mirror);
+    await flush();
+    expect(next).not.toHaveBeenCalled();
+  }, 30_000);
+
+  it('builds on an unchanged refresh of a store whose last rebuild did not complete, then on none after (#60)', async () => {
+    const reopened = await reopenAfterInterruptedRebuild();
+    const analyze = vi.spyOn(reopened.reads, 'analyze');
+
+    // The checkpoint is the rebuilt file's, so this refresh applies nothing.
+    expect((await syncInto(reopened, REBUILT)).recordsApplied).toBe(0);
+    expect(analyze).toHaveBeenCalledTimes(1);
+    expect(outcomes).toEqual(['built']);
+
+    expect((await syncInto(reopened, REBUILT)).recordsApplied).toBe(0);
+    expect(analyze).toHaveBeenCalledTimes(1);
+  }, 30_000);
+
+  it('builds on the next data read after an unchanged refresh that found the statistics stale and was stopped before its build (#60)', async () => {
+    const analyze = vi.spyOn(mirror.reads, 'analyze');
+    await readCube(mirror);
+    await flush();
+    expect(analyze).not.toHaveBeenCalled();
+    // Another process's sync applied rows after this one memoized the statistics.
+    const handle = await mirror.getMirror(FIXTURE_DOMAIN)!.raw();
+    handle.exec('UPDATE planner_statistics SET stale = 1');
+    const domain = mirror.getMirror(FIXTURE_DOMAIN);
+    if (!domain) throw new Error('mirror not found');
+    const runSync = domain.runSync.bind(domain);
+    const controller = new AbortController();
+    const stopped = new Error('Stopped for shutdown');
+    vi.spyOn(domain, 'runSync').mockImplementation(async (options) => {
+      const result = await runSync(options);
+      controller.abort(stopped);
+      return result;
+    });
+
+    await expect(
+      mirror.runDomainSync(FIXTURE_DOMAIN, 'refresh', {
+        signal: controller.signal,
+        dataset: fixtureDataset(),
+      }),
+    ).rejects.toBe(stopped);
+    expect(analyze).not.toHaveBeenCalled();
+    await readCube(mirror);
+    expect(analyze).toHaveBeenCalledTimes(1);
+  }, 30_000);
+
+  it('marks the statistics stale as a sync deletes the rows it replaces, before any page lands (#60)', async () => {
+    // A store without an ingest revision is replaced whole. This run fails once it has
+    // deleted the rows, before its first page, while the statistics of the rows it
+    // deleted still cover every index.
+    const handle = await mirror.getMirror(FIXTURE_DOMAIN)!.raw();
+    handle.exec('DELETE FROM ingest_revision');
+    const reset = new Error('The connection to the bulk host was reset');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw reset;
+      }),
+    );
+
+    await expect(syncInto(mirror, REBUILT)).rejects.toThrow();
+    expect(handle.prepare(`SELECT count(*) AS n FROM ${TABLE}`).get()).toEqual({ n: 0 });
+    expect((await statRows(mirror)).length).toBeGreaterThan(0);
+    expect(await staleFlag(mirror)).toEqual([{ stale: 1 }]);
+  }, 30_000);
+
+  it('builds on the next data read after a refresh that failed once it had committed rows (#60)', async () => {
+    const analyze = vi.spyOn(mirror.reads, 'analyze');
+    await readCube(mirror);
+    await flush();
+    expect(analyze).not.toHaveBeenCalled();
+    const domain = mirror.getMirror(FIXTURE_DOMAIN);
+    if (!domain) throw new Error('mirror not found');
+    const runSync = domain.runSync.bind(domain);
+    const reset = new Error('The connection to the bulk host was reset');
+    // The run's pages commit, then the run fails before it returns.
+    vi.spyOn(domain, 'runSync').mockImplementation(async (options) => {
+      await runSync(options);
+      throw reset;
+    });
+    outcomes.length = 0;
+
+    await expect(rebuildUnder(mirror, new AbortController().signal)).rejects.toBe(reset);
+    expect(analyze).not.toHaveBeenCalled();
+    await readCube(mirror);
+    expect(analyze).toHaveBeenCalledTimes(1);
+    await statisticsLand(mirror);
+  }, 30_000);
+
+  it('commits a build’s statistics and the cleared stale flag in one transaction (#60)', async () => {
+    const reopened = await reopenAfterInterruptedRebuild();
+    const handle = await reopened.getMirror(FIXTURE_DOMAIN)!.raw();
+    const ITEM_INDEX = `${TABLE}_item_code_idx`;
+    // A sentinel only a committed ANALYZE replaces.
+    handle
+      .prepare('UPDATE sqlite_stat1 SET stat = ? WHERE tbl = ? AND idx = ?')
+      .run('1 1', TABLE, ITEM_INDEX);
+    // The flag's clear fails, so the build cannot commit it.
+    handle.exec(
+      "CREATE TRIGGER refuse_clear BEFORE UPDATE ON planner_statistics BEGIN SELECT RAISE(ABORT, 'clear refused'); END",
+    );
+
+    await readCube(reopened);
+    await vi.waitFor(() => expect(outcomes).toEqual(['failed']), { timeout: 10_000, interval: 20 });
+    expect(await statRows(reopened)).toContainEqual({ idx: ITEM_INDEX, stat: '1 1' });
+    expect(await staleFlag(reopened)).toEqual([{ stale: 1 }]);
+
+    handle.exec('DROP TRIGGER refuse_clear');
+    await readCube(reopened);
+    await statisticsLand(reopened);
+    expect(await statRows(reopened)).toContainEqual({
+      idx: ITEM_INDEX,
+      stat: expect.stringMatching(/^128 /),
+    });
+    expect(await staleFlag(reopened)).toEqual([{ stale: 0 }]);
+  }, 30_000);
+
+  it('schedules no build from a data read while another process’s sync holds the lease, and one on the first read after its release (#60)', async () => {
+    // A build holds the write lock past busy_timeout, which would fail that sync's
+    // next page commit; the sync ends with its own build.
+    const reopened = await reopenWithoutStatistics();
+    const release = await leaseFromAnotherProcess(reopened);
+    const analyze = vi.spyOn(reopened.reads, 'analyze');
+
+    for (let i = 0; i < 3; i++) expect((await readCube(reopened)).rows.length).toBeGreaterThan(0);
+    await flush();
+    expect(analyze).not.toHaveBeenCalled();
+
+    release();
+    await readCube(reopened);
+    expect(analyze).toHaveBeenCalledTimes(1);
+    await statisticsLand(reopened);
+    expect(outcomes).toEqual(['built']);
+  }, 30_000);
+
+  it('memoizes nothing while another process’s sync holds the lease, so a read after it builds when that sync left the flag set (#60)', async () => {
+    await mirror.close();
+    mirror = openMirror();
+    const release = await leaseFromAnotherProcess(mirror);
+    const analyze = vi.spyOn(mirror.reads, 'analyze');
+    // Current statistics as the lease is taken: a memo made now would outlive the sync.
+    await readCube(mirror);
+    await flush();
+    expect(analyze).not.toHaveBeenCalled();
+
+    // That sync commits rows, and its process stops before its own build.
+    const handle = await mirror.getMirror(FIXTURE_DOMAIN)!.raw();
+    handle.exec('UPDATE planner_statistics SET stale = 1');
+    release();
+    await readCube(mirror);
+    expect(analyze).toHaveBeenCalledTimes(1);
+    await statisticsLand(mirror);
+  }, 30_000);
+
+  it('builds from a data read past a lease its holder let expire (#60)', async () => {
+    const reopened = await reopenWithoutStatistics();
+    await leaseFromAnotherProcess(reopened, 1);
+    const analyze = vi.spyOn(reopened.reads, 'analyze');
+
+    await readCube(reopened);
+    expect(analyze).toHaveBeenCalledTimes(1);
+    await statisticsLand(reopened);
+  }, 30_000);
+
+  it('abandons a build queued before another process’s sync claimed the lease, with no warning and no attempt spent (#60)', async () => {
+    const reopened = await reopenWithoutStatistics();
+    const AREA_YEAR_INDEX = `${TABLE}_area_code_year_idx`;
+    const handle = await reopened.getMirror(FIXTURE_DOMAIN)!.raw();
+    handle.exec(`DROP INDEX ${AREA_YEAR_INDEX}`);
+    const indexed = () =>
+      handle.prepare('SELECT name FROM sqlite_master WHERE name = ?').all(AREA_YEAR_INDEX);
+    await twoFailedBuilds(reopened);
+    const before = [...warnings];
+    const file = join(dir, `domain-${FIXTURE_DOMAIN}.db`);
+
+    // A writer holds the file's lock, so a build of the file started on the pool
+    // directly takes the one build slot, and the mirror's own build queues behind it.
+    const holder = await openSqliteHandle(file);
+    holder.exec('BEGIN IMMEDIATE');
+    let blocker: Promise<unknown>;
+    try {
+      blocker = reopened.reads.analyze(file, TABLE).catch((error: unknown) => error);
+      await readCube(reopened);
+      expect(reopened.reads.stats()).toMatchObject({ building: 1, queued: 1 });
+      // That writer is the other process's sync, claiming the lease.
+      holder
+        .prepare(
+          'UPDATE mirror_sync_lease SET owner = ?, generation = generation + 1, expires_at = ? WHERE id = 1',
+        )
+        .run('another-process', Number.MAX_SAFE_INTEGER);
+      holder.exec('COMMIT');
+    } finally {
+      holder.close();
+    }
+    expect(await blocker).toMatchObject({
+      code: JsonRpcErrorCode.Conflict,
+      data: { reason: 'sync_lease_held' },
+    });
+    await vi.waitFor(() => expect(reopened.reads.stats()).toMatchObject({ busy: 0, queued: 0 }), {
+      timeout: 10_000,
+      interval: 20,
+    });
+    await flush();
+    expect(outcomes).toEqual(['failed', 'failed']);
+    expect(warnings).toEqual(before);
+    expect(await statRows(reopened)).toHaveLength(0);
+    expect(indexed()).toEqual([]);
+
+    // Released: the third attempt is still the domain's to spend.
+    handle.exec('UPDATE mirror_sync_lease SET owner = NULL, expires_at = NULL WHERE id = 1');
+    await readCube(reopened);
+    await statisticsLand(reopened);
+    expect(outcomes).toEqual(['failed', 'failed', 'built']);
+    expect(warnings).toEqual(before);
+    expect(indexed()).toEqual([{ name: AREA_YEAR_INDEX }]);
+  }, 30_000);
+
+  it('schedules no build on a read or an unchanged refresh of a store written before the stale flag existed (#60)', async () => {
+    // A store as the release before the flag left it: schema version 2, statistics current.
+    const handle = await mirror.getMirror(FIXTURE_DOMAIN)!.raw();
+    handle.exec('DROP TABLE IF EXISTS planner_statistics');
+    handle.exec('UPDATE schema_version SET version = 2');
+    await mirror.close();
+    mirror = openMirror();
+    const analyze = vi.spyOn(mirror.reads, 'analyze');
+
+    for (let i = 0; i < 3; i++) await readCube(mirror);
+    expect((await syncInto(mirror, UNCHANGED)).recordsApplied).toBe(0);
+    await flush();
+    expect(analyze).not.toHaveBeenCalled();
+  }, 30_000);
+
+  it('builds statistics once, of the rows its removals leave, after a refresh whose file omits rows the cube holds (#63)', async () => {
+    const analyze = vi.spyOn(mirror.reads, 'analyze');
+    await readCube(mirror);
+    await flush();
+    expect(analyze).not.toHaveBeenCalled();
+    // The file's next revision keeps 2020 and withdraws 2021: its sync writes 64 rows and removes 64.
+    const { zip } = buildMidSizeDomainZip({
+      countryCount: 60,
+      aggregateCount: 4,
+      years: 2,
+      omit: (_area, year) => year === 2021,
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => chunkedResponse(zip, 1 << 16)),
+    );
+    outcomes.length = 0;
+
+    expect(await syncInto(mirror, REBUILT)).toMatchObject({
+      recordsApplied: 64,
+      tombstonesApplied: 64,
+      total: 64,
+    });
+    expect(analyze).toHaveBeenCalledTimes(1);
+    expect(outcomes).toEqual(['built']);
+    expect(await staleFlag(mirror)).toEqual([{ stale: 0 }]);
+    expect(await statRows(mirror)).toContainEqual({
+      idx: `${TABLE}_item_code_idx`,
+      stat: expect.stringMatching(/^64 /),
+    });
   }, 30_000);
 });
 

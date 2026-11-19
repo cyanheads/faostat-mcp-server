@@ -14,7 +14,9 @@
  *    `isPoolClosed()` tells apart from a job's own failure (#46);
  *  - statistics builds on the pool (#24): `analyze()` runs `ANALYZE` on a worker,
  *    a failing build keeps its worker, a second build waits while reads pass it,
- *    and `close()` settles queued and running builds;
+ *    a build refuses to start while a sync holds the file's lease (#60), the
+ *    area/year index a build installs stays when its statistics step then fails
+ *    (#62), and `close()` settles queued and running builds;
  *  - `FaostatMirror`: all five read paths honor an aborted signal, and a
  *    successful ANALYZE invalidates the domain file's worker handles;
  *  - the tools: the declared `query_timeout` on both client surfaces, a
@@ -55,6 +57,7 @@ import { OBSERVATION_TABLE_SCHEMA, stageObservations } from '@/services/canvas-s
 import { FaostatMirror, initFaostatMirror } from '@/services/faostat-mirror/faostat-mirror.js';
 import {
   isPoolClosed,
+  isSyncLeaseHeld,
   type ReadJob,
   ReadPool,
   withQueryCeiling,
@@ -116,11 +119,21 @@ function timedOut(): AbortSignal {
   return controller.signal;
 }
 
-/** A fresh SQLite file under `dir` holding an indexed table `t`, for a statistics build. */
+/**
+ * A fresh SQLite file under `dir` holding an indexed table `t`, for a statistics build,
+ * beside the two store rows a build reads and writes: the framework's sync lease, free,
+ * and the domain store's statistics flag, stale.
+ */
 async function analyzable(name: string): Promise<string> {
   const file = join(dir, name);
   const handle = await openSqliteHandle(file);
   handle.exec('CREATE TABLE t (a INTEGER, b INTEGER); CREATE INDEX t_a ON t (a);');
+  handle.exec(
+    'CREATE TABLE mirror_sync_lease (id INTEGER PRIMARY KEY CHECK (id = 1), owner TEXT, generation INTEGER NOT NULL DEFAULT 0, expires_at INTEGER); INSERT INTO mirror_sync_lease (id) VALUES (1);',
+  );
+  handle.exec(
+    'CREATE TABLE planner_statistics (stale INTEGER NOT NULL); INSERT INTO planner_statistics VALUES (1);',
+  );
   const insert = handle.prepare('INSERT INTO t VALUES (?, ?)');
   handle.transaction(() => {
     for (let i = 0; i < 500; i++) insert.run(i % 7, i);
@@ -463,9 +476,40 @@ describe('ReadPool', () => {
   });
 
   it("rejects a failing build with the driver's error and keeps the worker (#24)", async () => {
+    const file = await analyzable('missing-table.db');
     const pool = track(new ReadPool());
-    await expect(pool.analyze(spinFile, 'missing_table')).rejects.toThrow(/no such table/);
+    await expect(pool.analyze(file, 'missing_table')).rejects.toThrow(/no such table/);
     expect(pool.stats()).toMatchObject({ building: 0, busy: 0, live: 1, retired: 0 });
+  });
+
+  it('refuses a build while a sync holds the file’s lease, writing nothing, and keeps the worker (#60)', async () => {
+    const file = await analyzable('leased.db');
+    const pool = track(new ReadPool());
+    const main = await openSqliteHandle(file);
+    const lease = main.prepare(
+      'UPDATE mirror_sync_lease SET owner = ?, expires_at = ? WHERE id = 1',
+    );
+    const stale = () => main.prepare('SELECT stale FROM planner_statistics').all();
+    // A sync in another process holds it, with an expiry no clock reaches.
+    lease.run('a-syncing-process', Number.MAX_SAFE_INTEGER);
+
+    const refused = await pool.analyze(file, 't').catch((error: unknown) => error);
+    expect(refused).toMatchObject({
+      code: JsonRpcErrorCode.Conflict,
+      data: { reason: 'sync_lease_held' },
+    });
+    expect([isSyncLeaseHeld(refused), isPoolClosed(refused)]).toEqual([true, false]);
+    expect(await statRowCount(file)).toBe(0);
+    expect(stale()).toEqual([{ stale: 1 }]);
+    await expect(pool.all(quick(5))).resolves.toEqual([{ n: 5 }]);
+    expect(pool.stats()).toMatchObject({ building: 0, busy: 0, live: 1, retired: 0 });
+
+    // A holder that let its lease expire binds no one, as the framework's own claim reads it.
+    lease.run('a-process-that-died', 1);
+    await expect(pool.analyze(file, 't')).resolves.toBeGreaterThanOrEqual(0);
+    expect(await statRowCount(file)).toBeGreaterThan(0);
+    expect(stale()).toEqual([{ stale: 0 }]);
+    main.close();
   });
 
   it("opens a file behind another connection's lock once the lock is released", async () => {
@@ -556,6 +600,66 @@ describe('ReadPool', () => {
       holder.close();
     }
   }, 30_000);
+
+  it('commits no statistics from a build close() retired while it waited on a write lock, once the lock is released (#62)', async () => {
+    const file = await analyzable('close-waiting.db');
+    const pool = track(new ReadPool());
+    const count: ReadJob = { file, sql: 'SELECT COUNT(*) AS n FROM t', params: [] };
+    // One worker, its handle on the file open, is idle when the build reaches it.
+    await expect(pool.all(count)).resolves.toEqual([{ n: 500 }]);
+    const holder = await openSqliteHandle(file);
+    holder.exec('BEGIN IMMEDIATE');
+    try {
+      const build = pool.analyze(file, 't').catch((error: unknown) => error);
+      // A second worker, spawned after the build was handed over, loads, opens the file,
+      // and answers, while the first goes straight from the message to the lock.
+      await expect(pool.all(count)).resolves.toEqual([{ n: 500 }]);
+      expect(pool.stats()).toMatchObject({ building: 1, busy: 1, live: 2 });
+      await pool.close();
+      expect(isPoolClosed(await build)).toBe(true);
+    } finally {
+      holder.exec('ROLLBACK');
+      holder.close();
+    }
+    // The retired worker gets the lock it waited on, and exits before it can commit.
+    await vi.waitFor(() => expect(pool.stats().retired).toBe(0), {
+      timeout: 20_000,
+      interval: 50,
+    });
+    expect(await statRowCount(file)).toBe(0);
+    const check = await openSqliteHandle(file);
+    expect(check.prepare('SELECT stale FROM planner_statistics').all()).toEqual([{ stale: 1 }]);
+    check.close();
+  }, 30_000);
+
+  it('keeps the area/year index its own step committed when the statistics step after it fails: no statistics, the stale flag set (#62)', async () => {
+    const file = await analyzable('index-kept.db');
+    const main = await openSqliteHandle(file);
+    const index = 't_area_code_year_idx';
+    const indexed = () =>
+      main.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?").all(index);
+    const stale = () => main.prepare('SELECT stale FROM planner_statistics').all();
+    // A cube's area and year columns, and a store that fails the statistics step's flag write.
+    main.exec('ALTER TABLE t ADD COLUMN area_code INTEGER; ALTER TABLE t ADD COLUMN year INTEGER;');
+    main.exec(
+      "CREATE TRIGGER fail_flag_write BEFORE UPDATE ON planner_statistics BEGIN SELECT RAISE(ABORT, 'flag write failed'); END;",
+    );
+    const pool = track(new ReadPool());
+
+    await expect(pool.analyze(file, 't', true)).rejects.toThrow(/flag write failed/);
+    expect(indexed()).toEqual([{ name: index }]);
+    expect(await statRowCount(file)).toBe(0);
+    expect(stale()).toEqual([{ stale: 1 }]);
+    expect(pool.stats()).toMatchObject({ building: 0, busy: 0, live: 1, retired: 0 });
+
+    // Once the write succeeds, the next build keeps that index and commits its statistics.
+    main.exec('DROP TRIGGER fail_flag_write');
+    await expect(pool.analyze(file, 't', true)).resolves.toBeGreaterThanOrEqual(0);
+    expect(indexed()).toEqual([{ name: index }]);
+    expect(await statRowCount(file)).toBeGreaterThan(0);
+    expect(stale()).toEqual([{ stale: 0 }]);
+    main.close();
+  });
 
   it('close() rejects queued and running reads, retires busy workers, ends idle ones, and refuses new reads (#46)', async () => {
     const idle = track(new ReadPool());

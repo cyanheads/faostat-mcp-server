@@ -1,5 +1,6 @@
 /**
- * @fileoverview Isolated upgrade and round-trip coverage for FS/GLE bulk shapes.
+ * @fileoverview Isolated upgrade and round-trip coverage for FS/GLE bulk shapes, and
+ * the upgrade that gives a cube its file stamp and reconciles its rows once (#63).
  * @module tests/services/observation-migration
  */
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -84,6 +85,7 @@ describe('bulk identity upgrade', () => {
           id: '1|15|5510|2020',
           area_code: 1,
           item_code: 15,
+          item: 'Wheat',
           element_code: 5510,
           year: 2020,
           value: 999,
@@ -169,6 +171,11 @@ describe('bulk identity upgrade', () => {
     vi.stubGlobal('fetch', vi.fn());
     expect(await mirror.ready('QCL')).toBe(true);
     const handle = await mirror.getMirror('QCL')!.raw();
+    // The upgrade cleared the checkpoint for the one re-stream that stamps the rows
+    // (#63); restored, the refresh below is a refresh of the unchanged upstream.
+    handle
+      .prepare('UPDATE mirror_sync_state SET checkpoint = ?')
+      .run(fixtureDataset('QCL').DateUpdate);
     expect(
       handle
         .prepare(
@@ -205,11 +212,13 @@ describe('bulk identity upgrade', () => {
     });
     expect(fetch).not.toHaveBeenCalled();
     expect(await mirror.ready('QCL')).toBe(true);
-    const plan = handle
-      .prepare<{ detail: string }>(
-        'EXPLAIN QUERY PLAN SELECT DISTINCT item_code AS code FROM obs_QCL WHERE item_code IS NOT NULL UNION ALL SELECT DISTINCT item_code_text AS code FROM obs_QCL WHERE item_code_text IS NOT NULL',
-      )
-      .all();
+    // The plan of the distinct-code read the mirror itself sends once the refresh has
+    // added the text index.
+    reads.mockClear();
+    await mirror.resolve('QCL', 'item', { limit: 1 });
+    const itemCodesSql = reads.mock.calls[0]?.[0].sql;
+    expect(itemCodesSql).toContain('item_code_text');
+    const plan = handle.prepare<{ detail: string }>(`EXPLAIN QUERY PLAN ${itemCodesSql}`).all();
     expect(plan.some((r) => r.detail.includes('COVERING INDEX obs_QCL_item_code_idx'))).toBe(true);
     expect(plan.some((r) => r.detail.includes('COVERING INDEX obs_QCL_item_code_text_idx'))).toBe(
       true,
@@ -228,6 +237,37 @@ describe('bulk identity upgrade', () => {
     ]);
     expect(reads.mock.calls[0]?.[0].sql).not.toContain('NOT INDEXED');
     expect(reads.mock.calls[0]?.[0].sql).toContain('INDEXED BY obs_QCL_unit_element_idx');
+  });
+
+  it('repairs a compatible store’s item vocabulary on a refresh of its unchanged upstream, with no download (#64)', async () => {
+    await legacy('QCL');
+    mirror = initFaostatMirror({ dir, domains: ['QCL'] });
+    const handle = await mirror.getMirror('QCL')!.raw();
+    // The upgrade cleared the checkpoint for the one re-stream that stamps the rows
+    // (#63); restored, the refresh below fetches no ZIP.
+    handle
+      .prepare('UPDATE mirror_sync_state SET checkpoint = ?')
+      .run(fixtureDataset('QCL').DateUpdate);
+    // A second identity whose only row carries no label.
+    handle
+      .prepare(
+        'INSERT INTO obs_QCL(id, area_code, item_code, element_code, year) VALUES (?, ?, ?, ?, ?)',
+      )
+      .run('1|16|5510|2020', 1, 16, 5510, 2020);
+    const fetcher = vi.fn();
+    vi.stubGlobal('fetch', fetcher);
+    expect(await mirror.resolve('QCL', 'item', { limit: 10 })).toEqual({ matches: [], total: 0 });
+
+    await mirror.runDomainSync('QCL', 'refresh', {
+      signal: signal(),
+      dataset: fixtureDataset('QCL'),
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(handle.prepare('SELECT revision FROM ingest_revision').all()).toEqual([{ revision: 2 }]);
+    expect((await mirror.resolve('QCL', 'item', { limit: 10 })).matches).toEqual([
+      { code: 15, code_text: null, name: 'Wheat', kind: null },
+      { code: 16, code_text: null, name: '', kind: null },
+    ]);
   });
 
   it('enables text membership before a compatible refresh can publish partial rows', async () => {
@@ -438,5 +478,155 @@ describe('bulk identity upgrade', () => {
       source: 'FAO TIER 1',
       flag: 'E',
     });
+  });
+});
+
+describe('file stamp upgrade (#63)', () => {
+  const DOMAIN = 'QCL';
+  const TABLE = `obs_${DOMAIN}`;
+  /** A row an earlier file carried that the fixture file does not. */
+  const DRIFTED_ID = '2|15|5510|2019';
+  let dir: string;
+  let mirror: FaostatMirror | undefined;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'faostat-file-stamp-'));
+  });
+  afterEach(async () => {
+    await mirror?.close();
+    mirror = undefined;
+    vi.unstubAllGlobals();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Sync the fixture file into a QCL store and close it; returns its file path. */
+  async function syncedStore(): Promise<string> {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => chunkedResponse(buildDomainZip(), 43)),
+    );
+    const synced = new FaostatMirror({ dir, domains: [DOMAIN] });
+    await synced.runDomainSync(DOMAIN, 'init', { signal: signal(), dataset: fixtureDataset() });
+    await synced.close();
+    return join(dir, `domain-${DOMAIN}.db`);
+  }
+
+  /**
+   * The store as the release before the stamp left it — schema version 2, no stamp
+   * column, no statistics flag — holding a drifted row that release's refreshes kept.
+   * Returns its sync state.
+   */
+  async function releasedStore(): Promise<unknown> {
+    const handle = await openSqliteHandle(await syncedStore());
+    try {
+      const columns = handle
+        .prepare<{ name: string }>(`SELECT name FROM pragma_table_info('${TABLE}')`)
+        .all()
+        .map((c) => c.name);
+      if (columns.includes('file_date_update'))
+        handle.exec(`ALTER TABLE ${TABLE} DROP COLUMN file_date_update`);
+      handle.exec('DROP TABLE IF EXISTS planner_statistics');
+      handle.exec('UPDATE schema_version SET version = 2');
+      handle
+        .prepare(
+          `INSERT INTO ${TABLE}(id, area_code, area, item_code, item, element_code, element, year, unit, value, flag) VALUES (?, 2, 'Afghanistan', 15, 'Wheat', 5510, 'Production', 2019, 't', 4800, 'A')`,
+        )
+        .run(DRIFTED_ID);
+      return handle
+        .prepare('SELECT status, checkpoint, completed_at, total FROM mirror_sync_state')
+        .get();
+    } finally {
+      handle.close();
+    }
+  }
+
+  const state = (handle: Awaited<ReturnType<typeof openSqliteHandle>>) =>
+    handle.prepare('SELECT status, checkpoint, completed_at, total FROM mirror_sync_state').get();
+  const cubeIds = (handle: Awaited<ReturnType<typeof openSqliteHandle>>) =>
+    handle
+      .prepare<{ id: string }>(`SELECT id FROM ${TABLE} ORDER BY id`)
+      .all()
+      .map((row) => row.id);
+  const FILE_IDS = [
+    '2|15|5510|2020',
+    '2|15|5510|2021',
+    '351|15|5510|2020',
+    '351|15|5510|2021',
+    '5000|15|5510|2020',
+    '5000|15|5510|2021',
+  ];
+
+  it('adds the stamp to a store from before it and clears only its checkpoint, so the domain stays ready', async () => {
+    const before = await releasedStore();
+    expect(before).toMatchObject({
+      status: 'complete',
+      checkpoint: fixtureDataset().DateUpdate,
+      total: 6,
+    });
+    mirror = new FaostatMirror({ dir, domains: [DOMAIN] });
+    expect(await mirror.ready(DOMAIN)).toBe(true);
+    const handle = await mirror.getMirror(DOMAIN)!.raw();
+    expect(state(handle)).toEqual({ ...(before as object), checkpoint: null });
+    expect(
+      handle
+        .prepare(`SELECT name, type FROM pragma_table_info('${TABLE}') WHERE name = ?`)
+        .all('file_date_update'),
+    ).toEqual([{ name: 'file_date_update', type: 'INTEGER' }]);
+    // None of its rows carries a stamp, so its next refresh streams the file again.
+    expect(
+      handle.prepare(`SELECT count(*) AS n FROM ${TABLE} WHERE file_date_update IS NULL`).get(),
+    ).toEqual({ n: 7 });
+  });
+
+  it('keeps the checkpoint of a store whose rows already carry the stamp', async () => {
+    const handle = await openSqliteHandle(await syncedStore());
+    const before = state(handle);
+    handle.exec('UPDATE schema_version SET version = 3');
+    handle.close();
+    mirror = new FaostatMirror({ dir, domains: [DOMAIN] });
+    expect(state(await mirror.getMirror(DOMAIN)!.raw())).toEqual(before);
+    expect(before).toMatchObject({ checkpoint: fixtureDataset().DateUpdate });
+  });
+
+  it('removes a drifted store’s stale rows on its first refresh after upgrade, ready throughout, then fetches nothing', async () => {
+    await releasedStore();
+    mirror = new FaostatMirror({ dir, domains: [DOMAIN] });
+    const fetcher = vi.fn(async () => chunkedResponse(buildDomainZip(), 43));
+    vi.stubGlobal('fetch', fetcher);
+    const readiness: Promise<boolean>[] = [];
+    const upgraded = mirror;
+    // The upstream file is unchanged: its DateUpdate is the checkpoint the store had.
+    const refresh = () =>
+      upgraded.runDomainSync(DOMAIN, 'refresh', {
+        signal: signal(),
+        dataset: fixtureDataset(),
+        onProgress: () => readiness.push(upgraded.ready(DOMAIN)),
+      });
+
+    expect(await refresh()).toEqual({
+      pagesFetched: 2,
+      recordsApplied: 6,
+      tombstonesApplied: 1,
+      total: 6,
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(await Promise.all(readiness)).toEqual([true, true]);
+    const handle = await upgraded.getMirror(DOMAIN)!.raw();
+    expect(cubeIds(handle)).toEqual(FILE_IDS);
+    expect(await upgraded.status(DOMAIN)).toMatchObject({
+      status: 'complete',
+      ready: true,
+      total: 6,
+      checkpoint: fixtureDataset().DateUpdate,
+    });
+
+    fetcher.mockClear();
+    expect(await refresh()).toEqual({
+      pagesFetched: 0,
+      recordsApplied: 0,
+      tombstonesApplied: 0,
+      total: 6,
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(cubeIds(handle)).toEqual(FILE_IDS);
   });
 });

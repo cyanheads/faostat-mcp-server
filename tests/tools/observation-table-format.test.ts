@@ -37,7 +37,7 @@ type ProfileResult = Parameters<NonNullable<typeof commodityProfileTool.format>>
 type TrendPoint = ProfileResult['production_trend'][number];
 
 const OBSERVATION_HEADER =
-  '| Area | Item | Element | Year | Value | Unit | Flag | Period | Source |';
+  '| Area | M49 | Item | Element | Year | Value | Unit | Flag | Period | Source |';
 const TREND_HEADER = '| Year | Value | Unit | Observations | Flags |';
 
 /** What a cell displays for `value`: the text itself, with CR/LF as their escape sequences. */
@@ -50,6 +50,7 @@ function observation(overrides: Partial<Observation>): Observation {
   return {
     area_code: 2,
     area: 'Afghanistan',
+    area_m49: '004',
     item_code: 15,
     item_code_text: null,
     period: null,
@@ -104,28 +105,50 @@ describe('faostat_query_observations table rows (#27)', () => {
       observation({
         area_code: 107,
         area: "Côte d'Ivoire",
+        area_m49: '384',
         year: 2021,
         value: 1.5,
         flag: 'E',
       }),
-      observation({ area_code: 3, area: 'Albania', value: null, unit: null, flag: null }),
+      observation({
+        area_code: 3,
+        area: 'Albania',
+        area_m49: '008',
+        value: null,
+        unit: null,
+        flag: null,
+      }),
     ]);
     expect(tableLines(rendered, OBSERVATION_HEADER)).toEqual([
       OBSERVATION_HEADER,
-      '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
-      '| Afghanistan (2) | Wheat (15) | Production (5510) | 2020 | 5000 | t | A |  |  |',
-      "| Côte d'Ivoire (107) | Wheat (15) | Production (5510) | 2021 | 1.5 | t | E |  |  |",
-      '| Albania (3) | Wheat (15) | Production (5510) | 2020 |  |  |  |  |  |',
+      '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+      '| Afghanistan (2) | 004 | Wheat (15) | Production (5510) | 2020 | 5000 | t | A |  |  |',
+      "| Côte d'Ivoire (107) | 384 | Wheat (15) | Production (5510) | 2021 | 1.5 | t | E |  |  |",
+      '| Albania (3) | 008 | Wheat (15) | Production (5510) | 2020 |  |  |  |  |  |',
     ]);
   });
 
-  it('keeps every row at nine cells and displays each label as written', () => {
+  it('renders an M49 code as written, dotted extensions included, and a null one empty (#65)', () => {
+    const rendered = renderObservations([
+      observation({ area_code: 5000, area: 'World', area_m49: '001' }),
+      observation({ area_code: 51000, area: 'Africa (excluding intra-trade)', area_m49: '002.03' }),
+      observation({ area_code: 1, area: 'Country 1', area_m49: null }),
+    ]);
+    expect(tableLines(rendered, OBSERVATION_HEADER).slice(2)).toEqual([
+      '| World (5000) | 001 | Wheat (15) | Production (5510) | 2020 | 5000 | t | A |  |  |',
+      '| Africa (excluding intra-trade) (51000) | 002.03 | Wheat (15) | Production (5510) | 2020 | 5000 | t | A |  |  |',
+      '| Country 1 (1) |  | Wheat (15) | Production (5510) | 2020 | 5000 | t | A |  |  |',
+    ]);
+  });
+
+  it('keeps every row at ten cells and displays each label as written', () => {
     const observations = [
       observation({ area_code: 1, area: 'Pipe | Land' }),
       observation({ area_code: 2, item: 'x\\|y' }),
       observation({ area_code: 3, element: 'Line1\nLine2' }),
       observation({ area_code: 4, area: 'Carriage\rReturn', unit: 'kg\\ha' }),
       observation({ area_code: 5, unit: 't|ha', flag: 'A|E' }),
+      observation({ area_code: 6, area_m49: null }),
     ];
     const lines = tableLines(renderObservations(observations), OBSERVATION_HEADER);
 
@@ -135,6 +158,7 @@ describe('faostat_query_observations table rows (#27)', () => {
       const cells = splitRow(lines[2 + i] ?? '').map(renderCell);
       expect(cells).toEqual([
         `${displayed(o.area)} (${o.area_code})`,
+        o.area_m49 ?? '',
         `${displayed(o.item)} (${o.item_code})`,
         `${displayed(o.element)} (${o.element_code})`,
         String(o.year),
@@ -259,11 +283,11 @@ describe('structuredContent keeps raw labels (#27)', () => {
     );
 
     expect(result.observations).toEqual([
-      expect.objectContaining({ area: 'Pipe | Land', unit: 'kg|ha', flag: 'A' }),
+      expect.objectContaining({ area: 'Pipe | Land', area_m49: '007', unit: 'kg|ha', flag: 'A' }),
     ]);
     const lines = tableLines(text(queryObservationsTool.format?.(result)), OBSERVATION_HEADER);
     expect(lines[2]).toBe(
-      '| Pipe \\| Land (7) | Wheat (15) | Production (5510) | 2020 | 1.5 | kg\\|ha | A |  |  |',
+      '| Pipe \\| Land (7) | 007 | Wheat (15) | Production (5510) | 2020 | 1.5 | kg\\|ha | A |  |  |',
     );
     // format() escaped a copy — the result it rendered still carries the raw label.
     expect(result.observations[0]?.area).toBe('Pipe | Land');

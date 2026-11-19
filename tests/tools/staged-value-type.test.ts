@@ -36,9 +36,14 @@ import {
   chunkedResponse,
   FIXTURE_DOMAIN,
   fixtureDataset,
+  fixtureM49,
 } from '../fixtures/synthetic-domain.js';
 
-/** The ten observation columns, in staged order, with the types every table carries. */
+/**
+ * The observation columns, in staged order, with the types every table carries.
+ * `area_m49` is appended after `source` (#65), so every earlier column keeps its
+ * position, and it is text: M49 codes keep leading zeros and dotted extensions.
+ */
 const OBSERVATION_COLUMNS = [
   ['area_code', 'BIGINT'],
   ['area', 'VARCHAR'],
@@ -55,6 +60,7 @@ const OBSERVATION_COLUMNS = [
   ['value_qualifier', 'VARCHAR'],
   ['source_code', 'BIGINT'],
   ['source', 'VARCHAR'],
+  ['area_m49', 'VARCHAR'],
 ];
 
 /**
@@ -189,6 +195,17 @@ describe('faostat_query_observations stages value as DOUBLE (#30)', () => {
     );
     expect(totals?.total).toBe(expectedSum);
     expect(Number(totals?.fractional)).toBe(COUNTRIES * (2020 + YEARS - FIRST_LATE_YEAR));
+
+    // Every staged row carries its area's M49 code as text, leading zeros kept, and
+    // it is the code the resolver reports for that area (#65).
+    const pairs = await sql(
+      ctx,
+      `SELECT DISTINCT area_code, area_m49 FROM ${staged.table_name} ORDER BY area_code`,
+    );
+    const expected = Array.from({ length: COUNTRIES }, (_, i) => [i + 1, fixtureM49(i + 1)]);
+    expect(pairs.map((r) => [Number(r.area_code), r.area_m49])).toEqual(expected);
+    const resolved = await mirror!.resolve(FIXTURE_DOMAIN, 'area', { limit: COUNTRIES });
+    expect(resolved.matches.map((m) => [m.code, m.m49_code])).toEqual(expected);
   }, 30_000);
 
   it('stages DOUBLE, not VARCHAR, when the preview window holds only null values', async () => {
@@ -229,9 +246,11 @@ describe('faostat_query_observations stages value as DOUBLE (#30)', () => {
     expect(await stagedColumns(ctx, staged.table_name)).toEqual(OBSERVATION_COLUMNS);
     const [row] = await sql(
       ctx,
-      `SELECT value, typeof(value) AS t FROM ${staged.table_name} WHERE area_code = 250`,
+      `SELECT value, typeof(value) AS t, area_m49 FROM ${staged.table_name} WHERE area_code = 250`,
     );
-    expect(row).toEqual({ value: 1250, t: 'DOUBLE' });
+    expect(row).toEqual({ value: 1250, t: 'DOUBLE', area_m49: '250' });
+    // The inline page carries the same code the buffered table stages.
+    expect(staged.observations.find((o) => o.area_code === 7)?.area_m49).toBe('007');
   });
 });
 
@@ -313,7 +332,7 @@ describe('faostat_commodity_profile stages value as DOUBLE under both domains (#
     // Trade contributed, so the table holds both domains.
     expect(result.top_exporters.length).toBeGreaterThan(0);
 
-    // Same ten columns, same order, plus `domain` last.
+    // Same observation columns, same order, plus `domain` last.
     expect(await stagedColumns(ctx, result.table_name)).toEqual([
       ...OBSERVATION_COLUMNS,
       ['domain', 'VARCHAR'],
@@ -355,6 +374,20 @@ describe('faostat_commodity_profile stages value as DOUBLE under both domains (#
     expect(fractional.map((r) => [r.domain, Number(r.n)])).toEqual([
       ['QCL', (COUNTRIES - 7) * (2020 + YEARS - FIRST_LATE_YEAR)],
       ['TCL', TRADE.length],
+    ]);
+
+    // Production and trade rows each carry their area's M49 code (#65).
+    const pairs = await sql(
+      ctx,
+      `SELECT DISTINCT domain, area_code, area_m49 FROM ${result.table_name} ORDER BY domain, area_code`,
+    );
+    const rollUps = new Set([261, 265, 266, 268, 269, 351, 420]);
+    expect(pairs.map((r) => [r.domain, Number(r.area_code), r.area_m49])).toEqual([
+      ...Array.from({ length: COUNTRIES }, (_, i) => i + 1)
+        .filter((code) => !rollUps.has(code))
+        .map((code) => ['QCL', code, fixtureM49(code)]),
+      ['TCL', 7, '007'],
+      ['TCL', 8, '008'],
     ]);
   }, 30_000);
 });

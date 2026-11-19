@@ -32,9 +32,9 @@ Global food and agriculture statistics from the UN's FAOSTAT: production, trade,
 | Tool | Description |
 |:---|:---|
 | `faostat_list_domains` | Discover FAOSTAT statistical domains with codes, descriptions, last-update date, upstream row count, and local index status. The entry point — every query keys on a domain code. |
-| `faostat_resolve_codes` | Resolve human terms to the codes a query needs (areas, items, elements), flagging each area as a country or an aggregate region. |
+| `faostat_resolve_codes` | Resolve human terms to the codes a query needs (areas, items, elements), flagging each area as a country or an aggregate region and carrying its M49 code. |
 | `faostat_query_observations` | Query a domain's cube by area(s), item(s), element(s), and year range. Returns pages of up to `limit` rows by an `offset` of at most 100,000; with DataCanvas on, a first page whose match exceeds `limit` also stages the whole match to a canvas table. |
-| `faostat_commodity_profile` | Workflow: assemble top producers, the production trend, and trade flows for one commodity from the production and trade domains in a single call. The elements follow what the item carries: Production, or Stocks for live-animal items. |
+| `faostat_commodity_profile` | Workflow: assemble top producers, the production trend, and trade flows for one commodity from the production and trade domains in a single call. The elements follow what the item carries: Production, or Stocks for live-animal items. `trade_item_code` ranks trade on another TCL item for crops traded mostly in processed form. |
 | `faostat_dataframe_query` | Run a read-only SQL `SELECT` against the canvas tables staged by the analytical tools. |
 | `faostat_dataframe_describe` | List the canvas tables staged this session, each with provenance, row count, and column schema. |
 | `faostat_dataframe_drop` | Drop one staged canvas table before its 2-hour TTL. Opt-in — callable only with `FAOSTAT_DATAFRAME_DROP_ENABLED=true`. |
@@ -52,21 +52,24 @@ Global food and agriculture statistics from the UN's FAOSTAT: production, trade,
 
 ### `faostat_resolve_codes` <sub>tool</sub>
 
-- FTS5 full-text `query`, substring `name_contains`, or exact `code` lookup within a `dimension`: `area`, `item`, or `element`; `code_text` looks up alphanumeric items
+- FTS5 full-text `query`, substring `name_contains`, or exact `code` lookup within a `dimension`: `area`, `item`, or `element`; `code_text` looks up alphanumeric items, and `m49_code` (area only) looks up every area carrying an M49 code
+- `query` words are matched as prefixes, each distinct word searched once, and search time is linear in the query's length; quotes, parentheses, asterisks, and control characters separate words. A blank or `*` query lists the dimension; any other query made only of quotes, parentheses, asterisks, and whitespace is rejected as `invalid_query`
+- `code_text` and `item_codes_text` are case-insensitive: letters are uppercased before lookup
 - Item/element matches are scoped to codes present in the given `domain`'s cube; area codes are shared across domains
 - Element matches include observed `units`; `item_codes` or `item_codes_text` restrict element discovery and units to selected items. Item/element lookups require that domain to be ready
-- Every area match is flagged `country` or `aggregate` (codes ≥ 5000, plus curated sub-threshold roll-ups such as China=351)
+- Every area match is flagged `country` or `aggregate` (codes ≥ 5000, plus curated sub-threshold roll-ups such as China=351) and carries `m49_code`, a string with its leading zeros (`840`, `001`); the excluding-intra-trade aggregates carry dotted FAO extensions such as `002.03`, so the codes are FAO's, not ISO numeric codes
 - Verified item groups are marked `aggregate` by domain. Classification is incomplete: `kind: null` does not mean items can safely be summed together
 - `limit` (at most 200 per call, default 50; a larger value is served at 200 with a notice) + `offset` page the match set
-- Typed errors: `unknown_domain`, `index_not_ready`, `invalid_text_selector`, `invalid_item_scope`, `query_timeout`, `pool_closed`
+- Typed errors: `unknown_domain`, `index_not_ready`, `invalid_text_selector`, `invalid_m49_selector`, `invalid_item_scope`, `invalid_query`, `query_timeout`, `pool_closed`
 
 ---
 
 ### `faostat_query_observations` <sub>tool</sub>
 
 - Filters by `area_codes` / `item_codes` / `item_codes_text` / `element_codes` / `source_codes` and an inclusive `year_start` / `year_end` range
-- Alphanumeric items retain their exact `item_code_text` with `item_code: null`; numeric items retain their integer code
+- Alphanumeric items retain their exact `item_code_text` with `item_code: null` (`item_codes_text` letters are uppercased before the query); numeric items retain their integer code
 - Period observations retain `period` (e.g. `2000-2002`) and use its midpoint as `year` for filtering. Censored values retain the numeric bound plus `value_qualifier` (e.g. `<` with `2.5`)
+- Every row carries `area_m49`, the area's M49 code as `faostat_resolve_codes` reports it, shown in an `M49` column
 - Source-specific rows carry `source_code` and `source`; omitting `source_codes` returns all sources, which must be compared separately rather than summed
 - An empty query with explicit item and element selections returns `available_elements` with labels and units for those items; this does not establish coverage for the requested areas, years, or sources
 - Aggregate regions excluded by default (`include_aggregates: false`); explicit `area_codes` bypass the exclusion
@@ -81,13 +84,14 @@ Global food and agriculture statistics from the UN's FAOSTAT: production, trade,
 ### `faostat_commodity_profile` <sub>tool</sub>
 
 - Selects one QCL item with `item_code` or `item_query` (code takes precedence), then ranks top producers/exporters/importers and returns an annual production trend
+- `trade_item_code` (a TCL item code) ranks `top_exporters` and `top_importers`, their units, and the staged TCL rows on that item instead, for crops traded mostly in processed form (paddy rice 27 trades as rice milled equivalent 30); producers, the trend, and the element choice stay on the selected item. `trade_item` echoes `{ code, name }` when the input was supplied and TCL is indexed and has finished its initial sync. Find the code with `faostat_resolve_codes` on `domain: "TCL"`
 - The elements follow what the item carries: Production (5510) and tonne trade quantities (5610/5910) for an item with Production; for live-animal items, which have none, their Stocks elements (5111, 5112, 5114) and every import/export quantity element they carry, grouped by unit. `ranking_elements` names each ranking's elements and units, and the section headings repeat them
-- Query selection prefers a unique exact label after trimming, collapsing whitespace, and case folding; otherwise requires a unique relevance match. For ambiguous terms such as `maize` or `milk`, call `faostat_resolve_codes` with `domain: "QCL"`, `dimension: "item"`, and the query, then pass the selected `item_code` (e.g. `56` for maize grain)
+- Query selection prefers a unique exact label after trimming, collapsing whitespace, case folding, and comparing `;` and `,` alike (`Peas, dry` selects `Peas; dry`); otherwise requires a unique relevance match. For ambiguous terms such as `maize` or `milk`, call `faostat_resolve_codes` with `domain: "QCL"`, `dimension: "item"`, and the query, then pass the selected `item_code` (e.g. `56` for maize grain)
 - Rankings are per-country sums grouped by unit, each country at its own latest reporting year; `years_behind` marks how far a row trails its ranking's latest year, and the notice names lagging rows with a `year_start` that drops them; countries only (aggregates excluded)
-- Returns a partial profile without trade, with a notice — rather than failing — when the trade domain (TCL) isn't indexed or still syncing
+- Returns a partial profile without trade, with a notice — rather than failing — when the trade domain (TCL) isn't indexed or has no completed sync
 - `top_n` caps each ranked list (at most 50 per call; a larger value is served at 50 with a notice); when the merged observation set is too large to inline it spills to a DataCanvas table — `faostat_dataframe_describe` for its columns, then `faostat_dataframe_query` for further SQL
 - Every staging outcome is stated in the notice: the staged table, a set that fit inline, a staging failure, or a disabled canvas
-- Typed errors: `missing_item`, `ambiguous_item`, `no_match`, `domain_not_indexed`, `index_not_ready`, `invalid_year_range`, `canvas_not_found`, `query_timeout`, `pool_closed`
+- Typed errors: `missing_item`, `invalid_query`, `ambiguous_item`, `no_match`, `trade_item_not_found`, `domain_not_indexed`, `index_not_ready`, `invalid_year_range`, `canvas_not_found`, `query_timeout`, `pool_closed`
 
 ---
 
@@ -225,15 +229,17 @@ The corpus is not bundled. Before the data tools can answer queries, sync the se
 
 ```sh
 bun run mirror:init      # one-time bootstrap — downloads and indexes the FAOSTAT_DOMAINS set
-bun run mirror:refresh   # re-sync domains whose upstream update date has advanced; build missing planner statistics
+bun run mirror:refresh   # re-sync domains whose upstream update date has advanced; build missing or stale planner statistics
 bun run mirror:verify    # report sync status, local row counts, checkpoints, and dimension population
 ```
 
 `mirror:init` is idempotent and resumable per domain — re-running after an interrupt re-streams only the unfinished domain ZIP. `FAOSTAT_DOMAINS` selects which domains are indexed; everything else in the catalog shows in `faostat_list_domains` with `indexed: false` until added and re-synced. On HTTP transport, set `FAOSTAT_REFRESH_CRON` to refresh in-process on a schedule; on stdio, run `mirror:refresh` out-of-band. The read tools return `index_not_ready` until the first sync completes.
 
-After upgrading an older mirror, run `mirror:refresh`. FS and GLE rebuild once to recover period/text-item rows and separate source estimates, even when the upstream date is unchanged; they remain unready until that rebuild succeeds. Compatible numeric domains stay readable and gain the new indexes during refresh without a forced download. Until those indexes are prepared, domain-wide element/unit discovery can be slow; scope it with `item_codes` or `item_codes_text` when possible.
+After upgrading an older mirror, run `mirror:refresh`. Each row records the update date of the file it came from, and rows an older release wrote carry none, so that first refresh re-downloads every synced domain once, even when its upstream date is unchanged. FS and GLE rebuild once to recover period/text-item rows and separate source estimates; they remain unready until that rebuild succeeds. Compatible numeric domains stay readable throughout and gain the new indexes during the refresh. Until those indexes are prepared, domain-wide element/unit discovery can be slow; scope it with `item_codes` or `item_codes_text` when possible.
 
-`mirror:refresh` also builds query-planner statistics (`ANALYZE`) for any selected domain whose statistics are missing or do not cover one of its indexes, even when its data is unchanged upstream — a mirror synced by an older release, one a refresh has just given a new index, or one whose last build failed. Otherwise the server builds them itself, in the background on a worker thread, the first time a data read touches that domain, and keeps answering meanwhile.
+A refresh removes the rows its rebuilt domain file does not carry and prints `<N> records applied, <M> removed` per domain.
+
+`mirror:refresh` also builds query-planner statistics (`ANALYZE`) for any selected domain whose statistics are missing, stale because rows changed since the last build committed, or do not cover one of its indexes, even when its data is unchanged upstream — a mirror synced by an older release, one a refresh has just given a new index, or one whose last build failed or was stopped. Otherwise the server builds them itself, in the background on a worker thread, the first time a data read touches that domain, and keeps answering meanwhile. No read triggers a build while another process's sync holds the domain store's lease; that sync ends with its own.
 
 ### Docker
 
@@ -246,7 +252,7 @@ Build locally with `docker build -t faostat-mcp-server .`. For stdio from an MCP
 ```sh
 docker exec <container> bun run mirror:init      # one-time bootstrap
 docker exec <container> bun run mirror:verify    # sync status, row counts, checkpoints, and dimension population
-docker exec <container> bun run mirror:refresh   # re-sync updated domains; build missing planner statistics
+docker exec <container> bun run mirror:refresh   # re-sync updated domains; build missing or stale planner statistics
 ```
 
 ## Project structure

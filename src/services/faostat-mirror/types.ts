@@ -88,6 +88,13 @@ export interface ObservationRow {
   area_m49: string | null;
   element: string;
   element_code: number;
+  /**
+   * The `DateUpdate` of the domain file the row was last written from, as Unix epoch
+   * seconds (UTC): the stamp a refresh tells the rows its file carries from the rows
+   * the file no longer does (#63). Null on a row stored before rows carried it, or
+   * written from a file whose `DateUpdate` has another form.
+   */
+  file_date_update: number | null;
   flag: string | null;
   /** Composite exact identity; ordinary numeric annual source-less rows keep `area|item|element|year`. */
   id: string;
@@ -188,6 +195,11 @@ export interface ResolvedCode {
   cpc_code?: string;
   /** Country/aggregate for areas; verified aggregate groups for items; otherwise unknown. */
   kind: AreaKind | null;
+  /**
+   * FAO's published M49 code for an area, leading zeros kept (`001`, `002.03`);
+   * absent for items and elements, and for an area whose code list carried none.
+   */
+  m49_code?: string;
   /** The human-readable label. */
   name: string;
   /** Distinct non-null units for an element in the selected domain/item scope. */

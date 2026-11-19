@@ -3,9 +3,15 @@
  * through fflate, routes the bundled code-list CSVs (`_AreaCodes`, `_ItemCodes`,
  * `_Elements`, `_Flags`) into the shared dimension store, and stream-parses the
  * normalized data CSV (`_All_Data_(Normalized)`) into observation rows yielded as
- * MirrorService pages. Bounded memory: the data CSV is split record-by-record
- * from decompressed chunks and drained in batched pages; the (small) code-list
- * CSVs are buffered whole and applied to dimensions before the data drains.
+ * MirrorService pages. The data rows also supply the item identities the item list
+ * lacks: FAO ships some lists short or header-only (#64). Each row carries the
+ * stamp of the file it came from, and once every row of the file is in, the rows
+ * the cube holds without that stamp are removed (#63), unless the file carries no
+ * row at all. Bounded memory: the data CSV is split record-by-record from
+ * decompressed chunks and drained in batched pages; the (small) code-list CSVs are
+ * buffered whole and applied to dimensions
+ * before the data drains, the data rows' item identities are kept one entry per
+ * identity, and the rows to remove are read in bounded rowid slices.
  * @module services/faostat-mirror/ingester
  */
 
@@ -32,10 +38,48 @@ import type {
   ObservationRow,
 } from './types.js';
 
-/** Observation rows drained to the framework per page (one transaction each). */
+/** Observation rows, or ids of rows to remove, drained to the framework per page (one transaction each). */
 const BATCH_ROWS = 5000;
 
+/**
+ * Rowids one read of the rows a file does not carry covers. Each read is one
+ * rowid-range search of the cube table, so it reads at most this many rows, and
+ * the pass over the 4.8M-row FBS cube is 97 such reads.
+ */
+const STALE_SLICE_ROWIDS = 50_000;
+
 const EMPTY = new Uint8Array(0);
+
+/**
+ * The stamp a file's rows carry in `file_date_update`: its manifest `DateUpdate`
+ * as Unix epoch seconds, read as UTC. Undefined unless the `DateUpdate` is a
+ * calendar instant in the manifest's `YYYY-MM-DDTHH:MM:SS` form, so two values
+ * never share a stamp, and SQLite reads one back as the text it came from
+ * (`strftime('%Y-%m-%dT%H:%M:%S', stamp, 'unixepoch')`). An integer, never the
+ * 19-character text: it takes 4 bytes a row until 2038 and 6 after, against about
+ * 20, which on the 17M-row TCL cube is the difference between tens and hundreds of
+ * megabytes.
+ */
+export function dateUpdateStamp(dateUpdate: string): number | undefined {
+  const ms = Date.parse(`${dateUpdate}Z`);
+  if (!Number.isFinite(ms) || new Date(ms).toISOString() !== `${dateUpdate}.000Z`) return;
+  return ms / 1000;
+}
+
+/**
+ * The reads of a domain cube the ingester needs from the store it writes, bound
+ * for one run by `FaostatMirror.runDomainSync`. Each read takes the run's signal
+ * and rejects with the run's stop reason once the run is stopped.
+ */
+export interface CubeAccess {
+  /** The lowest and highest rowid the cube holds, or undefined when it holds no row. */
+  rowids(signal: AbortSignal): Promise<{ first: number; last: number } | undefined>;
+  /**
+   * The ids of the rows with a rowid in `[from, to)` that do not carry `stamp`,
+   * unstamped rows included.
+   */
+  unstamped(stamp: number, from: number, to: number, signal: AbortSignal): Promise<string[]>;
+}
 
 /** Identify which bundled CSV a ZIP entry is, by filename suffix. */
 type EntryKind = 'data' | 'areas' | 'items' | 'elements' | 'flags' | 'other';
@@ -49,11 +93,14 @@ function classifyEntry(name: string): EntryKind {
   return 'other';
 }
 
-/** Map one data-CSV record (against the real header) to an observation row, or null to skip. */
+/**
+ * Map one data-CSV record (against the real header) to an observation row, or null
+ * to skip. The row is the record's alone: the file stamp is the ingester's to add.
+ */
 export function dataRowToObservation(
   fields: string[],
   cols: Map<string, number>,
-): ObservationRow | null {
+): Omit<ObservationRow, 'file_date_update'> | null {
   const get = (name: string): string | undefined => {
     const i = cols.get(name);
     return i === undefined ? undefined : fields[i];
@@ -219,22 +266,49 @@ function splitNonEmptyLines(text: string): string[] {
 }
 
 /**
+ * An item's identity: its numeric code, or its alphanumeric code text. The two never
+ * collide, since a code text always holds a letter.
+ */
+function itemKey(r: Pick<ItemRecord, 'item_code' | 'item_code_text'>): number | string | null {
+  return r.item_code ?? r.item_code_text;
+}
+
+/**
  * Build a domain ingester. The returned generator:
  * 1. On `refresh`, short-circuits when the manifest `DateUpdate` is not newer
  *    than the stored checkpoint (no fetch — a domain ZIP is one atomic unit).
  * 2. Streams the ZIP, buffering the four code-list CSVs (small) and routing the
- *    data CSV record-by-record into observation rows.
- * 3. Applies the dimension code lists to the shared store, then yields data rows
- *    in batched pages. The durable `checkpoint` (the manifest `DateUpdate`) is
- *    emitted only on the terminal page — an interrupted run leaves no checkpoint,
- *    so the next refresh re-streams the whole ZIP (a ZIP is one atomic unit).
+ *    data CSV record-by-record into observation rows, noting each item identity
+ *    the rows name with the label of its first row in file order.
+ * 3. Applies the dimension code lists to the shared store, then adds the noted
+ *    item identities the item list lacks ({@link DimensionsStore.addMissingItems},
+ *    which never replaces a row already present), then yields data rows in batched
+ *    pages, each row stamped with the file's {@link dateUpdateStamp}.
+ * 4. Once every data page has committed, reads the ids of the rows the cube holds
+ *    without that stamp — rows the file no longer carries, and rows stored before
+ *    rows carried a stamp — one {@link STALE_SLICE_ROWIDS} rowid slice at a time
+ *    (`cube`), and yields them as tombstone pages. A read never meets a cube
+ *    missing a row of the file, and since the stamp is the file's, not the run's,
+ *    a run stopped anywhere and rerun removes the same rows.
+ *
+ * The durable `checkpoint` (the manifest `DateUpdate`) is emitted only on the
+ * terminal page, which carries the last tombstones, so no removal ever follows it:
+ * once it commits, the next refresh skips the domain. An interrupted run leaves no
+ * checkpoint, so the next refresh re-streams the whole ZIP (a ZIP is one atomic
+ * unit). Two files remove nothing, each with a warning saying so, and still
+ * complete with their checkpoint, so the next file that stamps and carries rows
+ * removes what it does not carry: a file whose `DateUpdate` stamps nothing, whose
+ * rows land unstamped; and a file whose data CSV yields no row (FAO has shipped one
+ * holding only its header, with or without a final line break), which would
+ * otherwise remove every row of the domain.
  */
 export function makeDomainSync(opts: {
+  cube: CubeAccess;
   dataset: ManifestDataset;
   dimensions: DimensionsStore;
   log?: MirrorLogger;
 }): SyncGenerator {
-  const { dataset, dimensions, log } = opts;
+  const { cube, dataset, dimensions, log } = opts;
 
   return async function* domainSync(ctx: SyncContext): AsyncGenerator<SyncPage> {
     const checkpoint = dataset.DateUpdate;
@@ -244,6 +318,13 @@ export function makeDomainSync(opts: {
       });
       return;
     }
+    const stamp = dateUpdateStamp(checkpoint);
+    if (stamp === undefined) {
+      log?.warning?.(
+        `${dataset.DatasetCode} manifest DateUpdate "${checkpoint}" is not a YYYY-MM-DDTHH:MM:SS instant, so this sync stamps none of its rows and removes none the file no longer carries; the next file whose DateUpdate has that form removes them`,
+      );
+    }
+    const stamped = { file_date_update: stamp ?? null };
 
     const response = await fetch(dataset.FileLocation, {
       signal: ctx.signal,
@@ -269,6 +350,28 @@ export function makeDomainSync(opts: {
     let dataHeader: Map<string, number> | undefined;
     const pending: ObservationRow[] = [];
     let dataRows = 0;
+    /** Each item identity the data rows name, labeled from its first row in file order. */
+    const rowItems = new Map<number | string | null, ItemRecord>();
+    /** The data CSV's first record is its header, the rest its rows. */
+    const take = (record: string): void => {
+      if (!dataHeader) {
+        dataHeader = headerIndex(parseCsvLine(record));
+        return;
+      }
+      const obs = dataRowToObservation(parseCsvLine(record), dataHeader);
+      if (!obs) return;
+      pending.push(Object.assign(obs, stamped));
+      dataRows++;
+      const key = itemKey(obs);
+      if (!rowItems.has(key)) {
+        rowItems.set(key, {
+          item_code: obs.item_code,
+          item_code_text: obs.item_code_text,
+          cpc_code: null,
+          item: obs.item,
+        });
+      }
+    };
 
     // Buffered code-list CSV text (small files), keyed by kind.
     const codeListChunks: Partial<Record<'areas' | 'items' | 'elements' | 'flags', Uint8Array[]>> =
@@ -293,26 +396,13 @@ export function makeDomainSync(opts: {
           }
           if (chunk?.length) {
             for (const record of splitter.push(decoder.decode(chunk, { stream: true }))) {
-              if (!dataHeader) {
-                dataHeader = headerIndex(parseCsvLine(record));
-                continue;
-              }
-              const obs = dataRowToObservation(parseCsvLine(record), dataHeader);
-              if (obs) {
-                pending.push(obs);
-                dataRows++;
-              }
+              take(record);
             }
           }
           if (final) {
+            // A header-only CSV without a final line break ends with its header here.
             const last = splitter.flush();
-            if (last && dataHeader) {
-              const obs = dataRowToObservation(parseCsvLine(last), dataHeader);
-              if (obs) {
-                pending.push(obs);
-                dataRows++;
-              }
-            }
+            if (last) take(last);
           }
         };
         file.start();
@@ -355,7 +445,7 @@ export function makeDomainSync(opts: {
 
     // Apply the bundled dimension code lists to the shared store. Done after the
     // stream drains so all code-list entries are fully buffered.
-    await applyDimensions(dimensions, codeListChunks, decoder);
+    const itemsFromRows = await applyDimensions(dimensions, codeListChunks, [...rowItems.values()]);
 
     if (!dataHeader) {
       throw serviceUnavailable(
@@ -368,30 +458,59 @@ export function makeDomainSync(opts: {
       yield { records: pending.splice(0, BATCH_ROWS) as unknown as MirrorRow[] };
     }
 
-    log?.notice?.(`${dataset.DatasetCode} ingest complete`, { dataRows });
-    // Terminal completion marker — checkpoint valid only once every row applied.
-    yield { records: [], checkpoint };
+    log?.notice?.(`${dataset.DatasetCode} ingest complete`, { dataRows, itemsFromRows });
+    // FAO has shipped a data CSV holding only its header: a publishing fault, not the
+    // withdrawal of a whole domain, so a file with no row removes none.
+    if (dataRows === 0) {
+      log?.warning?.(
+        `${dataset.DatasetCode} data file for DateUpdate "${checkpoint}" carries no data rows, so this sync removes none of the rows the cube holds; the next file that carries rows removes those it does not carry`,
+      );
+    }
+    const stale: string[] = [];
+    const range = stamp === undefined || dataRows === 0 ? undefined : await cube.rowids(ctx.signal);
+    if (stamp !== undefined && range) {
+      for (let from = range.first; from <= range.last; from += STALE_SLICE_ROWIDS) {
+        for (const id of await cube.unstamped(stamp, from, from + STALE_SLICE_ROWIDS, ctx.signal))
+          stale.push(id);
+        // Strictly more than a page, so the last tombstones ride the checkpoint page.
+        while (stale.length > BATCH_ROWS) {
+          yield { records: [], tombstones: stale.splice(0, BATCH_ROWS) };
+        }
+      }
+    }
+    // Terminal completion marker — checkpoint valid only once every row applied and removed.
+    yield { records: [], tombstones: stale, checkpoint };
   };
 }
 
-/** Decode and parse buffered code-list chunks, then upsert into the dimension store. */
+/**
+ * Decode and parse buffered code-list chunks and upsert them into the dimension
+ * store, then add the data rows' item identities the item list lacks. The list
+ * goes first, so its label and CPC code are what a listed identity keeps. Returns
+ * how many items the rows added.
+ */
 async function applyDimensions(
   dimensions: DimensionsStore,
   chunks: Partial<Record<'areas' | 'items' | 'elements' | 'flags', Uint8Array[]>>,
-  decoder: TextDecoder,
-): Promise<void> {
+  rowItems: ItemRecord[],
+): Promise<number> {
   const decode = (parts: Uint8Array[] | undefined): string | undefined =>
     parts ? new TextDecoder('utf-8').decode(concat(parts)) : undefined;
-  void decoder; // streaming decoder reserved for the data CSV; code lists use a fresh decode
 
   const areaText = decode(chunks.areas);
   if (areaText) await dimensions.upsertAreas(parseAreaCodes(areaText));
   const itemText = decode(chunks.items);
-  if (itemText) await dimensions.upsertItems(parseItemCodes(itemText));
+  const listed = itemText ? parseItemCodes(itemText) : [];
+  await dimensions.upsertItems(listed);
+  const listedKeys = new Set(listed.map(itemKey));
+  const added = await dimensions.addMissingItems(
+    rowItems.filter((r) => !listedKeys.has(itemKey(r))),
+  );
   const elementText = decode(chunks.elements);
   if (elementText) await dimensions.upsertElements(parseElementCodes(elementText));
   const flagText = decode(chunks.flags);
   if (flagText) await dimensions.upsertFlags(parseFlags(flagText));
+  return added;
 }
 
 /** Concatenate Uint8Array chunks into one buffer. */

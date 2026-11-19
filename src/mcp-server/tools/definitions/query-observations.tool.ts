@@ -54,6 +54,7 @@ const LIMIT = countInput({
 function toObservation({
   area_code,
   area,
+  area_m49,
   item_code,
   item,
   element_code,
@@ -71,6 +72,7 @@ function toObservation({
   return {
     area_code,
     area,
+    area_m49,
     item_code,
     item,
     element_code,
@@ -206,7 +208,7 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       )
       .optional()
       .describe(
-        'Exact alphanumeric item identities from resolver code_text; mutually exclusive with item_codes. Numeric codes use item_codes.',
+        'Exact alphanumeric item identities from resolver code_text; letters are uppercased before the query, so 210400f reads as 210400F. Mutually exclusive with item_codes. Numeric codes use item_codes.',
       ),
     source_codes: z
       .array(z.number().int())
@@ -264,6 +266,12 @@ export const queryObservationsTool = tool('faostat_query_observations', {
           .object({
             area_code: z.number().describe('Area code.'),
             area: z.string().describe('Area name.'),
+            area_m49: z
+              .string()
+              .nullable()
+              .describe(
+                "FAO's published M49 code for the area, a string with its leading zeros (840, 001); the excluding-intra-trade aggregates carry dotted FAO extensions such as 002.03. The same code faostat_resolve_codes reports as the area's m49_code; null when the domain file carries none.",
+              ),
             item_code: z
               .number()
               .nullable()
@@ -394,10 +402,15 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       return { domain: code, observations: [], spilled: false, truncated: false };
     }
 
+    // Every stored text identity is uppercase, and the input pattern admits lowercase
+    // letters: the page, count, staging, its query_params, and available_elements all
+    // read the normalized identities (#68).
+    const itemCodesText = input.item_codes_text?.map((code) => code.toUpperCase());
+
     const filters = {
       ...(input.area_codes?.length ? { areaCodes: input.area_codes } : {}),
       ...(input.item_codes?.length ? { itemCodes: input.item_codes } : {}),
-      ...(input.item_codes_text?.length ? { itemCodesText: input.item_codes_text } : {}),
+      ...(itemCodesText?.length ? { itemCodesText } : {}),
       ...(input.source_codes?.length ? { sourceCodes: input.source_codes } : {}),
       ...(input.element_codes?.length ? { elementCodes: input.element_codes } : {}),
       ...(input.year_start !== undefined ? { yearStart: input.year_start } : {}),
@@ -438,7 +451,7 @@ export const queryObservationsTool = tool('faostat_query_observations', {
     if (rows.length === 0) {
       let availableElements: { code: number; name: string; units: string[] }[] | undefined;
       if (
-        (input.item_codes !== undefined || input.item_codes_text !== undefined) &&
+        (input.item_codes !== undefined || itemCodesText !== undefined) &&
         input.element_codes !== undefined
       ) {
         availableElements = [];
@@ -447,9 +460,7 @@ export const queryObservationsTool = tool('faostat_query_observations', {
         do {
           const page = await mirror.resolve(code, 'element', {
             ...(input.item_codes !== undefined ? { itemCodes: input.item_codes } : {}),
-            ...(input.item_codes_text !== undefined
-              ? { itemCodesText: input.item_codes_text }
-              : {}),
+            ...(itemCodesText !== undefined ? { itemCodesText } : {}),
             limit: 200,
             offset,
             signal,
@@ -504,7 +515,7 @@ export const queryObservationsTool = tool('faostat_query_observations', {
             domain: code,
             area_codes: input.area_codes,
             item_codes: input.item_codes,
-            item_codes_text: input.item_codes_text,
+            item_codes_text: itemCodesText,
             source_codes: input.source_codes,
             element_codes: input.element_codes,
             year_start: input.year_start,
@@ -602,14 +613,14 @@ export const queryObservationsTool = tool('faostat_query_observations', {
       lines.push('_No observations._');
       return [{ type: 'text', text: lines.join('\n') }];
     }
-    lines.push('| Area | Item | Element | Year | Value | Unit | Flag | Period | Source |');
-    lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+    lines.push('| Area | M49 | Item | Element | Year | Value | Unit | Flag | Period | Source |');
+    lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
     for (const o of result.observations) {
       const itemCode = [o.item_code, o.item_code_text]
         .filter((value) => value !== null)
         .join(' / ');
       lines.push(
-        `| ${markdownCell(o.area)} (${o.area_code}) | ${markdownCell(o.item)} (${markdownCell(itemCode)}) | ${markdownCell(o.element)} (${o.element_code}) | ${o.year} | ${o.value_qualifier ?? ''}${o.value ?? ''} | ${markdownCell(o.unit)} | ${markdownCell(o.flag)} | ${markdownCell(o.period)} | ${markdownCell(o.source)}${o.source_code === null ? '' : ` (${o.source_code})`} |`,
+        `| ${markdownCell(o.area)} (${o.area_code}) | ${markdownCell(o.area_m49)} | ${markdownCell(o.item)} (${markdownCell(itemCode)}) | ${markdownCell(o.element)} (${o.element_code}) | ${o.year} | ${o.value_qualifier ?? ''}${o.value ?? ''} | ${markdownCell(o.unit)} | ${markdownCell(o.flag)} | ${markdownCell(o.period)} | ${markdownCell(o.source)}${o.source_code === null ? '' : ` (${o.source_code})`} |`,
       );
     }
     return [{ type: 'text', text: lines.join('\n') }];

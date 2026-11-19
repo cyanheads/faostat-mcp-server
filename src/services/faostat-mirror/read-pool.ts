@@ -19,9 +19,18 @@
  * lets reads pass it, and the two workers never both hold a build, so reads always
  * keep one.
  *
+ * Under Node, process exit waits for the statement a retired worker is still running;
+ * under Bun it exits at once. A build's statistics are one transaction of per-index
+ * `ANALYZE` statements (#62), so a build {@link ReadPool.close} retires holds that
+ * exit for one statement at most — an index's `ANALYZE`, the area/year `CREATE INDEX`
+ * on a store that lacks the index, or a `BEGIN IMMEDIATE` waiting out `busy_timeout`
+ * behind another connection's write lock — and commits no statistics.
+ *
  * A job the pool rejects because it is closing or closed carries
  * `reason: 'pool_closed'`, which {@link isPoolClosed} reads, so a caller tells
- * shutdown apart from a failure of the job itself (#46).
+ * shutdown apart from a failure of the job itself (#46). A build its worker found a
+ * sync's lease in the way of carries `reason: 'sync_lease_held'`
+ * ({@link isSyncLeaseHeld}), the same way (#60).
  * @module services/faostat-mirror/read-pool
  */
 
@@ -29,6 +38,7 @@ import { extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import {
+  conflict,
   McpError,
   requestCancelled,
   serviceUnavailable,
@@ -166,6 +176,25 @@ export function isPoolClosed(error: unknown): boolean {
   return error instanceof McpError && error.data?.reason === POOL_CLOSED;
 }
 
+/** `data.reason` on a build its worker refused because a sync holds the store's lease. */
+const SYNC_LEASE_HELD = 'sync_lease_held';
+
+/** A build's refusal while a sync holds the lease, recognized by {@link isSyncLeaseHeld}. */
+function syncLeaseHeld(): McpError {
+  return conflict('The statistics build did not run: a sync holds the mirror store’s lease.', {
+    reason: SYNC_LEASE_HELD,
+  });
+}
+
+/**
+ * True when `error` is a statistics build's refusal to write while a sync holds the
+ * store's lease ({@link ReadPool.analyze}): its statistics are unchanged, and nothing
+ * about the build failed.
+ */
+export function isSyncLeaseHeld(error: unknown): boolean {
+  return error instanceof McpError && error.data?.reason === SYNC_LEASE_HELD;
+}
+
 export class ReadPool {
   private closed = false;
   private readonly entry: URL;
@@ -203,14 +232,18 @@ export class ReadPool {
 
   /**
    * Build `table`'s planner statistics in `file` on a worker, and resolve with how
-   * long the `ANALYZE` statement ran, in ms. Takes no signal, so it is never cut off:
-   * it rejects only with the driver's error (a writer holding the lock past
-   * `busy_timeout`, a read-only file), with `DatabaseError` when the worker cannot
-   * open the file, with `ServiceUnavailable` when its worker dies, or with the
-   * pool's shutdown rejection ({@link isPoolClosed}) when the pool closes before it
-   * returns. The caller reports success to the other workers with {@link invalidate}.
-   * When `areaYearIndex` is true, installs the cube's `(area_code, year)` index
-   * before ANALYZE in the same job, under the same single-build scheduling limit.
+   * long the build ran, in ms. Its per-index `ANALYZE` statements and the clear of
+   * the store's stale flag commit in one transaction, so a build that does not finish
+   * leaves the flag set and the previous statistics in place. Takes no signal, so it
+   * is never cut off: it rejects only with the driver's error (a writer
+   * holding the lock past `busy_timeout`, a read-only file), with `DatabaseError` when
+   * the worker cannot open the file, with `ServiceUnavailable` when its worker dies,
+   * with `Conflict` ({@link isSyncLeaseHeld}) when a sync holds the store's lease as
+   * the build would write, or with the pool's shutdown rejection
+   * ({@link isPoolClosed}) when the pool closes before it returns. The caller reports
+   * success to the other workers with {@link invalidate}. When `areaYearIndex` is
+   * true, installs the cube's `(area_code, year)` index first in the same job, in its
+   * own transaction, under the same single-build scheduling limit.
    */
   analyze(file: string, table: string, areaYearIndex = false): Promise<number> {
     if (this.closed) return Promise.reject(poolClosed('The mirror read pool is closed.'));
@@ -249,7 +282,12 @@ export class ReadPool {
    * Reject every queued and running job with the pool's shutdown rejection
    * ({@link isPoolClosed}), close idle workers and wait for them to exit. A worker
    * mid-statement is retired rather than awaited — neither driver can interrupt it,
-   * and under Node the process exit still waits for it.
+   * and under Node the process exit still waits for it. A retired build stops when
+   * its running statement returns, committing nothing unless that statement is its
+   * closing `COMMIT`, so that wait is one statement: an index's `ANALYZE`, the
+   * area/year `CREATE INDEX` on a store that lacks it, or a `BEGIN IMMEDIATE` waiting
+   * out `busy_timeout` behind another connection's write lock, never a whole-table
+   * `ANALYZE` (#62).
    */
   async close(): Promise<void> {
     if (this.closed) return;
@@ -330,6 +368,7 @@ export class ReadPool {
       worker.unref();
       job.detach();
       if ('error' in reply) job.reject(fromFailure(reply.error));
+      else if ('leaseHeld' in reply) job.reject(syncLeaseHeld());
       else job.resolve('rows' in reply ? reply.rows : reply.durationMs);
       this.pump();
     });

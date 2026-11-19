@@ -4,7 +4,7 @@ description: Analyze food and agriculture statistics with faostat_* tools. Use f
 license: Apache-2.0
 metadata:
   author: "cyanheads"
-  version: "1.2"
+  version: "1.3"
 ---
 
 ## Scope
@@ -13,7 +13,7 @@ Use FAOSTAT for historical food and agriculture statistics from the domains avai
 
 ## Identifiers
 
-Obtain domain codes from faostat_list_domains and area, item, and element identities from faostat_resolve_codes. Pass numeric item codes through item_codes; when code is null, pass the exact code_text through item_codes_text. Resolve items and elements in each domain being analyzed; a CPC crosswalk is not an item code. Areas share a vocabulary across domains, so a resolved area alone does not establish observations in the chosen domain.
+Obtain domain codes from faostat_list_domains and area, item, and element identities from faostat_resolve_codes. Pass numeric item codes through item_codes; when code is null, pass the exact code_text through item_codes_text (letters are case-insensitive). Food Balance Sheets items resolve like any other, with kind null. Resolve items and elements in each domain being analyzed; a CPC crosswalk is not an item code. Areas share a vocabulary across domains, so a resolved area alone does not establish observations in the chosen domain. Each area carries FAO's M49 code (m49_code on matches, area_m49 on observations), a string with leading zeros; to join another source, look an area up by it with m49_code on dimension area. The codes are FAO's, with dotted extensions and historical entities' former codes, not ISO numeric codes.
 
 Use the canvas and table identifiers returned by faostat_query_observations or faostat_commodity_profile. A canvas identifier alone does not establish that the latest call staged a table: check the spill status and returned table name.
 
@@ -34,7 +34,7 @@ Use the canvas and table identifiers returned by faostat_query_observations or f
 
 ### One commodity or a controlled comparison
 
-Use faostat_commodity_profile for a quick production/trade overview of one QCL item; live-animal items, which carry no Production, rank on Stocks, and ranking_elements names the elements and units behind each ranking. If the commodity is ambiguous, resolve and select its identity rather than combining candidates. Its rankings and annual trend aggregate the full filtered mirror match independently of the staged observation table; incomplete staging does not make those summaries partial.
+Use faostat_commodity_profile for a quick production/trade overview of one QCL item; live-animal items, which carry no Production, rank on Stocks, and ranking_elements names the elements and units behind each ranking. If the commodity is ambiguous, resolve and select its identity rather than combining candidates. Its rankings and annual trend aggregate the full filtered mirror match independently of the staged observation table; incomplete staging does not make those summaries partial. A crop traded mostly in processed form (paddy rice 27) shows little or no trade under its own item: find the traded product's TCL code with faostat_resolve_codes (domain TCL, dimension item, a query naming the product) and pass it as trade_item_code. Exporters and importers then rank that item, while producers and the trend stay on the selected one; trade_item names it.
 
 For a controlled comparison, use faostat_query_observations with the intended item, element, countries, and reporting period. For production versus trade, resolve the identities in both domains and check units before comparing. Join staged slices on the dimensions that identify the intended observations, including year, period, and source where present; filter or aggregate each side to the intended grain first so multiple elements, units, or sources do not multiply joined rows.
 
@@ -46,4 +46,4 @@ Use disjoint year or code selections when partitioning an incomplete retrieval, 
 
 ### Name search
 
-Send ordinary words to faostat_resolve_codes. Its full-text search normalizes whitespace-separated terms and applies prefix matching; it does not accept raw FTS operators or quoted-phrase syntax. Use its substring search when token-prefix matching does not express the intended label search, then inspect the candidates before selecting a code.
+Send ordinary words to faostat_resolve_codes. Its full-text search applies prefix matching to each distinct word; quotes, parentheses, asterisks, and control characters only separate words, so it accepts no raw FTS operators or quoted-phrase syntax. A blank or * query lists the dimension; any other query made only of quotes, parentheses, asterisks, and whitespace fails invalid_query. The profile's item_query follows the same rule, except that a blank or * item_query names no commodity and fails missing_item without item_code; a label comparison there reads ";" and "," alike ("Peas, dry" selects "Peas; dry"). Use its substring search when token-prefix matching does not express the intended label search, then inspect the candidates before selecting a code.

@@ -114,6 +114,40 @@ it.each([
   ).toEqual({ matches: [], total: 0 });
 });
 
+it.each([
+  ['\u0007', '"\\u0007"'],
+  ['\u0000', '"\\u0000"'],
+])(
+  'answers an element query of %j, which leaves no word, with no matches on both surfaces (#67)',
+  async (query, quoted) => {
+    expect(await mirror.resolve('QCL', 'element', { query, itemCodes: [866], limit: 1 })).toEqual({
+      matches: [],
+      total: 0,
+    });
+    for (const [selection, scope] of [
+      [{}, ''],
+      [{ item_codes: [866] }, ' for item_codes [866]'],
+    ] as [{ item_codes?: number[] }, string][]) {
+      const wire = await runToolContract(resolveCodesTool, {
+        domain: 'QCL',
+        dimension: 'element',
+        query,
+        ...selection,
+      });
+      expect(wire.isError).toBeFalsy();
+      const notice = `No element matched query ${quoted}${scope} in domain QCL.`;
+      expect(wire.structuredContent).toMatchObject({
+        matches: [],
+        totalMatches: 0,
+        notice: expect.stringContaining(notice),
+      });
+      expect(wire.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n')).toContain(
+        notice,
+      );
+    }
+  },
+);
+
 it('classifies verified QCL items at read time', async () => {
   expect((await mirror.resolve('QCL', 'item', { code: 1717, limit: 1 })).matches[0]?.kind).toBe(
     'aggregate',
@@ -252,6 +286,115 @@ it('keeps exact text item scope, null units, and stable text pagination', async 
   });
   expect(JSON.stringify(miss.content)).toContain('1806C');
 });
+
+/** Seed two FS-shaped text identities into QCL: 210400F carries three elements, 210400TSUB one. */
+async function seedTextIdentities() {
+  const handle = await mirror.getMirror('QCL')!.raw();
+  await mirror.dimensions.upsertItems([
+    { item_code: null, item_code_text: '210400F', item: 'Severe, female', cpc_code: null },
+    { item_code: null, item_code_text: '210400TSUB', item: 'Severe, town', cpc_code: null },
+  ]);
+  await mirror.dimensions.upsertElements([
+    { element_code: 6121, element: 'Value' },
+    { element_code: 61211, element: 'Confidence interval: Lower bound' },
+    { element_code: 61212, element: 'Confidence interval: Upper bound' },
+  ]);
+  for (const [id, text, element] of [
+    ['f-value', '210400F', 6121],
+    ['f-lower', '210400F', 61211],
+    ['f-upper', '210400F', 61212],
+    ['t-value', '210400TSUB', 6121],
+  ] as const)
+    handle
+      .prepare(
+        "INSERT INTO obs_QCL(id,item_code,item_code_text,element_code,unit) VALUES (?,NULL,?,?,'%')",
+      )
+      .run(id, text, element);
+}
+
+it.each([
+  ['210400F', '210400F'],
+  ['210400f', '210400F'],
+  ['210400Tsub', '210400TSUB'],
+  ['210400tsub', '210400TSUB'],
+])('reads code_text %s as the stored identity %s on both surfaces (#68)', async (input, stored) => {
+  await seedTextIdentities();
+  const wire = await runToolContract(resolveCodesTool, {
+    domain: 'QCL',
+    dimension: 'item',
+    code_text: input,
+  });
+  expect(wire.isError).toBeFalsy();
+  expect(wire.structuredContent).toMatchObject({
+    matches: [{ code: null, code_text: stored }],
+    totalMatches: 1,
+  });
+  expect(JSON.stringify(wire.content)).toContain(`**${stored}**`);
+});
+
+it.each([['210400F'], ['210400f']])(
+  'scopes elements by item_codes_text %s to the stored identity on both surfaces (#68)',
+  async (input) => {
+    await seedTextIdentities();
+    const wire = await runToolContract(resolveCodesTool, {
+      domain: 'QCL',
+      dimension: 'element',
+      item_codes_text: [input],
+    });
+    expect(wire.isError).toBeFalsy();
+    const { matches } = wire.structuredContent as { matches: { code: number; units: string[] }[] };
+    expect(matches.map((m) => [m.code, m.units])).toEqual([
+      [6121, ['%']],
+      [61211, ['%']],
+      [61212, ['%']],
+    ]);
+    for (const code of ['6121', '61211', '61212'])
+      expect(JSON.stringify(wire.content)).toContain(`**${code}**`);
+  },
+);
+
+it('keeps an unknown text code an empty answer and rejects padded identities (#68)', async () => {
+  await seedTextIdentities();
+  const miss = await runToolContract(resolveCodesTool, {
+    domain: 'QCL',
+    dimension: 'item',
+    code_text: '210400X',
+  });
+  expect(miss.structuredContent).toMatchObject({
+    matches: [],
+    totalMatches: 0,
+    notice: expect.stringContaining('No item matched code_text "210400X" in domain QCL.'),
+  });
+  for (const padded of [' 210400F', '210400F '])
+    for (const args of [
+      { domain: 'QCL', dimension: 'item', code_text: padded },
+      { domain: 'QCL', dimension: 'element', item_codes_text: [padded] },
+    ])
+      expect(resolveCodesTool.input.safeParse(args).success).toBe(false);
+});
+
+it.each([
+  { item_codes_text: ['210400x'], scope: 'item_codes_text [210400X]' },
+  { item_codes: [999], scope: 'item_codes [999]' },
+])(
+  'names the applied item scope when element resolution finds nothing: %j',
+  async ({ scope, ...selection }) => {
+    await seedTextIdentities();
+    for (const filter of [{}, { query: 'value' }, { code: 6121 }]) {
+      const wire = await runToolContract(resolveCodesTool, {
+        domain: 'QCL',
+        dimension: 'element',
+        ...selection,
+        ...filter,
+      });
+      expect(wire.isError).toBeFalsy();
+      const { notice } = wire.structuredContent as { notice: string };
+      expect(wire.structuredContent).toMatchObject({ matches: [], totalMatches: 0 });
+      expect(notice).toContain(`for ${scope} in domain QCL`);
+      expect(JSON.stringify(wire.content)).toContain(`for ${scope} in domain QCL`);
+    }
+  },
+);
 
 it('enumerates empty-query guidance beyond the first element page using the same deadline', async () => {
   const handle = await mirror.getMirror('QCL')!.raw();

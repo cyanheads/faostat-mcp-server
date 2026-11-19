@@ -5,7 +5,9 @@
  * trade, 5610/5910 for a Production item, otherwise every import and export
  * quantity element it carries in TCL. The output names each ranking's elements
  * and units on both surfaces, and an item with no applicable QCL element returns
- * empty sections with a notice naming what it does carry.
+ * empty sections with a notice naming what it does carry. A `trade_item_code` (#66)
+ * moves the trade rankings to another TCL item while those elements stay keyed on
+ * the selected item, and units are counted per item.
  * @module tests/tools/commodity-profile-elements
  */
 
@@ -17,6 +19,7 @@ import { parseConfig } from '@cyanheads/mcp-ts-core/config';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { commodityProfileTool } from '@/mcp-server/tools/definitions/commodity-profile.tool.js';
+import { dataframeDescribeTool } from '@/mcp-server/tools/definitions/dataframe-describe.tool.js';
 import { setCanvas } from '@/services/canvas-accessor.js';
 import { type FaostatMirror, initFaostatMirror } from '@/services/faostat-mirror/index.js';
 import {
@@ -50,8 +53,13 @@ const RODENTS = { itemCode: 1150, item: 'Other rodents' } as const;
 const BIRDS = { itemCode: 1083, item: 'Other birds' } as const;
 const HAY = { itemCode: 300, item: 'Hay' } as const;
 const RABBITS = { itemCode: 1140, item: 'Rabbits and hares' } as const;
+/** A Stocks item counted in head whose own trade rows are in tonnes. */
+const CAMELS = { itemCode: 1126, item: 'Camels' } as const;
+/** TCL-only trade items (#66): processed forms that QCL does not hold. */
+const FLOUR = { itemCode: 16, item: 'Flour of wheat' } as const;
+const BEEF = { itemCode: 867, item: 'Meat of cattle' } as const;
 
-/** QCL: a Production item, three Stocks items, and an item carrying only Area harvested. */
+/** QCL: a Production item, five Stocks items, and an item carrying only Area harvested. */
 const QCL_ROWS: ExplicitObservation[] = [
   { ...ALPHA, ...WHEAT, ...PRODUCTION, year: 2022, value: 50 },
   { ...BRAVO, ...WHEAT, ...PRODUCTION, year: 2022, value: 70 },
@@ -63,15 +71,24 @@ const QCL_ROWS: ExplicitObservation[] = [
   { ...BRAVO, ...BIRDS, ...STOCKS_THOUSAND, year: 2022, value: 7 },
   { ...ALPHA, ...HAY, ...AREA_HARVESTED, year: 2022, value: 12 },
   { ...ALPHA, ...RABBITS, ...STOCKS_THOUSAND, year: 2022, value: 4 },
+  { ...BRAVO, ...CAMELS, ...STOCKS_HEAD, year: 2022, value: 80 },
 ];
 
 /**
  * TCL: wheat in tonnes plus a stray head-count row that a Production item must
  * not rank; cattle in head plus an import value that no ranking reads; rodents in
- * two units (the 1150 shape); rabbits in two units from one country in one year. The
- * birds and hay carry no trade rows.
+ * two units (the 1150 shape); rabbits in two units from one country in one year;
+ * camels in tonnes, beside their head-count Stocks. The birds and hay carry no trade
+ * rows. Flour (tonnes plus a head-count row) and beef (tonnes) are trade items QCL
+ * does not carry.
  */
 const TCL_ROWS: ExplicitObservation[] = [
+  { ...ALPHA, ...FLOUR, ...EXPORT_T, year: 2022, value: 400 },
+  { ...BRAVO, ...FLOUR, ...EXPORT_T, year: 2022, value: 300 },
+  { ...BRAVO, ...FLOUR, ...IMPORT_T, year: 2022, value: 200 },
+  { ...ALPHA, ...FLOUR, ...IMPORT_HEAD, year: 2022, value: 9999 },
+  { ...ALPHA, ...BEEF, ...EXPORT_T, year: 2022, value: 60 },
+  { ...BRAVO, ...BEEF, ...IMPORT_T, year: 2022, value: 50 },
   { ...ALPHA, ...WHEAT, ...IMPORT_T, year: 2022, value: 7 },
   { ...BRAVO, ...WHEAT, ...EXPORT_T, year: 2022, value: 8 },
   { ...ALPHA, ...WHEAT, ...IMPORT_HEAD, year: 2022, value: 999 },
@@ -85,6 +102,8 @@ const TCL_ROWS: ExplicitObservation[] = [
   { ...ALPHA, ...RODENTS, ...EXPORT_THOUSAND, year: 2022, value: 3 },
   { ...ALPHA, ...RABBITS, ...EXPORT_HEAD, year: 2022, value: 6 },
   { ...ALPHA, ...RABBITS, ...EXPORT_THOUSAND, year: 2022, value: 4 },
+  { ...ALPHA, ...CAMELS, ...EXPORT_T, year: 2022, value: 2 },
+  { ...BRAVO, ...CAMELS, ...IMPORT_T, year: 2022, value: 3 },
 ];
 
 type Ranked = { area_code: number; value: number; unit: string | null; year: number };
@@ -96,6 +115,8 @@ type ProfileWire = {
     production_trend: { year: number; value: number; unit: string | null }[];
     trend_points: number;
     ranking_elements: Record<string, unknown>;
+    resolved_items: { code: number; name: string }[];
+    trade_item?: { code: number; name: string };
     notice?: string;
   };
   /** The `format()` block alone. */
@@ -315,6 +336,110 @@ describe('faostat_commodity_profile element selection (#51)', () => {
     ]);
     expect(formatted).toContain('### Top producers — Stocks 5111\n_None._');
   });
+
+  it('reads the mirror 11 times with the canvas on and TCL available', async () => {
+    const reads = vi.spyOn(mirror.reads, 'all');
+    try {
+      await profile({ item_code: WHEAT.itemCode });
+      expect(reads).toHaveBeenCalledTimes(11);
+    } finally {
+      reads.mockRestore();
+    }
+  });
+
+  it('ranks a Production item’s trade item on its tonne rows alone, on both surfaces (#66)', async () => {
+    const { structured, formatted } = await profile({
+      item_code: WHEAT.itemCode,
+      trade_item_code: FLOUR.itemCode,
+    });
+    expect(structured.trade_item).toEqual({ code: 16, name: 'Flour of wheat' });
+    // Producers and the trend stay on the selected item.
+    expect(structured.resolved_items).toEqual([{ code: 15, name: 'Wheat' }]);
+    expect(rows(structured.top_producers)).toEqual([
+      [20, 70, 't', 2022],
+      [10, 50, 't', 2022],
+    ]);
+    // The trade item's head-count import row (5608) is not an element a Production item ranks.
+    expect(rows(structured.top_exporters)).toEqual([
+      [10, 400, 't', 2022],
+      [20, 300, 't', 2022],
+    ]);
+    expect(rows(structured.top_importers)).toEqual([[20, 200, 't', 2022]]);
+    expect(structured.ranking_elements).toEqual({
+      top_producers: [{ element_code: 5510, element: 'Production', units: ['t'] }],
+      top_exporters: [{ element_code: 5910, element: 'Export quantity', units: ['t'] }],
+      top_importers: [{ element_code: 5610, element: 'Import quantity', units: ['t'] }],
+    });
+    expect(formatted).toContain('Resolved to: Wheat (15)\n\nTrade item: Flour of wheat (16)\n');
+    expect(formatted).toContain('### Top producers — Production 5510 (t)');
+    expect(formatted).toContain(
+      '### Top exporters of Flour of wheat (16) — Export quantity 5910 (t)\n- Alpha (10): 400 t',
+    );
+    expect(formatted).toContain(
+      '### Top importers of Flour of wheat (16) — Import quantity 5610 (t)\n- Bravo (20): 200 t',
+    );
+  });
+
+  it('counts units per item: a Stocks item with a tonne trade item raises no mixed-unit part (#66)', async () => {
+    const { structured } = await profile({
+      item_code: CATTLE.itemCode,
+      trade_item_code: BEEF.itemCode,
+    });
+    expect(rows(structured.top_producers)).toEqual([
+      [20, 300, 'An', 2022],
+      [10, 110, 'An', 2022],
+    ]);
+    // A Stocks item ranks every trade quantity element; the beef carries the tonne pair.
+    expect(rows(structured.top_exporters)).toEqual([[10, 60, 't', 2022]]);
+    expect(rows(structured.top_importers)).toEqual([[20, 50, 't', 2022]]);
+    expect(structured.ranking_elements.top_exporters).toEqual([
+      { element_code: 5910, element: 'Export quantity', units: ['t'] },
+    ]);
+    expect(structured.notice).not.toMatch(/more than one unit/);
+  });
+
+  it('counts a trade_item_code equal to item_code as one item: the omitted call’s mixed-unit notice, on both surfaces (#66)', async () => {
+    const mixed =
+      'The selected item reports in more than one unit (An, t). Rows are grouped by unit rather than summed across them, so a country or year can appear once per unit and values are comparable only within the same unit.';
+    const omitted = await profile({ item_code: CAMELS.itemCode });
+    const same = await profile({ item_code: CAMELS.itemCode, trade_item_code: CAMELS.itemCode });
+    // Stocks in head, trade in tonnes: one item reporting in two units.
+    expect(rows(omitted.structured.top_producers)).toEqual([[20, 80, 'An', 2022]]);
+    expect(rows(omitted.structured.top_exporters)).toEqual([[10, 2, 't', 2022]]);
+    expect(omitted.structured.notice).toContain(mixed);
+    expect(same.structured.trade_item).toEqual({ code: 1126, name: 'Camels' });
+    expect(same.structured.notice).toContain(mixed);
+    expect(same.structured.notice).not.toMatch(/The trade item/);
+    expect(same.text).toContain(`> ${same.structured.notice}`);
+  });
+
+  it('names the trade item when it alone reports in more than one unit (#66)', async () => {
+    const { structured } = await profile({
+      item_code: CATTLE.itemCode,
+      trade_item_code: RODENTS.itemCode,
+    });
+    expect(structured.notice).toContain(
+      'The trade item Other rodents (1150) reports in more than one unit (An, 1000 An). Rows are grouped by unit rather than summed across them',
+    );
+    expect(structured.notice).not.toMatch(/selected item/);
+  });
+
+  it('keeps the read count at 11, every TCL read on the trade item (#66)', async () => {
+    const reads = vi.spyOn(mirror.reads, 'all');
+    try {
+      await profile({ item_code: WHEAT.itemCode, trade_item_code: FLOUR.itemCode });
+      expect(reads).toHaveBeenCalledTimes(11);
+      const tcl = reads.mock.calls.map(([read]) => read).filter((r) => r.file.includes(TCL));
+      // The element read, two rankings, the units read, and the staging stream.
+      expect(tcl).toHaveLength(5);
+      for (const read of tcl) {
+        expect(read.params).toContain(FLOUR.itemCode);
+        expect(read.params).not.toContain(WHEAT.itemCode);
+      }
+    } finally {
+      reads.mockRestore();
+    }
+  });
 });
 
 describe('faostat_commodity_profile element selection without trade (#51)', () => {
@@ -348,6 +473,21 @@ describe('faostat_commodity_profile element selection without trade (#51)', () =
     // No trade claim beyond the unavailable-domain one.
     expect(structured.notice).not.toMatch(/TCL holds no/);
   });
+
+  it('leaves trade_item_code unchecked and unnamed when TCL is outside the selection (#66)', async () => {
+    const { structured, formatted } = await profile({
+      item_code: CATTLE.itemCode,
+      trade_item_code: 9999,
+    });
+    expect(structured).not.toHaveProperty('trade_item');
+    expect(rows(structured.top_producers)).toEqual([
+      [20, 300, 'An', 2022],
+      [10, 110, 'An', 2022],
+    ]);
+    expect(structured.notice).toMatch(/Add TCL to FAOSTAT_DOMAINS/);
+    expect(formatted).not.toContain('Trade item:');
+    expect(formatted).toContain('### Top exporters\n_None._');
+  });
 });
 
 describe('faostat_commodity_profile staged table for a Stocks item (#51)', () => {
@@ -368,6 +508,14 @@ describe('faostat_commodity_profile staged table for a Stocks item (#51)', () =>
       { ...c, ...CATTLE, ...IMPORT_HEAD, year: 2022, value: 2 },
       { ...c, ...CATTLE, ...EXPORT_HEAD, year: 2022, value: 3 },
       { ...c, ...CATTLE, ...IMPORT_VALUE, year: 2022, value: 4 },
+      // A trade item (#66) in tonnes for half of them, with a value row no ranking reads.
+      ...(c.areaCode <= 10
+        ? [
+            { ...c, ...BEEF, ...IMPORT_T, year: 2022, value: 5 },
+            { ...c, ...BEEF, ...EXPORT_T, year: 2022, value: 6 },
+            { ...c, ...BEEF, ...IMPORT_VALUE, year: 2022, value: 7 },
+          ]
+        : []),
     ]);
     mirror = await syncMirror(dir, qcl, tcl);
     const built = createCanvasService(parseConfig({ CANVAS_PROVIDER_TYPE: 'duckdb' }));
@@ -405,5 +553,40 @@ describe('faostat_commodity_profile staged table for a Stocks item (#51)', () =>
       [TCL, 5608, 20],
       [TCL, 5908, 20],
     ]);
+  }, 30_000);
+
+  it('stages the trade item’s TCL rows and records trade_item_code in query_params (#66)', async () => {
+    const ctx = createMockContext({
+      tenantId: 'profile-elements-staged-trade-item',
+      errors: [...(commodityProfileTool.errors ?? []), ...(dataframeDescribeTool.errors ?? [])],
+    });
+    const result = await commodityProfileTool.handler(
+      commodityProfileTool.input.parse({
+        item_code: CATTLE.itemCode,
+        trade_item_code: BEEF.itemCode,
+      }),
+      ctx,
+    );
+    expect(result.spilled).toBe(true);
+    const instance = await canvas.acquire(result.canvas_id, ctx);
+    const staged = await instance.query(
+      `SELECT domain, CAST(item_code AS INTEGER) AS item_code, CAST(element_code AS INTEGER) AS element_code, COUNT(*) AS n FROM ${result.table_name} GROUP BY domain, item_code, element_code ORDER BY domain, item_code, element_code`,
+    );
+    // The QCL rows stay the selected item's; the TCL rows are the trade item's alone.
+    expect(staged.rows.map((r) => [r.domain, r.item_code, r.element_code, Number(r.n)])).toEqual([
+      [QCL, 866, 5111, 493],
+      [TCL, 867, 5610, 10],
+      [TCL, 867, 5910, 10],
+    ]);
+    const described = await dataframeDescribeTool.handler(
+      dataframeDescribeTool.input.parse({ name: result.table_name }),
+      ctx,
+    );
+    expect(described.tables[0]?.query_params).toEqual({
+      item_query: 'Cattle',
+      item_code: 866,
+      item_codes: [866],
+      trade_item_code: 867,
+    });
   }, 30_000);
 });

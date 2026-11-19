@@ -82,7 +82,9 @@ export const STAGE_MAX_ROWS = 50_000;
  * inline preview, and `value` is the one column that window can mistype — whole
  * numbers infer BIGINT, an all-null window VARCHAR — after which every later row is
  * coerced to that type (a fractional value truncated) without an error. `nullable`
- * is left at its default (`true`), matching an inferred schema.
+ * is left at its default (`true`), matching an inferred schema. A new column goes
+ * last, so every column of this table keeps its position; {@link PROFILE_TABLE_SCHEMA}
+ * keeps `domain` last, one ordinal later.
  */
 export const OBSERVATION_TABLE_SCHEMA: ColumnSchema[] = [
   { name: 'area_code', type: 'BIGINT' },
@@ -100,6 +102,8 @@ export const OBSERVATION_TABLE_SCHEMA: ColumnSchema[] = [
   { name: 'value_qualifier', type: 'VARCHAR' },
   { name: 'source_code', type: 'BIGINT' },
   { name: 'source', type: 'VARCHAR' },
+  // Text, never a number: M49 codes keep leading zeros (001) and FAO's dotted extensions (002.03).
+  { name: 'area_m49', type: 'VARCHAR' },
 ];
 
 /**

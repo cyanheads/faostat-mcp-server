@@ -1,7 +1,8 @@
 /**
  * @fileoverview Shared dimension store — `areas`, `items`, `elements`, `flags`
- * tables populated from each domain ZIP's bundled code-list CSVs, plus FTS5
- * indexes over the labels that drive `faostat_resolve_codes`. Owned directly via
+ * tables populated from each domain ZIP's bundled code-list CSVs (items also
+ * from the data rows, for identities a list omits), plus FTS5 indexes over the
+ * labels that drive `faostat_resolve_codes`. Owned directly via
  * the framework's runtime-agnostic SQLite handle (not a per-table MirrorService,
  * which is one-table-per-store): dimensions are reference vocabularies shared
  * across every domain, upserted opportunistically during each domain sync.
@@ -67,18 +68,77 @@ export function classifyArea(areaCode: number): AreaKind {
 }
 
 /**
- * Escape an FTS5 MATCH query: wrap each whitespace-separated token in double
- * quotes (so punctuation in the term is treated literally) and append `*` for
- * prefix matching. Empty after normalization → undefined (caller lists instead).
+ * The distinct search tokens of a query, in first-seen order: FTS5's quote,
+ * grouping, and prefix characters and every control character become separators,
+ * then the rest splits on whitespace. A control character must never reach FTS5 —
+ * a NUL ends its query string mid-phrase. A repeated token adds nothing to an AND
+ * of prefix terms, so each is searched once.
  */
-export function toFtsMatch(query: string): string | undefined {
-  const tokens = query
-    .toLowerCase()
-    .replace(/["()*]/g, ' ')
-    .split(/\s+/)
-    .filter(Boolean);
-  if (tokens.length === 0) return;
-  return tokens.map((t) => `"${t}"*`).join(' ');
+function searchTokens(query: string): string[] {
+  return [
+    ...new Set(
+      query
+        .toLowerCase()
+        .replace(/["()*\p{Cc}]/gu, ' ')
+        .split(/\s+/)
+        .filter(Boolean),
+    ),
+  ];
+}
+
+/** Search terms per FTS5 statement; keeps search time linear in the query's length. */
+const FTS_GROUP_TERMS = 64;
+
+/**
+ * Escape a query for FTS5 MATCH: each search token wrapped in double quotes (so
+ * punctuation in the term is treated literally) with `*` appended for prefix
+ * matching, in groups of at most {@link FTS_GROUP_TERMS} terms, each group one MATCH
+ * string. A row matches the query when it matches every group. Empty when no token
+ * survives: such a search matches nothing.
+ */
+function toFtsMatchGroups(query: string): string[] {
+  const terms = searchTokens(query).map((t) => `"${t}"*`);
+  const groups: string[] = [];
+  for (let i = 0; i < terms.length; i += FTS_GROUP_TERMS)
+    groups.push(terms.slice(i, i + FTS_GROUP_TERMS).join(' '));
+  return groups;
+}
+
+/** How a search tool reads its full-text query once no exact selector wins. */
+export type SearchQuery =
+  /** Absent, blank, whitespace-only, or exactly `*` after trimming: read as omitted. */
+  | { kind: 'omitted' }
+  /** Every other character is a quote, parenthesis, or asterisk: no search term was given. */
+  | { kind: 'invalid'; query: string }
+  /** Searched as given, with control characters read as separators. */
+  | { kind: 'search'; query: string };
+
+/**
+ * The one rule `faostat_resolve_codes` reads `query` by, and
+ * `faostat_commodity_profile` reads `item_query` by, whenever no exact selector
+ * wins (#67). A value made only of FTS5's quote, grouping, and prefix characters
+ * and whitespace is invalid rather than read as omitted, so the caller learns its
+ * query was never run. Anything else searches: a value that leaves no word the index
+ * holds (`?`, `-`, a lone control character) matches nothing.
+ */
+export function classifySearchQuery(query: string | undefined): SearchQuery {
+  if (query === undefined) return { kind: 'omitted' };
+  const trimmed = query.trim();
+  if (trimmed === '' || trimmed === '*') return { kind: 'omitted' };
+  if (/^[\s"()*]*$/u.test(trimmed)) return { kind: 'invalid', query };
+  return { kind: 'search', query };
+}
+
+/**
+ * A caller's text as notices and error messages name it: JSON-quoted, with DEL and
+ * the C1 controls escaped as well, so no control character reaches the response
+ * text. A plain word reads as itself in double quotes (`"wheat"`).
+ */
+export function quoteSearchText(text: string): string {
+  return JSON.stringify(text).replace(
+    /[\u007f-\u009f]/g,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
 }
 
 /** A configured table's column/FTS metadata for the generic resolve query. */
@@ -192,6 +252,58 @@ export class DimensionsStore {
     });
   }
 
+  /**
+   * Add item records only where no row holds their identity — the items a domain's
+   * data rows name that its item list lacks (#64). A row already present keeps its
+   * label and CPC code, whichever domain's list or rows supplied it, so a list entry
+   * ({@link upsertItems}) always wins over a data-derived one. Each added row gets its
+   * FTS row in the same transaction. Returns how many rows it added.
+   */
+  async addMissingItems(records: ItemRecord[]): Promise<number> {
+    if (records.length === 0) return 0;
+    const h = await this.open();
+    return h.transaction(() => {
+      const insert = h.prepare(
+        `INSERT INTO items (item_code, item_code_text, cpc_code, item) VALUES (?, ?, ?, ?)
+         ON CONFLICT DO NOTHING`,
+      );
+      const ftsIns = h.prepare(`INSERT INTO items_fts(rowid, item) VALUES (?, ?)`);
+      let added = 0;
+      for (const r of records) {
+        const { changes, lastInsertRowid } = insert.run(
+          r.item_code,
+          r.item_code_text,
+          r.cpc_code,
+          r.item,
+        );
+        if (changes === 0) continue;
+        ftsIns.run(Number(lastInsertRowid), r.item);
+        added++;
+      }
+      return added;
+    });
+  }
+
+  /**
+   * The item identities in `codes` that no item row holds. A number is an
+   * `item_code`, a string an `item_code_text`, as {@link resolve}'s `domainCodes`
+   * carries them.
+   */
+  async missingItemIdentities(codes: (number | string)[]): Promise<(number | string)[]> {
+    if (codes.length === 0) return [];
+    const h = await this.open();
+    const held = new Set<number | string>();
+    for (const row of h
+      .prepare<{ item_code: number | null; item_code_text: string | null }>(
+        'SELECT item_code, item_code_text FROM items',
+      )
+      .all()) {
+      if (row.item_code !== null) held.add(row.item_code);
+      if (row.item_code_text !== null) held.add(row.item_code_text);
+    }
+    return codes.filter((code) => !held.has(code));
+  }
+
   /** Upsert element records and refresh their FTS rows. */
   async upsertElements(records: ElementRecord[]): Promise<void> {
     if (records.length === 0) return;
@@ -252,9 +364,23 @@ export class DimensionsStore {
   }
 
   /**
+   * The areas whose stored M49 code equals `m49Code` exactly — no padding and no
+   * prefix match — in area-code order. Every one is returned: nothing in the schema
+   * keeps a code to one area, so a shared code yields each area carrying it.
+   */
+  async areasByM49(m49Code: string): Promise<ResolvedCode[]> {
+    const h = await this.open();
+    return h
+      .prepare<Record<string, unknown>>('SELECT * FROM areas WHERE area_m49 = ? ORDER BY area_code')
+      .all(m49Code)
+      .map((row) => this.toResolved('area', row));
+  }
+
+  /**
    * Resolve codes within a dimension. Precedence: an exact `code` lookup wins;
    * otherwise a normalized exact label when `preferExact` is set and one or more
-   * labels match; otherwise an FTS `query` match (relevance-ranked); otherwise a `name_contains`
+   * labels match; otherwise an FTS `query` match (relevance-ranked; no matches when the
+   * query leaves no search term); otherwise a `name_contains`
    * substring filter; otherwise list the whole dimension. Returns up to `limit`
    * rows starting at `offset` plus the true total of matches (for truncation
    * disclosure and pagination).
@@ -310,7 +436,17 @@ export class DimensionsStore {
     }
 
     if (opts.preferExact && opts.query) {
-      const normalize = (name: string) => name.trim().split(/\s+/u).join(' ').toLowerCase();
+      // FAO code lists write `;` where observation rows and most callers write `,`
+      // (`Peas; dry` beside `Peas, dry`), so the comparison folds one into the other.
+      // A control character separates words, as in the search (#67).
+      const normalize = (name: string) =>
+        name
+          .replace(/\p{Cc}/gu, ' ')
+          .trim()
+          .split(/\s+/u)
+          .join(' ')
+          .toLowerCase()
+          .replaceAll(';', ',');
       const query = normalize(opts.query);
       const scope = domainCodes && new Set(domainCodes);
       const exact = h
@@ -331,31 +467,28 @@ export class DimensionsStore {
       }
     }
 
-    // FTS relevance match. Every matching rowid is fetched — no SQL LIMIT — and the
-    // domain scope filters that list, so `total` is the exact scoped count and the
-    // offset/limit window is a JS slice. `ORDER BY rank, rowid`: rank alone has no
-    // tiebreaker, so rowid stabilizes the order across paged calls.
-    //
-    // The scope never reaches FTS5 as a `rowid` constraint beside MATCH (#36). FTS5
-    // claims `rowid = ?` so the core never re-checks it, then honors the bound value
-    // only when it is INTEGER. better-sqlite3 binds every JS number as REAL, and a
-    // one-code `rowid IN (?)` is rewritten to `rowid = ?`, so under Node the scope
-    // was silently dropped and every match came back.
-    const ftsMatch = opts.query ? toFtsMatch(opts.query) : undefined;
-    if (ftsMatch) {
+    /*
+     * FTS relevance match. Every matching rowid is fetched — no SQL LIMIT — and the
+     * domain scope filters that list, so `total` is the exact scoped count and the
+     * offset/limit window is a JS slice. Rank alone has no tiebreaker, so rowid
+     * stabilizes the order across paged calls.
+     *
+     * The scope never reaches FTS5 as a `rowid` constraint beside MATCH (#36). FTS5
+     * claims `rowid = ?` so the core never re-checks it, then honors the bound value
+     * only when it is INTEGER. better-sqlite3 binds every JS number as REAL, and a
+     * one-code `rowid IN (?)` is rewritten to `rowid = ?`, so under Node the scope
+     * was silently dropped and every match came back.
+     *
+     * A query that leaves no search term matches nothing (#67): it never falls
+     * through to the substring filter or the listing.
+     */
+    if (opts.query !== undefined) {
       const scope = domainCodes && new Set(domainCodes);
-      const ids = h
-        .prepare<{ rowid: number }>(
-          `SELECT rowid FROM ${cfg.ftsTable} WHERE ${cfg.ftsTable} MATCH ? ORDER BY rank, rowid`,
-        )
-        .all(ftsMatch)
-        .map((r) =>
-          h
-            .prepare<Record<string, unknown>>(
-              `SELECT * FROM ${cfg.table} WHERE ${dimension === 'item' ? 'id' : cfg.codeColumn} = ?`,
-            )
-            .get(r.rowid),
-        )
+      const byRowid = h.prepare<Record<string, unknown>>(
+        `SELECT * FROM ${cfg.table} WHERE ${dimension === 'item' ? 'id' : cfg.codeColumn} = ?`,
+      );
+      const ids = this.ftsRowids(h, cfg.ftsTable, toFtsMatchGroups(opts.query))
+        .map((rowid) => byRowid.get(rowid))
         .filter((r): r is Record<string, unknown> => r !== undefined)
         .filter(
           (r) => !scope || scope.has((r[cfg.codeColumn] ?? r.item_code_text) as number | string),
@@ -399,6 +532,44 @@ export class DimensionsStore {
     return { matches: rows.map((r) => this.toResolved(dimension, r)), total };
   }
 
+  /**
+   * The rowids of `ftsTable` that match every MATCH group, ordered by rank, then
+   * rowid. A single group runs as one statement. Otherwise each group runs as its
+   * own statement, keeping only the rows every group so far matched and stopping at
+   * the first group that leaves none; a kept row's rank is the sum of its group
+   * ranks. FTS5's bm25 sums per-phrase scores, so that is the rank one statement over
+   * every term would give it, up to floating-point rounding. Search time is linear in
+   * the query's length. No groups → no rows.
+   */
+  private ftsRowids(h: SqliteHandle, ftsTable: string, groups: string[]): number[] {
+    const [first, ...rest] = groups;
+    if (first === undefined) return [];
+    if (rest.length === 0) {
+      return h
+        .prepare<{ rowid: number }>(
+          `SELECT rowid FROM ${ftsTable} WHERE ${ftsTable} MATCH ? ORDER BY rank, rowid`,
+        )
+        .all(first)
+        .map((r) => r.rowid);
+    }
+    const ranked = h.prepare<{ rowid: number; rank: number }>(
+      `SELECT rowid, rank FROM ${ftsTable} WHERE ${ftsTable} MATCH ?`,
+    );
+    let ranks = new Map(ranked.all(first).map((r) => [r.rowid, r.rank]));
+    for (const group of rest) {
+      if (ranks.size === 0) break;
+      const kept = new Map<number, number>();
+      for (const r of ranked.all(group)) {
+        const rank = ranks.get(r.rowid);
+        if (rank !== undefined) kept.set(r.rowid, rank + r.rank);
+      }
+      ranks = kept;
+    }
+    return [...ranks]
+      .sort(([rowidA, rankA], [rowidB, rankB]) => rankA - rankB || rowidA - rowidB)
+      .map(([rowid]) => rowid);
+  }
+
   private selectByCode(
     h: SqliteHandle,
     dimension: DimensionKind,
@@ -424,6 +595,7 @@ export class DimensionsStore {
         // mirrors ingested before the deny-set fix persisted the old classification,
         // so recomputing here corrects them with no re-sync (issue #4).
         kind: isAggregateAreaCode(code) ? 'aggregate' : 'country',
+        ...(row.area_m49 == null ? {} : { m49_code: String(row.area_m49) }),
       };
     }
     if (dimension === 'item') {

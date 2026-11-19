@@ -1,11 +1,16 @@
 /**
  * @fileoverview End-to-end mirror test against a synthetic in-memory ZIP. Runs a
  * real domain sync into a temp SQLite mirror, then exercises the read path:
- * dimension code resolution (FTS + country/aggregate classification) and
+ * dimension code resolution (FTS + country/aggregate classification, each area's
+ * M49 code and the exact M49 lookup) and
  * observation queries (aggregate exclusion default, year range, code filters,
  * streaming). Fully offline — `fetch` is stubbed to return the fixture ZIP. A
  * second suite runs two instances over one store directory: a sync refused by the
- * other's lease must leave that sync's rows, state, and revision as they were.
+ * other's lease must leave that sync's rows, state, and revision as they were. A
+ * third covers the item vocabulary a domain's data rows supply when its ZIP's item
+ * list is short or header-only, and the repair of a mirror synced without them (#64).
+ * A fourth covers a refresh removing the rows its file no longer carries, run
+ * through, stopped and rerun at each stage (#63).
  * @module tests/services/faostat-mirror
  */
 
@@ -13,19 +18,24 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { openSqliteHandle } from '@cyanheads/mcp-ts-core/mirror';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { listDomainsTool } from '@/mcp-server/tools/definitions/list-domains.tool.js';
 import { queryObservationsTool } from '@/mcp-server/tools/definitions/query-observations.tool.js';
 import { resolveCodesTool } from '@/mcp-server/tools/definitions/resolve-codes.tool.js';
 import { FaostatMirror, initFaostatMirror } from '@/services/faostat-mirror/faostat-mirror.js';
+import type { ManifestDataset } from '@/services/faostat-mirror/types.js';
 import {
   buildDomainZip,
   buildExplicitDomainZip,
   buildMidSizeDomainZip,
   chunkedResponse,
+  type DomainVocab,
   type ExplicitObservation,
   FIXTURE_DOMAIN,
   fixtureDataset,
+  fixtureManifestResponse,
 } from '../fixtures/synthetic-domain.js';
 
 describe('FaostatMirror end-to-end', () => {
@@ -88,7 +98,9 @@ describe('FaostatMirror end-to-end', () => {
 
   it('resolves an area by exact code', async () => {
     const { matches } = await mirror.resolve(FIXTURE_DOMAIN, 'area', { code: 351, limit: 10 });
-    expect(matches).toEqual([{ code: 351, code_text: null, name: 'China', kind: 'aggregate' }]);
+    expect(matches).toEqual([
+      { code: 351, code_text: null, name: 'China', kind: 'aggregate', m49_code: '156' },
+    ]);
   });
 
   it('preserves historical reporting entities as countries', async () => {
@@ -247,7 +259,7 @@ describe('FaostatMirror end-to-end', () => {
     // code, so the fix reaches already-ingested mirrors with no re-sync.
     const resolved = await mirror.resolve(FIXTURE_DOMAIN, 'area', { code: 351, limit: 10 });
     expect(resolved.matches).toEqual([
-      { code: 351, code_text: null, name: 'China', kind: 'aggregate' },
+      { code: 351, code_text: null, name: 'China', kind: 'aggregate', m49_code: '156' },
     ]);
 
     // query surface: the SAME code is dropped from the default (aggregate-excluded)
@@ -341,6 +353,87 @@ describe('FaostatMirror end-to-end', () => {
     expect(estimated?.area_m49).toBe('004');
   });
 
+  it('returns only declared fields on every faostat_query_observations row, never the internal id or note', async () => {
+    const output = await queryObservationsTool.handler(
+      queryObservationsTool.input.parse({ domain: FIXTURE_DOMAIN, include_aggregates: true }),
+      createMockContext({ errors: queryObservationsTool.errors }),
+    );
+    const declared = Object.keys(
+      queryObservationsTool.output.shape.observations.element.shape,
+    ).sort();
+    expect(output.observations).toHaveLength(6);
+    for (const row of output.observations) {
+      expect(Object.keys(row).sort()).toEqual(declared);
+      expect(row).not.toHaveProperty('id');
+      expect(row).not.toHaveProperty('note');
+    }
+  });
+
+  it('looks up areas by their exact stored M49 code, every match in area-code order (#65)', async () => {
+    await mirror.dimensions.upsertAreas([
+      {
+        area_code: 51000,
+        area_m49: '002.03',
+        area: 'Africa (excluding intra-trade)',
+        kind: 'aggregate',
+      },
+      { area_code: 5100, area_m49: '002', area: 'Africa', kind: 'aggregate' },
+      { area_code: 9002, area_m49: '950', area: 'Shared B', kind: 'aggregate' },
+      { area_code: 9001, area_m49: '950', area: 'Shared A', kind: 'aggregate' },
+    ]);
+    const codes = async (m49: string) =>
+      (await mirror.dimensions.areasByM49(m49)).map((match) => [match.code, match.m49_code]);
+    expect(await codes('002')).toEqual([[5100, '002']]);
+    expect(await codes('002.03')).toEqual([[51000, '002.03']]);
+    expect(await codes('950')).toEqual([
+      [9001, '950'],
+      [9002, '950'],
+    ]);
+    // Exact, never a prefix or a padded reading: the store matches the string it is given.
+    expect(await codes('02')).toEqual([]);
+    expect(await codes('00')).toEqual([]);
+    expect(await codes('999')).toEqual([]);
+
+    // The mirror's resolve routes an area m49Code to the same lookup and counts it.
+    expect(await mirror.resolve(FIXTURE_DOMAIN, 'area', { m49Code: '950', limit: 1 })).toEqual({
+      matches: [
+        { code: 9001, code_text: null, name: 'Shared A', kind: 'aggregate', m49_code: '950' },
+        { code: 9002, code_text: null, name: 'Shared B', kind: 'aggregate', m49_code: '950' },
+      ],
+      total: 2,
+    });
+  });
+
+  it("returns each area's M49 on resolver matches and on every observation row (#65)", async () => {
+    const resolved = await resolveCodesTool.handler(
+      resolveCodesTool.input.parse({ domain: FIXTURE_DOMAIN, dimension: 'area' }),
+      createMockContext({ errors: resolveCodesTool.errors }),
+    );
+    const m49 = new Map(resolved.matches.map((match) => [match.code, match.m49_code]));
+    expect(Object.fromEntries(m49)).toEqual({ 2: '004', 351: '156', 5000: '001' });
+    const listing = JSON.stringify(resolveCodesTool.format!(resolved));
+    expect(listing).toContain('**2** — Afghanistan [country] (M49 004)');
+    expect(listing).toContain('**351** — China [aggregate] (M49 156)');
+    expect(listing).toContain('**5000** — World [aggregate] (M49 001)');
+
+    const output = await queryObservationsTool.handler(
+      queryObservationsTool.input.parse({ domain: FIXTURE_DOMAIN, include_aggregates: true }),
+      createMockContext({ errors: queryObservationsTool.errors }),
+    );
+    expect(output.observations).toHaveLength(6);
+    for (const row of output.observations) expect(row.area_m49).toBe(m49.get(row.area_code));
+    const [text] = queryObservationsTool.format!(output);
+    const lines = text?.type === 'text' ? text.text.split('\n') : [];
+    expect(lines).toContain(
+      '| Area | M49 | Item | Element | Year | Value | Unit | Flag | Period | Source |',
+    );
+    for (const row of output.observations) {
+      expect(lines).toContain(
+        `| ${row.area} (${row.area_code}) | ${m49.get(row.area_code)} | Wheat (15) | Production (5510) | ${row.year} | ${row.value} | t | ${row.flag} |  |  |`,
+      );
+    }
+  });
+
   it('streams all matching country rows for canvas spillover', async () => {
     const collected: Record<string, unknown>[] = [];
     for await (const row of mirror.streamObservations(
@@ -357,6 +450,8 @@ describe('FaostatMirror end-to-end', () => {
     expect(collected.some((r) => Number(r.area_code) === 351)).toBe(false);
     // Streamed rows carry the agent-facing column set incl. the flag.
     expect(collected[0]).toHaveProperty('flag');
+    // …and the area's M49 code, which the staged tables carry as area_m49 (#65).
+    expect(collected.map((r) => r.area_m49)).toEqual(['004', '004']);
   });
 
   it('bounds the spillover stream by the row limit', async () => {
@@ -385,6 +480,10 @@ describe('FaostatMirror end-to-end', () => {
   });
 });
 
+/** A tool call's `content[]` text, joined. */
+const text = (wire: Awaited<ReturnType<typeof runToolContract>>) =>
+  wire.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+
 /** A promise and its resolve — paces a sync without timers. */
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve: () => void = () => {};
@@ -403,6 +502,19 @@ function heldOpen(bytes: Uint8Array, gate: Promise<void>): Response {
     async pull(controller) {
       await gate;
       controller.close();
+    },
+  });
+  return new Response(body, { status: 200 });
+}
+
+/** `bytes` as a response body that delivers every byte, then fails with `error` instead of ending. */
+function brokenAfter(bytes: Uint8Array, error: Error): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+    },
+    pull(controller) {
+      controller.error(error);
     },
   });
   return new Response(body, { status: 200 });
@@ -719,4 +831,761 @@ describe('FaostatMirror profile reads (#50, #51)', () => {
       [30, 2019, 2],
     ]);
   });
+});
+
+/**
+ * The item vocabulary a domain's data rows supply (#64). FAO ships some item lists
+ * short or header-only (FBS's `_ItemCodes.csv` is its header alone), so the sync
+ * also adds each item identity its rows name that the vocabulary lacks, labeled
+ * from its first row, and a sync of an already-synced store first adds every cube
+ * identity the vocabulary lacks, none from rows the sync replaces. A list entry keeps
+ * precedence: its label and CPC code are never replaced by a data-derived one.
+ */
+describe('item vocabulary from the data rows (#64)', () => {
+  let dir: string;
+  let mirror: FaostatMirror;
+
+  const CASSAVA = { code: 125, name: 'Cassava; fresh', cpc: '01520.01', rowName: 'Cassava, fresh' };
+  const WHEAT = { code: 15, name: 'Wheat', cpc: '0111' };
+  const PRODUCTION = [{ code: 5510, name: 'Production' }];
+  /** FBS as FAO ships it: a header-only item list. */
+  const FBS_HEADER_ONLY: DomainVocab = {
+    elements: [{ code: 664, name: 'Food supply (kcal/capita/day)' }],
+    items: [
+      { code: 2511, name: 'Wheat and products', listed: false },
+      { code: 2901, name: 'Grand Total', listed: false },
+    ],
+  };
+  const QCL_FULL: DomainVocab = { elements: PRODUCTION, items: [WHEAT, CASSAVA] };
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'faostat-item-vocab-'));
+  });
+
+  afterEach(async () => {
+    await mirror.close();
+    vi.unstubAllGlobals();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Init each domain from its vocab, in order, into one mirror registered as the singleton. */
+  async function syncDomains(vocabs: [string, DomainVocab][]): Promise<void> {
+    mirror = initFaostatMirror({ dir, domains: vocabs.map(([domain]) => domain) });
+    for (const [domain, vocab] of vocabs) {
+      const zip = buildDomainZip(domain, vocab);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => chunkedResponse(zip, 64)),
+      );
+      await mirror.runDomainSync(domain, 'init', {
+        signal: new AbortController().signal,
+        dataset: fixtureDataset(domain),
+      });
+    }
+  }
+
+  /** Refresh `domain` against its unchanged upstream, with a `fetch` that fails the test if called. */
+  async function refreshUnchanged(domain: string, signal = new AbortController().signal) {
+    const fetcher = vi.fn();
+    vi.stubGlobal('fetch', fetcher);
+    const result = await mirror.runDomainSync(domain, 'refresh', {
+      signal,
+      dataset: fixtureDataset(domain),
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+    return result;
+  }
+
+  /** Run `fn` on a separate connection to the shared dimension database. */
+  async function withDimensions<T>(
+    fn: (h: Awaited<ReturnType<typeof openSqliteHandle>>) => T,
+  ): Promise<T> {
+    const handle = await openSqliteHandle(join(dir, 'dimensions.db'));
+    try {
+      return fn(handle);
+    } finally {
+      handle.close();
+    }
+  }
+
+  /** The vocabulary as a mirror synced before #64 left it: without these identities' rows. */
+  function dropItems(codes: (number | string)[]): Promise<void> {
+    return withDimensions((h) => {
+      for (const code of codes)
+        h.prepare('DELETE FROM items WHERE item_code = ? OR item_code_text = ?').run(code, code);
+      h.exec("INSERT INTO items_fts(items_fts) VALUES ('rebuild')");
+    });
+  }
+
+  /** Every vocabulary row, in insertion order. */
+  function itemRows(): Promise<unknown[]> {
+    return withDimensions((h) => h.prepare('SELECT * FROM items ORDER BY id').all());
+  }
+
+  /** Throws when the item FTS index disagrees with the `items` rows it indexes. */
+  function checkItemFts(): Promise<void> {
+    return withDimensions((h) => {
+      h.exec("INSERT INTO items_fts(items_fts, rank) VALUES ('integrity-check', 1)");
+    });
+  }
+
+  const listing = (domain: string) => mirror.resolve(domain, 'item', { limit: 50 });
+
+  it('keeps a full list’s labels and CPC codes, never its rows’ labels', async () => {
+    await syncDomains([['QCL', QCL_FULL]]);
+    expect(await listing('QCL')).toEqual({
+      matches: [
+        { code: 15, code_text: null, name: 'Wheat', kind: null, cpc_code: '0111' },
+        { code: 125, code_text: null, name: 'Cassava; fresh', kind: null, cpc_code: '01520.01' },
+      ],
+      total: 2,
+    });
+    expect(
+      (await mirror.resolve('QCL', 'item', { query: 'cassava', limit: 5 })).matches,
+    ).toMatchObject([{ code: 125, name: 'Cassava; fresh' }]);
+    expect(
+      await mirror.resolve('QCL', 'item', { nameContains: 'Cassava, fresh', limit: 5 }),
+    ).toEqual({ matches: [], total: 0 });
+    await checkItemFts();
+  });
+
+  it('resolves every item of a header-only list by listing, code, and query, unclassified', async () => {
+    await syncDomains([['FBS', FBS_HEADER_ONLY]]);
+    const grandTotal = { code: 2901, code_text: null, name: 'Grand Total', kind: null };
+    expect(await listing('FBS')).toEqual({
+      matches: [
+        { code: 2511, code_text: null, name: 'Wheat and products', kind: null },
+        grandTotal,
+      ],
+      total: 2,
+    });
+    expect((await mirror.resolve('FBS', 'item', { code: 2511, limit: 1 })).matches).toEqual([
+      { code: 2511, code_text: null, name: 'Wheat and products', kind: null },
+    ]);
+    const queried = await runToolContract(resolveCodesTool, {
+      domain: 'FBS',
+      dimension: 'item',
+      query: 'grand total',
+    });
+    expect(queried.isError).toBeFalsy();
+    expect(queried.structuredContent).toMatchObject({ matches: [grandTotal] });
+    expect(text(queried)).toContain('**2901** — Grand Total');
+    const listed = await runToolContract(resolveCodesTool, { domain: 'FBS', dimension: 'item' });
+    expect(listed.structuredContent).toMatchObject({ matches: [{ code: 2511 }, grandTotal] });
+    expect(text(listed)).toContain('**2511** — Wheat and products');
+    await checkItemFts();
+  });
+
+  it('adds what a short list lacks, keeping listed labels and CPC codes and verified aggregates', async () => {
+    await syncDomains([
+      [
+        'QCL',
+        {
+          elements: PRODUCTION,
+          items: [WHEAT, CASSAVA, { code: 1717, name: 'Cereals, primary', listed: false }],
+        },
+      ],
+    ]);
+    expect((await listing('QCL')).matches).toEqual([
+      { code: 15, code_text: null, name: 'Wheat', kind: null, cpc_code: '0111' },
+      { code: 125, code_text: null, name: 'Cassava; fresh', kind: null, cpc_code: '01520.01' },
+      { code: 1717, code_text: null, name: 'Cereals, primary', kind: 'aggregate' },
+    ]);
+    await checkItemFts();
+  });
+
+  it('resolves an alphanumeric item the list lacks through code_text, with code null', async () => {
+    await syncDomains([
+      [
+        'FS',
+        {
+          elements: [{ code: 6121, name: 'Prevalence' }],
+          items: [
+            { code: 21010, name: 'Energy', cpc: '0001' },
+            { code: '210401F', name: 'Food', listed: false },
+          ],
+        },
+      ],
+    ]);
+    const food = { code: null, code_text: '210401F', name: 'Food', kind: null };
+    expect((await mirror.resolve('FS', 'item', { codeText: '210401F', limit: 1 })).matches).toEqual(
+      [food],
+    );
+    const wire = await runToolContract(resolveCodesTool, {
+      domain: 'FS',
+      dimension: 'item',
+      code_text: '210401F',
+    });
+    expect(wire.structuredContent).toMatchObject({ matches: [food] });
+    expect(text(wire)).toContain('**210401F** — Food');
+    expect((await listing('FS')).matches.map((m) => m.code ?? m.code_text)).toEqual([
+      21010,
+      '210401F',
+    ]);
+  });
+
+  it.each([
+    ['QCL', 'FBS'],
+    ['FBS', 'QCL'],
+  ])('keeps the list entry whichever domain syncs first (%s, then %s)', async (...order) => {
+    const fbs: DomainVocab = {
+      ...FBS_HEADER_ONLY,
+      items: [...FBS_HEADER_ONLY.items, { code: 125, name: 'Cassava, fresh', listed: false }],
+    };
+    await syncDomains(order.map((domain) => [domain, domain === 'QCL' ? QCL_FULL : fbs]));
+    const cassava = {
+      code: 125,
+      code_text: null,
+      name: 'Cassava; fresh',
+      kind: null,
+      cpc_code: '01520.01',
+    };
+    expect((await mirror.resolve('QCL', 'item', { code: 125, limit: 1 })).matches).toEqual([
+      cassava,
+    ]);
+    expect((await listing('FBS')).matches).toEqual([
+      cassava,
+      { code: 2511, code_text: null, name: 'Wheat and products', kind: null },
+      { code: 2901, code_text: null, name: 'Grand Total', kind: null },
+    ]);
+    expect((await mirror.resolve('FBS', 'item', { query: 'fresh', limit: 5 })).matches).toEqual([
+      cassava,
+    ]);
+    await checkItemFts();
+  });
+
+  it('repairs a store synced without its rows’ items on a refresh of an unchanged upstream', async () => {
+    await syncDomains([['FBS', FBS_HEADER_ONLY]]);
+    await dropItems([2511, 2901]);
+    expect(await listing('FBS')).toEqual({ matches: [], total: 0 });
+
+    expect((await refreshUnchanged('FBS')).recordsApplied).toBe(0);
+    expect((await listing('FBS')).matches.map((m) => [m.code, m.name])).toEqual([
+      [2511, 'Wheat and products'],
+      [2901, 'Grand Total'],
+    ]);
+    expect(
+      (await mirror.resolve('FBS', 'item', { query: 'grand total', limit: 5 })).matches,
+    ).toEqual([{ code: 2901, code_text: null, name: 'Grand Total', kind: null }]);
+    await checkItemFts();
+  });
+
+  it('repairs only the identities a vocabulary lacks, leaving its listed rows as they were', async () => {
+    // RFN as a 2025 list left it: 3102 listed, 3103 and 3104 in the rows only.
+    await syncDomains([
+      [
+        'RFN',
+        {
+          elements: [{ code: 5157, name: 'Agricultural Use' }],
+          items: [
+            { code: 3102, name: 'Nutrient nitrogen N (total)', cpc: 'F3102', rowName: 'Nitrogen' },
+            { code: 3103, name: 'Nutrient phosphate P2O5 (total)' },
+            { code: 3104, name: 'Nutrient potash K2O (total)' },
+          ],
+        },
+      ],
+    ]);
+    await dropItems([3103, 3104]);
+    const [listed] = await itemRows();
+
+    await refreshUnchanged('RFN');
+    expect((await itemRows())[0]).toEqual(listed);
+    expect((await listing('RFN')).matches).toEqual([
+      {
+        code: 3102,
+        code_text: null,
+        name: 'Nutrient nitrogen N (total)',
+        kind: null,
+        cpc_code: 'F3102',
+      },
+      { code: 3103, code_text: null, name: 'Nutrient phosphate P2O5 (total)', kind: null },
+      { code: 3104, code_text: null, name: 'Nutrient potash K2O (total)', kind: null },
+    ]);
+    await checkItemFts();
+  });
+
+  it('repairs an alphanumeric identity, resolving it through code_text with code null', async () => {
+    await syncDomains([
+      [
+        'FS',
+        {
+          elements: [{ code: 6121, name: 'Prevalence' }],
+          items: [{ code: '210401F', name: 'Food' }],
+        },
+      ],
+    ]);
+    await dropItems(['210401F']);
+    expect((await mirror.resolve('FS', 'item', { codeText: '210401F', limit: 1 })).total).toBe(0);
+
+    await refreshUnchanged('FS');
+    expect((await mirror.resolve('FS', 'item', { codeText: '210401F', limit: 1 })).matches).toEqual(
+      [{ code: null, code_text: '210401F', name: 'Food', kind: null }],
+    );
+    await checkItemFts();
+  });
+
+  it('changes nothing and reads no label once the vocabulary covers the cube', async () => {
+    await syncDomains([['QCL', QCL_FULL]]);
+    const before = await itemRows();
+    const reads = vi.spyOn(mirror.reads, 'all');
+
+    await refreshUnchanged('QCL');
+    expect(await itemRows()).toEqual(before);
+    // The distinct-identity read alone: no label read for an identity the vocabulary holds.
+    expect(reads).toHaveBeenCalledTimes(1);
+    const identities = (await reads.mock.results[0]?.value) as { code: number | string }[];
+    expect(identities).toHaveLength(2);
+    expect(new Set(identities.map((row) => row.code))).toEqual(new Set([15, 125]));
+  });
+
+  it('labels an item the list lacks from its first row when its rows carry two labels, at sync and at repair', async () => {
+    // FBS rows as a relabel leaves them: 2020 under the old label, 2021 under the new.
+    const relabeled = (_areaCode: number, year: number) =>
+      year === 2020 ? 'Cereals - Excluding Beer' : 'Cereals, excluding beer';
+    await syncDomains([
+      [
+        'FBS',
+        {
+          ...FBS_HEADER_ONLY,
+          items: [{ code: 2905, name: 'Cereals', listed: false, rowName: relabeled }],
+        },
+      ],
+    ]);
+    const cereals = { code: 2905, code_text: null, name: 'Cereals - Excluding Beer', kind: null };
+    expect(await listing('FBS')).toEqual({ matches: [cereals], total: 1 });
+
+    await dropItems([2905]);
+    await refreshUnchanged('FBS');
+    expect(await listing('FBS')).toEqual({ matches: [cereals], total: 1 });
+    await checkItemFts();
+  });
+
+  it('adds no item from the rows a sync replaces: a store whose first sync broke off before its item list applied', async () => {
+    // A fresh FS store carries no ingest revision until a sync of it completes.
+    const DOMAIN = 'FS';
+    mirror = initFaostatMirror({ dir, domains: [DOMAIN] });
+    const sync = () =>
+      mirror.runDomainSync(DOMAIN, 'refresh', {
+        signal: new AbortController().signal,
+        dataset: fixtureDataset(DOMAIN),
+      });
+    // 6,000 rows of item 15: one 5,000-row page commits, then the download breaks.
+    const { zip } = buildMidSizeDomainZip({ domain: DOMAIN, countryCount: 600, years: 10 });
+    const broken = new Error('Connection reset mid-download');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => brokenAfter(zip, broken)),
+    );
+    await expect(sync()).rejects.toBe(broken);
+    const handle = await mirror.getMirror(DOMAIN)!.raw();
+    expect(handle.prepare(`SELECT count(*) AS n FROM obs_${DOMAIN}`).get()).toEqual({ n: 5000 });
+    expect(handle.prepare('SELECT revision FROM ingest_revision').all()).toEqual([]);
+    expect(await mirror.dimensions.missingItemIdentities([15])).toEqual([15]);
+
+    // The next file no longer carries item 15.
+    const next = buildDomainZip(DOMAIN, {
+      elements: [{ code: 6121, name: 'Prevalence' }],
+      items: [{ code: 21010, name: 'Energy', cpc: '0001' }],
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => chunkedResponse(next, 64)),
+    );
+    await sync();
+    const energy = { code: 21010, code_text: null, name: 'Energy', kind: null, cpc_code: '0001' };
+    expect(await mirror.dimensions.resolve('item', { limit: 50 })).toEqual({
+      matches: [energy],
+      total: 1,
+    });
+    expect(await listing(DOMAIN)).toEqual({ matches: [energy], total: 1 });
+    await checkItemFts();
+  });
+
+  it('rejects a refresh stopped during the repair with the stop’s reason, adding nothing', async () => {
+    await syncDomains([['FBS', FBS_HEADER_ONLY]]);
+    await dropItems([2511, 2901]);
+    const controller = new AbortController();
+    const stopped = new Error('Stopped for shutdown');
+    const all = mirror.reads.all.bind(mirror.reads);
+    vi.spyOn(mirror.reads, 'all').mockImplementation((job, signal) => {
+      controller.abort(stopped);
+      return all(job, signal);
+    });
+
+    await expect(refreshUnchanged('FBS', controller.signal)).rejects.toBe(stopped);
+    expect(await listing('FBS')).toEqual({ matches: [], total: 0 });
+    expect(await mirror.ready('FBS')).toBe(true);
+  });
+
+  it('adds an item only where no row holds its identity, indexing what it adds', async () => {
+    await syncDomains([['QCL', QCL_FULL]]);
+    const before = await itemRows();
+    const added = await mirror.dimensions.addMissingItems([
+      { item_code: 125, item_code_text: null, cpc_code: null, item: 'Cassava, fresh' },
+      { item_code: 2901, item_code_text: null, cpc_code: null, item: 'Grand Total' },
+      { item_code: null, item_code_text: '210401F', cpc_code: null, item: 'Food' },
+    ]);
+    expect(added).toBe(2);
+    expect((await itemRows()).slice(0, before.length)).toEqual(before);
+    expect(
+      await mirror.dimensions.addMissingItems([
+        { item_code: 2901, item_code_text: null, cpc_code: null, item: 'Other label' },
+      ]),
+    ).toBe(0);
+    expect((await mirror.dimensions.resolve('item', { query: 'grand', limit: 5 })).matches).toEqual(
+      [{ code: 2901, code_text: null, name: 'Grand Total', kind: null }],
+    );
+    expect(
+      await mirror.dimensions.missingItemIdentities([15, 2901, 3103, '210401F', '210402F']),
+    ).toEqual([3103, '210402F']);
+    expect(await mirror.dimensions.addMissingItems([])).toBe(0);
+    expect(await mirror.dimensions.missingItemIdentities([])).toEqual([]);
+    await checkItemFts();
+  });
+});
+
+/**
+ * A refresh removes the rows its file no longer carries (#63). Each row records the
+ * `DateUpdate` of the file it was written from; once every row of the file is in, the
+ * sync deletes the rows not stamped with it, on pages up to the one that carries the
+ * checkpoint. File A holds 11,000 rows. File B, its next revision, withdraws 5,500 of
+ * them (each row whose area code plus year is even, before 2025) and adds a year: 7,700
+ * rows on two data pages. The cube also holds a drifted row no file carries, at a far
+ * rowid, so the read of the rows B does not carry spans six rowid slices. A file whose
+ * data CSV holds only its header removes nothing: FAO has shipped a header-only CSV,
+ * a publishing fault rather than the withdrawal of a whole domain.
+ */
+describe('a refresh removes the rows its file no longer carries (#63)', () => {
+  const DOMAIN = 'RL';
+  const TABLE = `obs_${DOMAIN}`;
+  const A = buildMidSizeDomainZip({ domain: DOMAIN, countryCount: 2200, years: 5 });
+  const B = buildMidSizeDomainZip({
+    domain: DOMAIN,
+    countryCount: 2200,
+    years: 6,
+    omit: (area, year) => year < 2025 && (area + year) % 2 === 0,
+  });
+  const A_FILE = fixtureDataset(DOMAIN);
+  const B_FILE: ManifestDataset = { ...A_FILE, DateUpdate: '2026-10-02T00:00:00', FileRows: 7700 };
+  const B_IDS = [...B.ids].sort();
+  const DRIFTED_ID = '9999|15|5510|1990';
+  let dir: string;
+  let mirror: FaostatMirror;
+  let warnings: string[];
+  /** The ZIP the stubbed bulk host serves. */
+  let served: Uint8Array;
+  const fetcher = vi.fn(async () => chunkedResponse(served, 1 << 16));
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'faostat-refresh-removes-'));
+    warnings = [];
+    served = A.zip;
+    vi.stubGlobal('fetch', fetcher);
+    mirror = initFaostatMirror({
+      dir,
+      domains: [DOMAIN],
+      log: { warning: (message) => warnings.push(message) },
+    });
+    await mirror.runDomainSync(DOMAIN, 'init', {
+      signal: new AbortController().signal,
+      dataset: A_FILE,
+    });
+    // Past the 11,000 rowids A's rows take, so B's new rows land beyond it.
+    (await mirror.getMirror(DOMAIN)!.raw())
+      .prepare(
+        `INSERT INTO ${TABLE}(rowid, id, area_code, item_code, element_code, year, value) VALUES (250000, ?, 9999, 15, 5510, 1990, 1)`,
+      )
+      .run(DRIFTED_ID);
+    served = B.zip;
+    fetcher.mockClear();
+  }, 30_000);
+
+  afterEach(async () => {
+    await mirror.close();
+    vi.unstubAllGlobals();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function refresh(
+    args: {
+      dataset?: ManifestDataset;
+      onProgress?: Parameters<FaostatMirror['runDomainSync']>[2]['onProgress'];
+      signal?: AbortSignal;
+    } = {},
+  ) {
+    return mirror.runDomainSync(DOMAIN, 'refresh', {
+      signal: args.signal ?? new AbortController().signal,
+      dataset: args.dataset ?? B_FILE,
+      ...(args.onProgress ? { onProgress: args.onProgress } : {}),
+    });
+  }
+
+  /** Refresh against B and stop it once `at` holds after a page commits. */
+  async function stoppedRefresh(
+    at: (progress: {
+      pages: number;
+      tombstones: number;
+      checkpoint?: string | undefined;
+    }) => boolean,
+  ): Promise<void> {
+    const controller = new AbortController();
+    const stopped = new Error('Stopped for shutdown');
+    await expect(
+      refresh({
+        signal: controller.signal,
+        onProgress: (progress) => {
+          if (at(progress)) controller.abort(stopped);
+        },
+      }),
+    ).rejects.toBe(stopped);
+  }
+
+  /** Every id the cube holds, sorted. */
+  async function cubeIds(target = mirror): Promise<string[]> {
+    return (await target.getMirror(DOMAIN)!.raw())
+      .prepare<{ id: string }>(`SELECT id FROM ${TABLE} ORDER BY id`)
+      .all()
+      .map((row) => row.id);
+  }
+
+  /** The ids of `expected` the cube lacks. */
+  async function missing(expected: string[]): Promise<string[]> {
+    const present = new Set(await cubeIds());
+    return expected.filter((id) => !present.has(id));
+  }
+
+  it('ends a refresh with exactly its file’s rows, the rows a fresh init of that file holds', async () => {
+    expect(await refresh()).toMatchObject({
+      recordsApplied: 7700,
+      tombstonesApplied: 5501,
+      total: 7700,
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(await cubeIds()).toEqual(B_IDS);
+    expect(await mirror.status(DOMAIN)).toMatchObject({
+      status: 'complete',
+      ready: true,
+      total: 7700,
+      checkpoint: B_FILE.DateUpdate,
+    });
+
+    const freshDir = mkdtempSync(join(tmpdir(), 'faostat-refresh-fresh-'));
+    const fresh = new FaostatMirror({ dir: freshDir, domains: [DOMAIN] });
+    try {
+      expect(
+        await fresh.runDomainSync(DOMAIN, 'init', {
+          signal: new AbortController().signal,
+          dataset: B_FILE,
+        }),
+      ).toMatchObject({ tombstonesApplied: 0, total: 7700 });
+      expect(await cubeIds(fresh)).toEqual(await cubeIds());
+    } finally {
+      await fresh.close();
+      rmSync(freshDir, { recursive: true, force: true });
+    }
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => Response.json(fixtureManifestResponse([B_FILE]))),
+    );
+    const wire = await runToolContract(listDomainsTool, { code: DOMAIN });
+    expect(wire.structuredContent).toMatchObject({
+      domains: [
+        { code: DOMAIN, index_ready: true, indexed_row_count: 7700, upstream_row_count: 7700 },
+      ],
+    });
+    expect(text(wire)).toContain(`Local rows: ${(7700).toLocaleString()} (synced `);
+
+    // Its unchanged upstream, refreshed again: nothing fetched, nothing removed.
+    vi.stubGlobal('fetch', fetcher);
+    fetcher.mockClear();
+    expect(await refresh()).toEqual({
+      pagesFetched: 0,
+      recordsApplied: 0,
+      tombstonesApplied: 0,
+      total: 7700,
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(await cubeIds()).toEqual(B_IDS);
+  }, 30_000);
+
+  it('removes rows only once every row of the file is in, on pages up to the one carrying the checkpoint', async () => {
+    const handle = await mirror.getMirror(DOMAIN)!.raw();
+    const held = handle.prepare<{ n: number }>(
+      `SELECT count(*) AS n FROM ${TABLE} WHERE id IN (SELECT value FROM json_each(?))`,
+    );
+    const fileIds = JSON.stringify(B.ids);
+    const pages: unknown[] = [];
+    let seen = { records: 0, tombstones: 0 };
+    await refresh({
+      onProgress: ({ records, tombstones, checkpoint }) => {
+        pages.push({
+          records: records - seen.records,
+          tombstones: tombstones - seen.tombstones,
+          checkpoint: checkpoint === B_FILE.DateUpdate,
+          holdsEveryFileRow: held.get(fileIds)?.n === B.total,
+        });
+        seen = { records, tombstones };
+      },
+    });
+    expect(pages).toEqual([
+      { records: 5000, tombstones: 0, checkpoint: false, holdsEveryFileRow: false },
+      { records: 2700, tombstones: 0, checkpoint: false, holdsEveryFileRow: true },
+      { records: 0, tombstones: 5000, checkpoint: false, holdsEveryFileRow: true },
+      { records: 0, tombstones: 501, checkpoint: true, holdsEveryFileRow: true },
+    ]);
+  }, 30_000);
+
+  it('ends with the file’s rows when a refresh stopped mid-stream is rerun', async () => {
+    await stoppedRefresh(({ pages }) => pages === 1);
+    // Nothing is removed before every row of the file is in.
+    expect(await missing([...A.ids, DRIFTED_ID])).toEqual([]);
+    expect(await mirror.status(DOMAIN)).toMatchObject({
+      status: 'error',
+      ready: true,
+      checkpoint: A_FILE.DateUpdate,
+    });
+
+    expect(await refresh()).toMatchObject({ tombstonesApplied: 5501, total: 7700 });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(await cubeIds()).toEqual(B_IDS);
+  }, 30_000);
+
+  it('ends with the file’s rows when a refresh stopped during its removals is rerun', async () => {
+    await stoppedRefresh(({ tombstones }) => tombstones > 0);
+    // The first removal page committed: every row of the file stays, 501 stale rows remain.
+    expect(await missing(B.ids)).toEqual([]);
+    expect(await cubeIds()).toHaveLength(7700 + 501);
+
+    expect(await refresh()).toMatchObject({ tombstonesApplied: 501, total: 7700 });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(await cubeIds()).toEqual(B_IDS);
+  }, 30_000);
+
+  it('ends with the file’s rows, fetching nothing, when a refresh stopped right after its checkpoint page is rerun', async () => {
+    await stoppedRefresh(({ checkpoint }) => checkpoint === B_FILE.DateUpdate);
+    expect(await cubeIds()).toEqual(B_IDS);
+    // No completion committed, so the last completed total stands until a run completes.
+    expect(await mirror.status(DOMAIN)).toMatchObject({
+      status: 'error',
+      ready: true,
+      checkpoint: B_FILE.DateUpdate,
+      total: 11000,
+    });
+
+    expect(await refresh()).toEqual({
+      pagesFetched: 0,
+      recordsApplied: 0,
+      tombstonesApplied: 0,
+      total: 7700,
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(await cubeIds()).toEqual(B_IDS);
+  }, 30_000);
+
+  it('reads the rows its file does not carry on the read pool, in rowid slices that cover the cube once', async () => {
+    const all = vi.spyOn(mirror.reads, 'all');
+    await refresh();
+    const jobs = all.mock.calls.map(([job]) => job);
+    const slices = jobs.filter((job) => job.sql.includes('file_date_update'));
+    // Rowids 1–252,200: A's rows, the drifted row at 250,000, and B's new year past it.
+    expect(slices.map((job) => job.params.slice(0, 2))).toEqual(
+      [1, 50_001, 100_001, 150_001, 200_001, 250_001].map((from) => [from, from + 50_000]),
+    );
+    const handle = await mirror.getMirror(DOMAIN)!.raw();
+    const plan = (job: (typeof jobs)[number]) =>
+      handle
+        .prepare<{ detail: string }>(`EXPLAIN QUERY PLAN ${job.sql}`)
+        .all(...job.params)
+        .map((row) => row.detail)
+        .join('\n');
+    for (const job of slices) {
+      expect(plan(job)).toContain('USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)');
+    }
+    const bounds = jobs.filter((job) => job.sql.includes('max(rowid)'));
+    expect(bounds).toHaveLength(1);
+    expect(plan(bounds[0]!)).not.toMatch(new RegExp(`SCAN ${TABLE}\\b`));
+  }, 30_000);
+
+  it('applies a file whose DateUpdate it cannot stamp, keeping the rows it cannot tell withdrawn and saying so', async () => {
+    const UNSTAMPABLE: ManifestDataset = { ...B_FILE, DateUpdate: '2026-10-02' };
+    expect(await refresh({ dataset: UNSTAMPABLE })).toMatchObject({
+      recordsApplied: 7700,
+      tombstonesApplied: 0,
+      total: 7700 + 5500 + 1,
+    });
+    expect(warnings.filter((message) => message.includes('"2026-10-02"'))).toHaveLength(1);
+    expect(await mirror.status(DOMAIN)).toMatchObject({
+      status: 'complete',
+      checkpoint: '2026-10-02',
+    });
+
+    // The next file it can stamp removes them.
+    expect(await refresh()).toMatchObject({ tombstonesApplied: 5501, total: 7700 });
+    expect(await cubeIds()).toEqual(B_IDS);
+  }, 30_000);
+
+  it.each([
+    ['without', false],
+    ['with', true],
+  ])(
+    'keeps every stored row when a refresh’s data file holds only its header, %s a final line break, until a file that carries rows removes what it does not carry',
+    async (_, finalLineBreak) => {
+      const HEADER_ONLY_FILE: ManifestDataset = {
+        ...A_FILE,
+        DateUpdate: '2026-07-01T00:00:00',
+        FileRows: 0,
+      };
+      served = buildMidSizeDomainZip({
+        domain: DOMAIN,
+        countryCount: 2200,
+        years: 5,
+        omit: () => true,
+        finalLineBreak,
+      }).zip;
+      const stored = await cubeIds();
+      expect(stored).toHaveLength(11_001);
+      warnings.length = 0;
+
+      expect(await refresh({ dataset: HEADER_ONLY_FILE })).toMatchObject({
+        recordsApplied: 0,
+        tombstonesApplied: 0,
+        total: 11_001,
+      });
+      expect(fetcher).toHaveBeenCalledTimes(1);
+      expect(await cubeIds()).toEqual(stored);
+      expect(warnings).toEqual([
+        `${DOMAIN} data file for DateUpdate "${HEADER_ONLY_FILE.DateUpdate}" carries no data rows, so this sync removes none of the rows the cube holds; the next file that carries rows removes those it does not carry`,
+      ]);
+      expect(await mirror.status(DOMAIN)).toMatchObject({
+        status: 'complete',
+        ready: true,
+        total: 11_001,
+        checkpoint: HEADER_ONLY_FILE.DateUpdate,
+      });
+
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => Response.json(fixtureManifestResponse([HEADER_ONLY_FILE]))),
+      );
+      const wire = await runToolContract(listDomainsTool, { code: DOMAIN });
+      expect(wire.structuredContent).toMatchObject({
+        domains: [{ code: DOMAIN, index_ready: true, indexed_row_count: 11_001 }],
+      });
+      expect(text(wire)).toContain('Index ready: yes');
+      expect(text(wire)).toContain(`Local rows: ${(11_001).toLocaleString()} (synced `);
+
+      // The next file that carries rows removes every row it does not carry, and warns of nothing.
+      vi.stubGlobal('fetch', fetcher);
+      served = B.zip;
+      expect(await refresh()).toMatchObject({
+        recordsApplied: 7700,
+        tombstonesApplied: 5501,
+        total: 7700,
+      });
+      expect(await cubeIds()).toEqual(B_IDS);
+      expect(warnings).toHaveLength(1);
+    },
+    30_000,
+  );
 });

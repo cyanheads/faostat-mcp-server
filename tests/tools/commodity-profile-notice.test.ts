@@ -10,7 +10,9 @@
  * only what actually reached the table. Every staging branch states its
  * disposition in the notice (#31) — a failed staging as a failure, a disabled
  * canvas with the enable advice — and every branch returning a `canvas_id` points
- * at `faostat_dataframe_describe` before `faostat_dataframe_query` (#23). The
+ * at `faostat_dataframe_describe` before `faostat_dataframe_query` (#23). An item
+ * with no trade quantity row points at `faostat_resolve_codes` on TCL, and the
+ * row-level pointer names each domain's item when a trade item differs (#66). The
  * wire-level cases run through `runToolContract`, so the notice is read from
  * `structuredContent` and from the `content[]` trailer the framework renders.
  * @module tests/tools/commodity-profile-notice
@@ -346,6 +348,9 @@ describe('faostat_commodity_profile canvas pointers in the definition (#23)', ()
 describe('faostat_commodity_profile trade-domain states (#19)', () => {
   let dir: string;
   let mirror: FaostatMirror | undefined;
+  /** The notice for a selected TCL with no completed sync, whether or not one is running. */
+  const TCL_NOT_READY =
+    'Trade domain (TCL) is selected but has no completed sync — returning a profile without trade. No configuration change is needed: TCL becomes available once a sync of it completes, run by the server’s scheduled refresh where one is configured or by its operator through mirror:init or mirror:refresh. Check faostat_list_domains with code TCL for its index_ready flag, then call this profile again once it turns true.';
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'faostat-profile-trade-'));
@@ -365,8 +370,9 @@ describe('faostat_commodity_profile trade-domain states (#19)', () => {
 
   /**
    * Build a mirror over `domains` and sync QCL only. Listing TCL therefore leaves
-   * it selected-but-never-synced — `isSelected` true, `ready` false — which is the
-   * mid-index state; omitting TCL leaves it outside the selection entirely.
+   * it selected-but-never-synced — `isSelected` true, `ready` false — the state of a
+   * TCL with no completed sync, running or not; omitting TCL leaves it outside the
+   * selection entirely.
    */
   async function initMirror(domains: string[]): Promise<FaostatMirror> {
     const built = initFaostatMirror({ dir, domains });
@@ -385,16 +391,17 @@ describe('faostat_commodity_profile trade-domain states (#19)', () => {
     return getEnrichment(ctx).notice as string;
   }
 
-  it('tells a caller whose TCL is still indexing to wait, not to edit FAOSTAT_DOMAINS', async () => {
+  it('tells a caller whose TCL has no completed sync to wait, not to edit FAOSTAT_DOMAINS', async () => {
     const built = await initMirror([FIXTURE_DOMAIN, TCL]);
     expect(built.isSelected(TCL)).toBe(true);
     expect(await built.ready(TCL)).toBe(false);
 
     const notice = await profileNotice('profile-trade-indexing');
-    expect(notice).toMatch(/has not finished its initial sync/i);
+    // True whether or not a sync of TCL is running: nothing here starts one.
+    expect(notice).toContain(TCL_NOT_READY);
     // The config remedy belongs to the not-selected state alone. Following it here
     // means editing a variable that already lists TCL and restarting a sync that
-    // was already underway.
+    // may already be underway.
     expect(notice).not.toMatch(/FAOSTAT_DOMAINS/);
     expect(notice).not.toMatch(/re-sync/i);
   });
@@ -406,6 +413,15 @@ describe('faostat_commodity_profile trade-domain states (#19)', () => {
     expect(notice).toMatch(/not in the local mirror selection/i);
     expect(notice).toMatch(/Add TCL to FAOSTAT_DOMAINS/);
     expect(notice).not.toMatch(/initial sync/i);
+  });
+
+  it('leaves trade_item_code unchecked while TCL is still indexing (#66)', async () => {
+    await initMirror([FIXTURE_DOMAIN, TCL]);
+
+    const wire = await profileWire('profile-trade-item-indexing', { trade_item_code: 9999 });
+    expect(wire.structured).not.toHaveProperty('trade_item');
+    expect(wire.notice).toContain(TCL_NOT_READY);
+    expect(wire.notice).not.toMatch(/trade_item_code/);
   });
 });
 
@@ -748,5 +764,219 @@ describe('faostat_commodity_profile lag notice (#50)', () => {
     const wire = await profileWire('profile-lag-none', input);
     expect(wire.notice).not.toMatch(/behind/);
     expect(wire.notice).not.toMatch(/year_start/);
+  });
+});
+
+describe('faostat_commodity_profile trade item notices (#66)', () => {
+  let dir: string;
+  let mirror: FaostatMirror;
+
+  /** The pointer to a trade item that the notice adds when no trade quantity element is carried. */
+  const POINTER =
+    'call faostat_resolve_codes with domain TCL, dimension item, and a query naming the traded product, then pass a returned code as trade_item_code';
+
+  const alpha = { areaCode: 10, area: 'Alpha', year: 2022 };
+  const production = { elementCode: 5510, element: 'Production' };
+  const exports = { elementCode: 5910, element: 'Export quantity' };
+  const imports = { elementCode: 5610, element: 'Import quantity' };
+  const headExports = { elementCode: 5908, element: 'Export quantity', unit: 'An' };
+  const headImports = { elementCode: 5608, element: 'Import quantity', unit: 'An' };
+  const wheat = { itemCode: 15, item: 'Wheat' };
+  const palmFruit = { itemCode: 254, item: 'Oil palm fruit' };
+  const palmOil = { itemCode: 257, item: 'Palm oil' };
+  const bran = { itemCode: 17, item: 'Bran of wheat' };
+  const beef = { itemCode: 867, item: 'Meat of cattle' };
+  const cattle = { itemCode: 866, item: 'Cattle' };
+
+  beforeAll(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'faostat-profile-trade-item-'));
+    /*
+     * QCL: wheat, oil palm fruit, meat of cattle, and bran. TCL: wheat exports only,
+     * palm oil both ways, bran with an export value and no quantity element, and cattle
+     * with head-count quantities only (5608/5908); oil palm fruit has no TCL row.
+     */
+    const qcl = buildExplicitDomainZip([
+      { ...alpha, ...wheat, ...production, value: 100 },
+      { ...alpha, ...palmFruit, ...production, value: 50 },
+      { ...alpha, ...beef, ...production, value: 40 },
+      { ...alpha, ...bran, ...production, value: 30 },
+    ]);
+    const tcl = buildExplicitDomainZip(
+      [
+        { ...alpha, ...wheat, ...exports, value: 12 },
+        { ...alpha, ...palmOil, ...exports, value: 9 },
+        { ...alpha, ...palmOil, ...imports, value: 8 },
+        { ...alpha, ...bran, elementCode: 5922, element: 'Export value', value: 7 },
+        { ...alpha, ...cattle, ...headImports, value: 3 },
+        { ...alpha, ...cattle, ...headExports, value: 2 },
+      ],
+      TCL,
+    );
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string | URL) =>
+        chunkedResponse(String(url).includes(`_${TCL}_`) ? tcl : qcl, 1 << 16),
+      ),
+    );
+    mirror = initFaostatMirror({ dir, domains: [FIXTURE_DOMAIN, TCL] });
+    for (const domain of [FIXTURE_DOMAIN, TCL]) {
+      await mirror.runDomainSync(domain, 'init', {
+        signal: new AbortController().signal,
+        dataset: fixtureDataset(domain),
+      });
+    }
+  }, 30_000);
+
+  afterAll(async () => {
+    await mirror.close();
+    vi.unstubAllGlobals();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('points an item with no TCL trade quantity row at faostat_resolve_codes on TCL', async () => {
+    const wire = await profileWire('profile-pointer', { item_query: 'Oil palm fruit' });
+    expect(wire.notice).toContain(
+      `TCL holds no export quantity (5910) or import quantity (5610) rows for Oil palm fruit, so top_exporters and top_importers are empty. If the product trades in a processed form, ${POINTER}.`,
+    );
+    expect(wire.text).toContain(`> ${wire.notice}`);
+  });
+
+  it('leaves the pointer out when one side is missing, and when a trade item ranks', async () => {
+    const wheatOnly = await profileWire('profile-pointer-one-sided', { item_query: 'Wheat' });
+    expect(wheatOnly.notice).toContain(
+      'TCL holds no import quantity (5610) rows for Wheat, so top_importers is empty.',
+    );
+    expect(wheatOnly.notice).not.toContain(POINTER);
+
+    const palm = await profileWire('profile-pointer-traded', {
+      item_query: 'Oil palm fruit',
+      trade_item_code: palmOil.itemCode,
+    });
+    expect(palm.structured.trade_item).toEqual({ code: 257, name: 'Palm oil' });
+    expect(palm.structured.top_exporters).toMatchObject([{ area_code: 10, value: 9 }]);
+    expect(palm.notice).not.toMatch(/TCL holds no/);
+    expect(palm.notice).not.toContain(POINTER);
+  });
+
+  it('names the elements a supplied trade item carries instead of the pointer, on both surfaces', async () => {
+    const wire = await profileWire('profile-pointer-bran', {
+      item_query: 'Wheat',
+      trade_item_code: bran.itemCode,
+    });
+    expect(wire.structured.trade_item).toEqual({ code: 17, name: 'Bran of wheat' });
+    expect(wire.structured.ranking_elements).toEqual({
+      top_producers: [{ element_code: 5510, element: 'Production', units: ['t'] }],
+      top_exporters: [],
+      top_importers: [],
+    });
+    expect(wire.notice).toContain(
+      'TCL holds no export quantity (5910) or import quantity (5610) rows for Bran of wheat (17), so top_exporters and top_importers are empty. Bran of wheat (17) carries TCL rows only for other elements (5922): pass a trade_item_code whose item carries export quantity (5910) or import quantity (5610), or omit trade_item_code.',
+    );
+    // The pointer would send the caller back to the code that just ranked nothing.
+    expect(wire.notice).not.toContain(POINTER);
+    expect(wire.text).toContain(`> ${wire.notice}`);
+    expect(wire.formatted).toContain('Trade item: Bran of wheat (17)');
+    expect(wire.formatted).toContain('### Top exporters of Bran of wheat (17)\n_None._');
+    expect(wire.formatted).toContain('### Top importers of Bran of wheat (17)\n_None._');
+  });
+
+  it('names head-count elements a tonne-ranked trade item carries, without a read beyond the element check', async () => {
+    const reads = vi.spyOn(mirror.reads, 'all');
+    let traded: WireProfile;
+    let own: WireProfile;
+    let tradedReads: number;
+    try {
+      traded = await profileWire('profile-pointer-cattle', {
+        item_query: 'Meat of cattle',
+        trade_item_code: cattle.itemCode,
+      });
+      tradedReads = reads.mock.calls.length;
+      reads.mockClear();
+      own = await profileWire('profile-pointer-beef', { item_query: 'Meat of cattle' });
+      // The trade item's element read stands in for the selected item's: same read count.
+      expect(reads).toHaveBeenCalledTimes(tradedReads);
+    } finally {
+      reads.mockRestore();
+    }
+    expect(traded.notice).toContain(
+      'TCL holds no export quantity (5910) or import quantity (5610) rows for Cattle (866), so top_exporters and top_importers are empty. Cattle (866) carries TCL rows only for other elements (5608, 5908): pass a trade_item_code whose item carries export quantity (5910) or import quantity (5610), or omit trade_item_code.',
+    );
+    expect(traded.notice).not.toContain(POINTER);
+    expect(traded.text).toContain(`> ${traded.notice}`);
+    // Without a trade_item_code the notice keeps the pointer, word for word.
+    expect(own.notice).toContain(
+      `TCL holds no export quantity (5910) or import quantity (5610) rows for Meat of cattle, so top_exporters and top_importers are empty. If the product trades in a processed form, ${POINTER}.`,
+    );
+    expect(own.notice).not.toMatch(/carries TCL rows only/);
+  });
+
+  it.each([
+    ['no quantity element on either side', { item_code: bran.itemCode }, bran.itemCode],
+    ['one side ranked', { item_query: 'Wheat' }, wheat.itemCode],
+  ])(
+    'reads a trade_item_code equal to item_code as omitted in the notice, on both surfaces: %s',
+    async (_case, input, code) => {
+      // Both calls stage onto one named canvas, so both notices name the same canvas_id.
+      const tenant = `profile-pointer-same-${code}`;
+      const live = await canvas.acquire(undefined, createMockContext({ tenantId: tenant }));
+      const omitted = await profileWire(tenant, { ...input, canvas_id: live.canvasId });
+      const same = await profileWire(tenant, {
+        ...input,
+        canvas_id: live.canvasId,
+        trade_item_code: code,
+      });
+      expect(same.structured.trade_item).toMatchObject({ code });
+      expect(same.notice).toBe(omitted.notice);
+      expect(same.text).toContain(`> ${omitted.notice}`);
+      expect(same.notice).not.toMatch(/carries TCL rows only/);
+    },
+  );
+
+  it('gives a trade_item_code equal to item_code today’s pointer, word for word', async () => {
+    const same = await profileWire('profile-pointer-same-bran', {
+      item_code: bran.itemCode,
+      trade_item_code: bran.itemCode,
+    });
+    expect(same.notice).toContain(
+      `TCL holds no export quantity (5910) or import quantity (5610) rows for Bran of wheat, so top_exporters and top_importers are empty. If the product trades in a processed form, ${POINTER}.`,
+    );
+  });
+
+  it('adds neither sentence when a supplied trade item ranks one side', async () => {
+    const wire = await profileWire('profile-pointer-one-sided-traded', {
+      item_query: 'Oil palm fruit',
+      trade_item_code: wheat.itemCode,
+    });
+    expect(wire.structured.top_exporters).toMatchObject([{ area_code: 10, value: 12 }]);
+    expect(wire.notice).toContain(
+      'TCL holds no import quantity (5610) rows for Wheat (15), so top_importers is empty.',
+    );
+    expect(wire.notice).not.toMatch(/carries TCL rows only/);
+    expect(wire.notice).not.toContain(POINTER);
+  });
+
+  it('names each domain’s item in the row-level pointer when the trade item differs', async () => {
+    setCanvas(failingCanvas());
+    let traded: WireProfile;
+    let same: WireProfile;
+    try {
+      traded = await profileWire('profile-pointer-row-level', {
+        item_query: 'Oil palm fruit',
+        trade_item_code: palmOil.itemCode,
+      });
+      same = await profileWire('profile-pointer-row-level-same', {
+        item_query: 'Wheat',
+        trade_item_code: wheat.itemCode,
+      });
+    } finally {
+      setCanvas(canvas);
+    }
+    expect(traded.notice).toContain(
+      'for row-level data, call faostat_query_observations with item codes 254 on QCL (element codes 5510) and item codes 257 on TCL (element codes 5910, 5610).',
+    );
+    // A trade item equal to the selected one reads as the pointer always has.
+    expect(same.notice).toContain(
+      'for row-level data, call faostat_query_observations with item codes 15 on QCL (element codes 5510) and TCL (element codes 5910).',
+    );
   });
 });

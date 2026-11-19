@@ -1,5 +1,6 @@
 /**
- * @fileoverview Single-item profile selection through real scoped SQLite resolution.
+ * @fileoverview Single-item profile selection through real scoped SQLite resolution,
+ * and the trade item a `trade_item_code` selects in TCL (#66).
  * @module tests/tools/commodity-profile-selection
  */
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -152,10 +153,108 @@ describe('single-item selection (#41)', () => {
 
   it('requires selection and rejects invalid input bounds', async () => {
     const wire = await call({});
-    expect(wire.structuredContent).toMatchObject({ error: { data: { reason: 'missing_item' } } });
+    expect(wire.structuredContent).toMatchObject({
+      error: { message: 'Supply item_code or item_query.', data: { reason: 'missing_item' } },
+    });
     expect(text(wire)).toContain('Supply item_code or item_query');
+    // With no item_query at all, the message says nothing about one.
+    expect(text(wire)).not.toContain('names no commodity');
     for (const input of [{ item_code: 0 }, { item_code: 1.5 }, { item_query: '' }])
       expect(commodityProfileTool.input.safeParse(input).success).toBe(false);
+  });
+
+  it.each(['*', ' * ', '   '])(
+    'reads item_query %j as omitted: missing_item on both surfaces (#67)',
+    async (query) => {
+      const wire = await call({ item_query: query });
+      expect(wire.isError).toBe(true);
+      const recovery = commodityProfileTool.errors?.find(
+        (entry) => entry.reason === 'missing_item',
+      )?.recovery;
+      expect(wire.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          message:
+            'item_query is whitespace-only or "*", which names no commodity. Supply item_code or item_query.',
+          data: { reason: 'missing_item', recovery: { hint: recovery } },
+        },
+      });
+      expect(text(wire)).toContain('Supply item_code or item_query');
+      // The message names the query it read as omitted; the recovery never says this.
+      expect(text(wire)).toContain('which names no commodity');
+      expect(text(wire)).toContain(recovery);
+    },
+  );
+
+  it.each([
+    ['()', '"()"'],
+    ['""', '"\\"\\""'],
+    ['(*)', '"(*)"'],
+    ['**', '"**"'],
+    ['* *', '"* *"'],
+  ])(
+    'fails item_query %j with invalid_query on both surfaces, naming it as %s (#67)',
+    async (query, quoted) => {
+      const wire = await call({ item_query: query });
+      expect(wire.isError).toBe(true);
+      const recovery = commodityProfileTool.errors?.find(
+        (entry) => entry.reason === 'invalid_query',
+      )?.recovery;
+      expect(wire.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          message: `item_query ${quoted} holds no search term: it is made only of quotes, parentheses, asterisks, and whitespace.`,
+          data: { reason: 'invalid_query', recovery: { hint: recovery } },
+        },
+      });
+      // content[] carries the message markdown-escaped.
+      expect(text(wire)).toContain('holds no search term');
+      expect(text(wire)).toContain('quotes, parentheses, asterisks, and whitespace');
+      expect(text(wire)).toContain(recovery);
+    },
+  );
+
+  it.each(['()', '*'])('lets item_code win over item_query %j, unread (#67)', async (query) => {
+    const wire = await call({ item_code: 100, item_query: query });
+    expect(wire.isError).toBeFalsy();
+    expect(wire.structuredContent).toMatchObject({
+      item_query: query,
+      resolved_items: [{ code: 100, name: 'Milk variant 0' }],
+    });
+  });
+
+  it.each(['?', '-', '​', '小麦'])(
+    'keeps a search with no indexed word a no_match: %j (#67)',
+    async (query) => {
+      const wire = await call({ item_query: query });
+      expect(wire.structuredContent).toMatchObject({ error: { data: { reason: 'no_match' } } });
+    },
+  );
+
+  it.each([
+    ['\u0000', '"\\u0000"'],
+    ['\u0007', '"\\u0007"'],
+    ['\u0085', '"\\u0085"'],
+    ['(\u0007)', '"(\\u0007)"'],
+    ['?', '"?"'],
+  ])(
+    'answers item_query %j, which leaves no word, with no_match on both surfaces, naming it as %s (#67)',
+    async (query, quoted) => {
+      const wire = await call({ item_query: query });
+      expect(wire.isError).toBe(true);
+      expect(wire.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'no_match' } },
+      });
+      expect(text(wire)).toContain(`No QCL item matched ${quoted}.`);
+      expect(text(wire).replaceAll('\n', '')).not.toMatch(/\p{Cc}/u);
+    },
+  );
+
+  it('names an ambiguous item_query escaped on both surfaces', async () => {
+    const wire = await call({ item_query: 'variant\u0007' });
+    expect(wire.structuredContent).toMatchObject({ error: { data: { reason: 'ambiguous_item' } } });
+    expect(text(wire)).toContain('7 QCL items match "variant\\u0007". Candidates');
+    expect(text(wire).replaceAll('\n', '')).not.toMatch(/\p{Cc}/u);
   });
 
   it('serves a top_n above its cap at 50 rows per ranking, with the clamp on both surfaces (#56)', async () => {
@@ -333,6 +432,80 @@ describe('single-item selection (#41)', () => {
     });
   });
 
+  it('compares ";" and "," as one character in the exact-label preference', async () => {
+    const labels = [
+      [187, 'Peas; dry'],
+      [417, 'Peas; green'],
+      [191, 'Chick peas; dry'],
+      [195, 'Cow peas; dry'],
+    ] as const;
+    const zips = {
+      QCL: buildExplicitDomainZip(
+        labels.map(([itemCode, item], i) => ({
+          areaCode: 10,
+          area: 'Alpha',
+          itemCode,
+          item,
+          elementCode: 5510,
+          element: 'Production',
+          year: 2022,
+          value: i + 1,
+        })),
+      ),
+      TCL: buildExplicitDomainZip(
+        [
+          {
+            areaCode: 10,
+            area: 'Alpha',
+            itemCode: 900,
+            item: 'Other domain only',
+            elementCode: 5910,
+            element: 'Export quantity',
+            year: 2022,
+            value: 1,
+          },
+        ],
+        'TCL',
+      ),
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string | URL) =>
+        chunkedResponse(String(url).includes('_TCL_') ? zips.TCL : zips.QCL, 1 << 16),
+      ),
+    );
+    for (const domain of ['QCL', 'TCL'])
+      await mirror.runDomainSync(domain, 'refresh', {
+        signal: new AbortController().signal,
+        dataset: { ...fixtureDataset(domain), DateUpdate: '2026-01-01T00:00:00' },
+      });
+
+    for (const [query, code, name] of [
+      ['Peas, dry', 187, 'Peas; dry'],
+      ['Peas; dry', 187, 'Peas; dry'],
+      ['  peas,   DRY ', 187, 'Peas; dry'],
+      // A control character separates words here as it does in the search (#67).
+      ['Peas,\u0007dry', 187, 'Peas; dry'],
+      ['Peas; dry\u0000', 187, 'Peas; dry'],
+      ['Peas, green', 417, 'Peas; green'],
+      ['Chick peas, dry', 191, 'Chick peas; dry'],
+    ] as const) {
+      const wire = await call({ item_query: query });
+      expect(wire.isError).toBeFalsy();
+      expect(wire.structuredContent).toMatchObject({
+        item_query: query,
+        resolved_items: [{ code, name }],
+      });
+      expect(text(wire)).toContain(`${name} (${code})`);
+    }
+    // No exact label: the relevance search still has to pick one item.
+    const broad = await call({ item_query: 'peas dry' });
+    expect(broad.structuredContent).toMatchObject({
+      error: { data: { reason: 'ambiguous_item' } },
+    });
+    expect(text(broad)).toContain('3 QCL items match');
+  });
+
   it('bounds normalization CPU across a 64-fold input span', async () => {
     const store = new DimensionsStore(dir);
     try {
@@ -365,5 +538,200 @@ describe('single-item selection (#41)', () => {
     } finally {
       await store.close();
     }
+  });
+});
+
+describe('profile heading for a query with a control character (#67)', () => {
+  /** QCL: Wheat and Peas; dry, so a control character in either query still selects one item. */
+  beforeEach(async () => {
+    const qcl = buildExplicitDomainZip(
+      (
+        [
+          [15, 'Wheat'],
+          [187, 'Peas; dry'],
+        ] as const
+      ).map(([itemCode, item]) => ({
+        areaCode: 10,
+        area: 'Alpha',
+        itemCode,
+        item,
+        elementCode: 5510,
+        element: 'Production',
+        year: 2022,
+        value: 1,
+      })),
+    );
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => chunkedResponse(qcl, 1 << 16)),
+    );
+    await mirror.runDomainSync('QCL', 'refresh', {
+      signal: new AbortController().signal,
+      dataset: { ...fixtureDataset('QCL'), DateUpdate: '2026-01-01T00:00:00' },
+    });
+  });
+
+  /** The first line of the `format()` block, `content[0]`. */
+  const headingOf = (wire: Awaited<ReturnType<typeof call>>) => {
+    const [first] = wire.content;
+    return (first?.type === 'text' ? first.text : '').split('\n')[0];
+  };
+
+  it.each([
+    ['wheat\u0000', '"wheat\\u0000"', 'Wheat (15)'],
+    ['Peas,\u0007dry', '"Peas,\\u0007dry"', 'Peas; dry (187)'],
+  ])(
+    'renders item_query %j in the heading as %s, and keeps it raw in structuredContent',
+    async (query, quoted, resolved) => {
+      const wire = await call({ item_query: query });
+      expect(wire.isError).toBeFalsy();
+      expect(wire.structuredContent).toMatchObject({ item_query: query });
+      expect(headingOf(wire)).toBe(`## Commodity profile: ${quoted}`);
+      expect(text(wire)).toContain(`Resolved to: ${resolved}`);
+      expect(text(wire).replaceAll('\n', '')).not.toMatch(/\p{Cc}/u);
+    },
+  );
+
+  it.each([
+    [{ item_query: 'wheat' }, 'wheat'],
+    [{ item_query: '"wheat"' }, '"wheat"'],
+    [{ item_query: 'Peas, dry' }, 'Peas, dry'],
+    [{ item_code: 15 }, 'Wheat'],
+  ])('keeps the heading for %j as the text itself: %s', async (input, shown) => {
+    const wire = await call(input);
+    expect(wire.isError).toBeFalsy();
+    expect(headingOf(wire)).toBe(`## Commodity profile: ${shown}`);
+  });
+});
+
+describe('trade item selection (#66)', () => {
+  const alpha = { areaCode: 10, area: 'Alpha', year: 2022 };
+  const bravo = { areaCode: 20, area: 'Bravo', year: 2022 };
+  const production = { elementCode: 5510, element: 'Production' };
+  const exports = { elementCode: 5910, element: 'Export quantity' };
+  const imports = { elementCode: 5610, element: 'Import quantity' };
+  const milk = { itemCode: 100, item: 'Milk variant 0' };
+  const goats = { itemCode: 101, item: 'Milk of goats' };
+  const sugar = { itemCode: 1723, item: 'Sugar and sweeteners' };
+
+  /** QCL: two Production items. TCL: trade rows for the first and for a curated group item. */
+  beforeEach(async () => {
+    const zips = {
+      QCL: buildExplicitDomainZip([
+        { ...alpha, ...milk, ...production, value: 5 },
+        { ...bravo, ...milk, ...production, value: 9 },
+        { ...alpha, ...goats, ...production, value: 3 },
+      ]),
+      TCL: buildExplicitDomainZip(
+        [
+          { ...alpha, ...milk, ...exports, value: 4 },
+          { ...bravo, ...milk, ...imports, value: 2 },
+          { ...bravo, ...sugar, ...exports, value: 70 },
+          { ...alpha, ...sugar, ...exports, value: 30 },
+        ],
+        'TCL',
+      ),
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string | URL) =>
+        chunkedResponse(String(url).includes('_TCL_') ? zips.TCL : zips.QCL, 1 << 16),
+      ),
+    );
+    for (const domain of ['QCL', 'TCL'])
+      await mirror.runDomainSync(domain, 'refresh', {
+        signal: new AbortController().signal,
+        dataset: { ...fixtureDataset(domain), DateUpdate: '2026-01-01T00:00:00' },
+      });
+  });
+
+  it('takes the item_code schema: positive integers only', () => {
+    const props = (
+      z.toJSONSchema(commodityProfileTool.input, { io: 'input' }) as {
+        properties: Record<string, Record<string, unknown>>;
+      }
+    ).properties;
+    const { description: tradeDescription, ...trade } = props.trade_item_code ?? {};
+    const { description: _itemDescription, ...item } = props.item_code ?? {};
+    expect(trade).toEqual(item);
+    expect(tradeDescription).toEqual(expect.stringContaining('faostat_resolve_codes'));
+    expect(
+      commodityProfileTool.input.safeParse({ item_code: 100, trade_item_code: 30 }).success,
+    ).toBe(true);
+    for (const trade_item_code of [0, -1, 1.5])
+      expect(
+        commodityProfileTool.input.safeParse({ item_code: 100, trade_item_code }).success,
+      ).toBe(false);
+  });
+
+  it.each([
+    ['absent from every domain', 9999],
+    ['present in QCL alone', goats.itemCode],
+  ])(
+    'fails a trade_item_code %s with trade_item_not_found before any ranking read',
+    async (_case, code) => {
+      const reads = vi.spyOn(mirror.reads, 'all');
+      let wire: Awaited<ReturnType<typeof call>>;
+      try {
+        wire = await call({ item_code: milk.itemCode, trade_item_code: code });
+        // Item resolution, then the QCL and TCL element reads; no ranking, trend, or staging read.
+        expect(reads).toHaveBeenCalledTimes(3);
+      } finally {
+        reads.mockRestore();
+      }
+      const recovery = commodityProfileTool.errors?.find(
+        (entry) => entry.reason === 'trade_item_not_found',
+      )?.recovery;
+      expect(recovery).toBe(
+        'Call faostat_resolve_codes with domain TCL, dimension item, and a query naming the traded product, then pass a returned code as trade_item_code.',
+      );
+      expect(wire.isError).toBe(true);
+      expect(wire.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.NotFound,
+          message: `trade_item_code ${code} names no item with rows in TCL.`,
+          data: { reason: 'trade_item_not_found', recovery: { hint: recovery } },
+        },
+      });
+      expect(text(wire)).toContain(`trade_item_code ${code} names no item with rows in TCL.`);
+      expect(text(wire)).toContain(recovery);
+    },
+  );
+
+  it('ranks a trade_item_code equal to item_code exactly as when it is omitted', async () => {
+    const omitted = await call({ item_code: milk.itemCode });
+    const same = await call({ item_code: milk.itemCode, trade_item_code: milk.itemCode });
+    expect(same.isError).toBeFalsy();
+    const { trade_item, ...rest } = same.structuredContent as Record<string, unknown>;
+    expect(trade_item).toEqual({ code: 100, name: 'Milk variant 0' });
+    expect(rest).toEqual(omitted.structuredContent);
+    expect(rest).toMatchObject({
+      top_exporters: [{ area_code: 10, value: 4 }],
+      top_importers: [{ area_code: 20, value: 2 }],
+    });
+    expect(text(same)).toContain('Trade item: Milk variant 0 (100)');
+    expect(text(same)).toContain(
+      '### Top exporters of Milk variant 0 (100) — Export quantity 5910 (t)',
+    );
+    expect(text(omitted)).not.toContain('Trade item:');
+    expect(text(omitted)).toContain('### Top exporters — Export quantity 5910 (t)');
+  });
+
+  it('accepts a curated TCL group item as the trade item', async () => {
+    const wire = await call({ item_code: milk.itemCode, trade_item_code: sugar.itemCode });
+    expect(wire.isError).toBeFalsy();
+    expect(wire.structuredContent).toMatchObject({
+      resolved_items: [{ code: 100, name: 'Milk variant 0' }],
+      trade_item: { code: 1723, name: 'Sugar and sweeteners' },
+      top_producers: [
+        { area_code: 20, value: 9 },
+        { area_code: 10, value: 5 },
+      ],
+      top_exporters: [
+        { area_code: 20, value: 70 },
+        { area_code: 10, value: 30 },
+      ],
+      top_importers: [],
+    });
   });
 });

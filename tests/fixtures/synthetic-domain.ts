@@ -52,6 +52,9 @@ const FLAGS_CSV = [
 /** The synthetic domain code used across tests. */
 export const FIXTURE_DOMAIN = 'QCL';
 
+/** The fixture's M49 code for an area: its code zero-padded to three digits. */
+export const fixtureM49 = (areaCode: number) => String(areaCode).padStart(3, '0');
+
 /**
  * Per-domain item/element vocabulary override for {@link buildDomainZip}. The
  * default fixture hardcodes one item (Wheat=15) / element (Production=5510) in
@@ -61,10 +64,25 @@ export const FIXTURE_DOMAIN = 'QCL';
  * built from it, so `obs_<domain>` carries exactly these codes — the membership
  * set domain-scoped resolution keys off (issue #8). Areas stay shared (the two
  * standard countries), matching FAOSTAT's overlapping area vocabularies.
+ *
+ * An item's `code` is numeric, or an alphanumeric code text (`'210401F'`) for a
+ * text-identified item. `listed: false` keeps an item out of the ItemCodes CSV
+ * while its rows stay in the data, the shape of FAO's short and header-only item
+ * lists (#64): every item unlisted is a header-only list. `rowName` labels the
+ * data rows differently from the list, as FAO's row labels often differ from its
+ * list labels (`Cassava, fresh` in the rows, `Cassava; fresh` in the list). As a
+ * function it labels each row from its area code and year, so one item's rows can
+ * carry more than one label.
  */
 export interface DomainVocab {
   elements: { code: number; name: string }[];
-  items: { code: number; name: string; cpc?: string }[];
+  items: {
+    code: number | string;
+    name: string;
+    cpc?: string;
+    listed?: boolean;
+    rowName?: string | ((areaCode: number, year: number) => string);
+  }[];
 }
 
 /** The two shared country areas used for vocab-driven observation rows. */
@@ -94,12 +112,22 @@ export function buildDomainZip(domain = FIXTURE_DOMAIN, vocab?: DomainVocab): Ui
   return zipSync(files);
 }
 
-/** Item code-list CSV from a vocab (apostrophe-prefixed CPC, matching FAOSTAT). */
+/**
+ * Item code-list CSV from a vocab (apostrophe-prefixed CPC, matching FAOSTAT),
+ * leaving out `listed: false` items — just the header when none is listed.
+ */
 function buildItemCodesCsv(items: DomainVocab['items']): string {
   return [
     'Item Code,CPC Code,Item',
-    ...items.map((it) => `${it.code},'${it.cpc ?? '0000'},${it.name}`),
+    ...items
+      .filter((it) => it.listed !== false)
+      .map((it) => `${it.code},'${it.cpc ?? '0000'},${csvField(it.name)}`),
   ].join('\n');
+}
+
+/** A CSV cell, quoted as FAOSTAT quotes one when it holds a comma or a quote. */
+function csvField(value: string): string {
+  return /[",]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value;
 }
 
 /** Element code-list CSV from a vocab. */
@@ -116,8 +144,10 @@ function buildVocabDataRows(vocab: DomainVocab): string[] {
       for (const el of vocab.elements) {
         for (const year of [2020, 2021]) {
           seed += 1;
+          const label =
+            typeof it.rowName === 'function' ? it.rowName(c.code, year) : (it.rowName ?? it.name);
           rows.push(
-            `${c.code},'${c.m49},${c.name},${it.code},${it.name},${el.code},${el.name},${year},${year},t,${seed}.000000,A,Synth`,
+            `${c.code},'${c.m49},${c.name},${it.code},${csvField(label)},${el.code},${el.name},${year},${year},t,${seed}.000000,A,Synth`,
           );
         }
       }
@@ -136,13 +166,22 @@ function buildVocabDataRows(vocab: DomainVocab): string[] {
  * cross the 50,000-row staging cap using only country codes (< 5000), which the
  * country-only production path in commodity_profile and the default
  * aggregate-excluding query both require to reach truncation. Returns the ZIP plus
- * the exact row counts (`total = (countryCount + aggregateCount) * years`).
+ * the exact row counts (`total = (countryCount + aggregateCount) * years` when
+ * nothing is omitted).
  *
  * `value` overrides a country row's value per `(areaCode, year)` — `null` emits an
  * empty Value cell, which the ingester stores as NULL. Rows stream `ORDER BY year`,
  * so a function that keeps early years whole (or empty) and makes later years
  * fractional reproduces a preview window unlike the rows past it. Defaults to
  * `1000 + areaCode` in every year.
+ *
+ * `omit` leaves out the rows it returns true for, country and aggregate alike: a
+ * later revision of a file, built with the same counts, that drops the rows FAO
+ * withdrew (#63). `ids` lists the observation id of every row the file carries,
+ * in file order, as the ingester derives it (`area|item|element|year`), and
+ * `total` counts them. An `omit` that drops every row leaves the data CSV its
+ * header alone, which `finalLineBreak` ends with a line break (by default the CSV
+ * ends with its last record, unterminated).
  */
 export function buildMidSizeDomainZip(opts: {
   domain?: string;
@@ -150,14 +189,24 @@ export function buildMidSizeDomainZip(opts: {
   aggregateCount?: number;
   years?: number;
   value?: (areaCode: number, year: number) => number | null;
-}): { zip: Uint8Array; total: number; countryCount: number; aggregateCount: number } {
+  omit?: (areaCode: number, year: number) => boolean;
+  finalLineBreak?: boolean;
+}): {
+  zip: Uint8Array;
+  total: number;
+  countryCount: number;
+  aggregateCount: number;
+  ids: string[];
+} {
   const domain = opts.domain ?? FIXTURE_DOMAIN;
   const aggregateCount = opts.aggregateCount ?? 0;
   const years = opts.years ?? 1;
   const valueFor = opts.value ?? ((areaCode: number) => 1000 + areaCode);
+  const omit = opts.omit ?? (() => false);
   const base = `Production_Crops_Livestock_${domain}`;
 
   const dataRows: string[] = [];
+  const ids: string[] = [];
   const areaRows: string[] = ['Area Code,M49 Code,Area'];
   for (let i = 1; i <= opts.countryCount; i++) {
     const m49 = String(i).padStart(3, '0');
@@ -165,10 +214,12 @@ export function buildMidSizeDomainZip(opts: {
     const flag = i % 3 === 0 ? 'I' : i % 3 === 1 ? 'A' : 'E';
     for (let y = 0; y < years; y++) {
       const year = 2020 + y;
+      if (omit(i, year)) continue;
       const value = valueFor(i, year);
       dataRows.push(
         `${i},'${m49},${name},15,Wheat,5510,Production,${year},${year},t,${value === null ? '' : value.toFixed(6)},${flag},Synth`,
       );
+      ids.push(`${i}|15|5510|${year}`);
     }
     areaRows.push(`${i},'${m49},${name}`);
   }
@@ -179,15 +230,19 @@ export function buildMidSizeDomainZip(opts: {
     const value = (900000 + a).toFixed(6);
     for (let y = 0; y < years; y++) {
       const year = 2020 + y;
+      if (omit(code, year)) continue;
       dataRows.push(
         `${code},'${m49},${name},15,Wheat,5510,Production,${year},${year},t,${value},A,Aggregate`,
       );
+      ids.push(`${code}|15|5510|${year}`);
     }
     areaRows.push(`${code},'${m49},${name}`);
   }
 
   const files: Zippable = {
-    [`${base}_E_All_Data_(Normalized).csv`]: strToU8([DATA_HEADER, ...dataRows].join('\n')),
+    [`${base}_E_All_Data_(Normalized).csv`]: strToU8(
+      [DATA_HEADER, ...dataRows].join('\n') + (opts.finalLineBreak ? '\n' : ''),
+    ),
     [`${base}_E_AreaCodes.csv`]: strToU8(areaRows.join('\n')),
     [`${base}_E_ItemCodes.csv`]: strToU8(ITEM_CODES_CSV),
     [`${base}_E_Elements.csv`]: strToU8(ELEMENTS_CSV),
@@ -195,9 +250,10 @@ export function buildMidSizeDomainZip(opts: {
   };
   return {
     zip: zipSync(files),
-    total: (opts.countryCount + aggregateCount) * years,
+    total: ids.length,
     countryCount: opts.countryCount,
     aggregateCount,
+    ids,
   };
 }
 

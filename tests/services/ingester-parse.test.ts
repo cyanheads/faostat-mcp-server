@@ -1,14 +1,20 @@
 /**
  * @fileoverview Tests for the pure ingester parse helpers — column mapping off
  * the real header, M49/CPC apostrophe stripping, Year/Year-Code fallback,
- * aggregate-code classification, and the dimension code-list parsers.
+ * aggregate-code classification, the dimension code-list parsers, and the file
+ * stamp a manifest `DateUpdate` encodes to (#63).
  * @module tests/services/ingester-parse
  */
 
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { openSqliteHandle } from '@cyanheads/mcp-ts-core/mirror';
 import { describe, expect, it } from 'vitest';
 import { headerIndex, parseCsvLine } from '@/services/faostat-mirror/csv.js';
 import {
   dataRowToObservation,
+  dateUpdateStamp,
   parseAreaCodes,
   parseElementCodes,
   parseFlags,
@@ -186,4 +192,54 @@ describe('dimension code-list parsers', () => {
       { flag: 'E', description: 'Estimated value' },
     ]);
   });
+});
+
+describe('dateUpdateStamp (#63)', () => {
+  const STAMPS = [
+    ['1991-12-31T00:00:00', 694_137_600],
+    ['2025-11-14T00:00:00', 1_763_078_400],
+    ['2026-10-02T13:45:59', 1_790_948_759],
+    // Past the 32-bit signed range: the stamp stays an exact integer.
+    ['2038-01-19T03:14:08', 2_147_483_648],
+  ] as const;
+
+  it.each(STAMPS)('stamps %s as its Unix epoch seconds', (dateUpdate, seconds) => {
+    expect(dateUpdateStamp(dateUpdate)).toBe(seconds);
+  });
+
+  it('stamps losslessly: SQLite reads each stamp back as the DateUpdate it came from', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'faostat-stamp-'));
+    const handle = await openSqliteHandle(join(dir, 'stamp.db'));
+    try {
+      for (const [dateUpdate] of STAMPS) {
+        expect(
+          handle
+            .prepare<{ text: string }>(
+              "SELECT strftime('%Y-%m-%dT%H:%M:%S', ?, 'unixepoch') AS text",
+            )
+            .get(dateUpdateStamp(dateUpdate) ?? null),
+        ).toEqual({ text: dateUpdate });
+      }
+    } finally {
+      handle.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    '',
+    '2026-10-02',
+    '2026-10-02 00:00:00',
+    '2026-10-02T00:00:00Z',
+    '2026-10-02T00:00:00.000',
+    '2025-02-30T00:00:00',
+    '2025-13-01T00:00:00',
+    '2025-11-14T24:00:00',
+    '+002025-11-14T00:00:00',
+  ])(
+    'stamps nothing for %j, which is not a calendar instant in the manifest’s form',
+    (dateUpdate) => {
+      expect(dateUpdateStamp(dateUpdate)).toBeUndefined();
+    },
+  );
 });

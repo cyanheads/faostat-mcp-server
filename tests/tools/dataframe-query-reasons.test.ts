@@ -359,7 +359,10 @@ describe('faostat_dataframe_query error-contract reasons', () => {
 
 describe('faostat_dataframe_query sql description', () => {
   it('names every column a staged table can carry', () => {
-    const listed = new Set(dataframeQueryTool.input.shape.sql.description?.match(/\b[a-z_]+\b/g));
+    // Column names can carry digits (area_m49), so a token takes them too.
+    const listed = new Set(
+      dataframeQueryTool.input.shape.sql.description?.match(/\b[a-z0-9_]+\b/g),
+    );
     const missing = PROFILE_TABLE_SCHEMA.map((column) => column.name).filter(
       (name) => !listed.has(name),
     );

@@ -272,6 +272,52 @@ describe('faostat_commodity_profile per-country latest year (#5b, #5d)', () => {
     ]);
   });
 
+  it('ranks trade on the trade item, each country at its own latest year in that item (#66)', async () => {
+    const CHEESE = { itemCode: 901, item: 'Cheese from milk of cattle' } as const;
+    const EXPORTS = { elementCode: 5910, element: 'Export quantity' } as const;
+    const { ctx, result } = await profile(
+      [
+        { ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2022, value: 30 },
+        { ...BRAVO, ...CATTLE, ...PRODUCTION, year: 2021, value: 90 },
+      ],
+      { item_query: 'Milk of cattle', trade_item_code: CHEESE.itemCode },
+      [
+        // The selected item's own trade rows, which a trade item replaces in the rankings.
+        { ...ALPHA, ...CATTLE, ...IMPORTS, year: 2022, value: 1000 },
+        { ...BRAVO, ...CATTLE, ...EXPORTS, year: 2022, value: 1000 },
+        { ...ALPHA, ...CHEESE, ...IMPORTS, year: 2021, value: 4 },
+        { ...BRAVO, ...CHEESE, ...IMPORTS, year: 2019, value: 8 },
+        { ...ALPHA, ...CHEESE, ...EXPORTS, year: 2021, value: 3, flag: 'E' },
+      ],
+    );
+    expect(result.resolved_items).toEqual([{ code: 100, name: 'Milk of cattle' }]);
+    expect(result.trade_item).toEqual({ code: 901, name: 'Cheese from milk of cattle' });
+    expect(result.top_producers.map((r) => [r.area, r.value, r.year, r.years_behind])).toEqual([
+      ['Bravo', 90, 2021, 1],
+      ['Alpha', 30, 2022, 0],
+    ]);
+    // The importers' latest year is the cheese's 2021, not the milk's 2022 trade rows.
+    expect(result.top_importers.map((r) => [r.area, r.value, r.year, r.years_behind])).toEqual([
+      ['Bravo', 8, 2019, 2],
+      ['Alpha', 4, 2021, 0],
+    ]);
+    expect(result.top_exporters).toEqual([
+      {
+        area_code: 10,
+        area: 'Alpha',
+        value: 3,
+        observations: 1,
+        unit: 't',
+        year: 2021,
+        years_behind: 0,
+        flags: 'E',
+      },
+    ]);
+    expect(getEnrichment(ctx).notice as string).toContain(
+      'In top_importers (latest year 2021): Bravo (20) 2019, 2 years behind.',
+    );
+  });
+
   it('returns the annual trend on both client surfaces (#5e)', async () => {
     const { result } = await profile([
       { ...ALPHA, ...CATTLE, ...PRODUCTION, year: 2021, value: 10, flag: 'E' },

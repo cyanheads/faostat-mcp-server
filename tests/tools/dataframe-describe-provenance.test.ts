@@ -236,6 +236,7 @@ describe('faostat_dataframe_describe provenance parity', () => {
       'value_qualifier',
       'source_code',
       'source',
+      'area_m49',
     ]);
 
     // Cross-check the whole schema against the engine itself: every reported type
@@ -336,6 +337,18 @@ describe('faostat_commodity_profile provenance names (#32)', () => {
   it('omits both year keys when the call had no year bound', async () => {
     const { params } = await describeProfile('profile-no-years', {});
     expect(params).toEqual({ item_query: 'wheat', item_code: 15, item_codes: [15] });
+  }, 30_000);
+
+  it('records trade_item_code under its input name, though trade did not contribute (#66)', async () => {
+    // TCL is outside this mirror's selection, so the code goes unchecked and no TCL row is staged.
+    const { params, text } = await describeProfile('profile-trade-item', { trade_item_code: 30 });
+    expect(params).toEqual({
+      item_query: 'wheat',
+      item_code: 15,
+      item_codes: [15],
+      trade_item_code: 30,
+    });
+    expect(text).toContain('trade_item_code=30');
   }, 30_000);
 });
 

@@ -113,6 +113,8 @@ describe('error-contract conformance', () => {
       expect(declaredReasons(resolveCodesTool.errors)).toEqual([
         'index_not_ready',
         'invalid_item_scope',
+        'invalid_m49_selector',
+        'invalid_query',
         'invalid_text_selector',
         'pool_closed',
         'query_timeout',
@@ -185,11 +187,13 @@ describe('faostat_commodity_profile production-domain availability (#37)', () =>
       'canvas_not_found',
       'domain_not_indexed',
       'index_not_ready',
+      'invalid_query',
       'invalid_year_range',
       'missing_item',
       'no_match',
       'pool_closed',
       'query_timeout',
+      'trade_item_not_found',
     ]);
   });
 

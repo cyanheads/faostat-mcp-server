@@ -2,8 +2,10 @@
  * @fileoverview Incremental refresh of the FAOSTAT local mirror. For each
  * selected domain, HEAD/manifest-checks the domain's `DateUpdate` against the
  * stored checkpoint and re-streams only the domains FAO has rebuilt since the
- * last sync, then builds query-planner statistics for any domain that lacks them.
- * Safe to run on a schedule: an unchanged domain with statistics is left alone.
+ * last sync, or that hold no checkpoint, removing the rows a rebuilt file no
+ * longer carries, then builds query-planner statistics for any domain that lacks
+ * current ones. Safe to run on a schedule: an unchanged domain with current
+ * statistics is left alone.
  *
  * Usage:
  *   bun run mirror:refresh
@@ -34,7 +36,9 @@ async function main(): Promise<void> {
         continue;
       }
       const result = await mirror.runDomainSync(code, 'refresh', { signal: ctx.signal, dataset });
-      console.log(`  [${code}] refreshed — ${result.recordsApplied} records applied`);
+      console.log(
+        `  [${code}] refreshed — ${result.recordsApplied} records applied, ${result.tombstonesApplied} removed`,
+      );
     }
     const totalMin = ((Date.now() - start) / 60_000).toFixed(1);
     console.log(`\nRefresh complete in ${totalMin}m across ${domains.length} domain(s).`);

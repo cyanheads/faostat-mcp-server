@@ -108,7 +108,7 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
 
 `faostat_query_observations` returns one page of up to `limit` rows from `offset` (with `nextOffset` while rows remain, up to the 100,000-row `OFFSET_CAP`) and, with DataCanvas on, a first page whose match exceeds `limit` also **spills** the whole match to a DuckDB-backed canvas table; `faostat_commodity_profile` inlines its summaries and spills its row-level set. Both stage through the helpers in `src/services/canvas-staging.ts`. The returned `canvas_id` + `table_name` are then read through the mandatory `faostat_dataframe_describe` / `faostat_dataframe_query` pair — without that pair the spilled token is dead output. `faostat_dataframe_drop` removes one staged table ahead of its TTL; it is opt-in, so `src/index.ts` registers it through `dataframeDropRegistration()`, which wraps it in `disabledTool()` unless `FAOSTAT_DATAFRAME_DROP_ENABLED=true`, and the server `instructions` name it only when it is live. Guard with `canvasEnabled()`: with staging off, `faostat_query_observations` pages with `offset`, `faostat_commodity_profile` states it in a notice, and the `faostat_dataframe_*` tools surface `canvas_disabled`. The session canvas is acquired through the framework's `acquireShared` (one canvas per tenant, even under concurrent first calls); `faostat_dataframe_describe` and `faostat_dataframe_drop` never mint one.
 
-`schema` is required: pass `OBSERVATION_TABLE_SCHEMA` (the `streamObservations` columns, including item text codes, periods, value qualifiers, and sources) or `PROFILE_TABLE_SCHEMA` (those plus `domain`). The staged types are declared, never inferred from the preview rows — inference types `value` from whatever the preview window holds, and a whole-number window truncates every later fractional value.
+`schema` is required: pass `OBSERVATION_TABLE_SCHEMA` (the `streamObservations` columns, including item text codes, periods, value qualifiers, sources, and M49 codes) or `PROFILE_TABLE_SCHEMA` (those plus `domain`). The staged types are declared, never inferred from the preview rows — inference types `value` from whatever the preview window holds, and a whole-number window truncates every later fractional value.
 
 ```ts
 import {
@@ -201,7 +201,7 @@ await createApp({
 });
 ```
 
-`sessionMode` declares the HTTP session posture in `src/` rather than leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). `stateless` is correct here because no handler calls `ctx.requestInput` — add `require: 'stateful'` only if one ever does, so startup fails loudly instead of serving a mode where a 2025-era client can never answer the prompt. `teardown(core)` is the `setup()` counterpart: it closes the mirror's per-domain SQLite handles and the shared dimension database, which nothing else releases. It runs after the transport stops and before the logger closes, on every shutdown path. It first awaits `refresh?.stop()`, which aborts a scheduled refresh in flight and waits for it to settle — `schedulerService.destroyAll()` runs only after the hook and stops future ticks, not a running one — and a run stopped mid-build stops waiting at once, so shutdown reaches `mirror.close()` well inside the framework's 10 s backstop.
+`sessionMode` declares the HTTP session posture in `src/` rather than leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). `stateless` is correct here because no handler calls `ctx.requestInput` — add `require: 'stateful'` only if one ever does, so startup fails loudly instead of serving a mode where a 2025-era client can never answer the prompt. `teardown(core)` is the `setup()` counterpart: it closes the mirror's per-domain SQLite handles and the shared dimension database, which nothing else releases. It runs after the transport stops and before the logger closes, on every shutdown path. It first awaits `refresh?.stop()`, which aborts a scheduled refresh in flight and waits for it to settle — `schedulerService.destroyAll()` runs only after the hook and stops future ticks, not a running one — and a run stopped mid-build stops waiting at once, so shutdown reaches `mirror.close()` well inside the framework's 10 s backstop. A statistics build the close ends stops when its running statement returns and commits no statistics, so the next process builds again: under Node that wait is one statement — an index's `ANALYZE`, the area/year `CREATE INDEX`, or a lock wait of up to the 5 s `busy_timeout` — never the whole build; under Bun the process exits at once.
 
 `instructions` is optional server-level orientation, sent on every `initialize` as session-level context — here it carries the discover → resolve → query workflow, the aggregate-exclusion default, the paging and canvas staging path, and the data-quality-flag reminder, so the guidance isn't duplicated across every tool description. The canonical in-code identity block is `name` + `title` only — never duplicate `description` into `createApp()` (it derives from `package.json`).
 
@@ -283,11 +283,12 @@ src/
       index.ts                          # initFaostatMirror() / getFaostatMirror() accessor + barrel
       faostat-mirror.ts                 # FaostatMirror — per-domain MirrorService + dimension store
       read-pool.ts                      # ReadPool — cube reads + statistics builds on 2 worker threads, per-call query_timeout ceiling
-      read-worker.ts                    # Worker entry — runs a read or an ANALYZE; self-contained (package + node: imports only)
+      read-worker.ts                    # Worker entry — runs a read or a statistics build (one ANALYZE per index, one transaction, refused while a sync holds the lease); self-contained (package + node: imports only)
       scheduled-refresh.ts              # ScheduledRefresh — the HTTP refresh cron's job: per-domain deadline + shutdown stop, skips sync_locked
-      ingester.ts                       # Streaming bulk-ZIP → SQLite ingester
+      ingester.ts                       # Streaming bulk-ZIP → SQLite ingester — stamps rows with their file's DateUpdate, adds item identities the item list lacks, removes rows the file drops
       manifest.ts                       # Bulk manifest fetch/parse (datasets_E.json)
-      csv.ts, dimensions-store.ts, http.ts, types.ts
+      dimensions-store.ts               # Shared area/item/element vocabularies, FTS5 search (the one query rule), M49 lookup
+      csv.ts, http.ts, types.ts
   mcp-server/
     tools/
       markdown-cell.ts                  # markdownCell() — table-cell escaping shared by the format()s
@@ -388,13 +389,15 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run start:stdio` | Production mode (stdio) |
 | `bun run start:http` | Production mode (HTTP) |
 | `bun run mirror:init` | One-time bootstrap — download and index the `FAOSTAT_DOMAINS` set into the local mirror. Idempotent, resumable per domain. Required before the data tools answer queries. |
-| `bun run mirror:refresh` | Re-sync domains whose upstream `DateUpdate` has advanced (skips unchanged), and build query-planner statistics (`ANALYZE`) for any domain whose statistics are missing or do not cover one of its indexes, unchanged ones included. Run out-of-band on stdio; HTTP transport schedules it via `FAOSTAT_REFRESH_CRON`. |
+| `bun run mirror:refresh` | Re-sync domains whose upstream `DateUpdate` has advanced (skips unchanged, except that the first refresh of a mirror an older release wrote re-syncs every domain once to stamp its rows), removing the rows its rebuilt file does not carry and printing `<N> records applied, <M> removed` per domain, and build query-planner statistics (`ANALYZE`) for any domain whose statistics are missing, stale (rows changed since the last build committed), or do not cover one of its indexes, unchanged ones included. A read triggers no build while another process's sync holds the store's lease. Run out-of-band on stdio; HTTP transport schedules it via `FAOSTAT_REFRESH_CRON`. |
 | `bun run mirror:verify` | Report per-domain sync status, local row counts, checkpoints, and shared dimension population. |
 | `bun run lint:mcp` | Validate MCP tool definitions against the spec (format-parity, schema shape, naming). Rule catalog: `api-linter` skill. |
 | `bun run lint:packaging` | Packaging surface checks — registry/bundle env parity, npm launch shape, bundle exclusions, plugin manifests, and published `skills/` (run by devcheck). |
 | `bun run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/*.md` |
 | `bun run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
 | `bun run bundle` | Build, pack, and clean a `.mcpb` for one-click Claude Desktop install |
+
+**Dependency hold.** `vitest` and `@vitest/coverage-istanbul` stay pinned exact at `5.1.0`: vitest 5.1.1's fork pool calls `child.channel.unref()`, which Bun (1.4.4 and 1.4.5) lacks, so no test file starts under the Bun lane ([vitest-dev/vitest#12037](https://github.com/vitest-dev/vitest/issues/12037), [oven-sh/bun#33593](https://github.com/oven-sh/bun/issues/33593)). Lift the pin when Bun ships it.
 
 **CI is one file.** `.github/workflows/codeql.yml` (scaffolded) is the only GitHub Actions workflow: CodeQL is GitHub-owned end to end, and the file runs only while the repo's CodeQL *default setup* is turned off. Verification — `devcheck`, tests, the release gates — runs locally; don't add a workflow that re-runs it.
 
