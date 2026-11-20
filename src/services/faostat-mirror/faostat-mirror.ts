@@ -192,7 +192,6 @@ function syncLeaseHeld(handle: SqliteHandle): boolean {
  * next sync replaces.
  */
 function revisionPublishingStore(
-  onRowWrite: () => void,
   setLease: (lease: SyncLease | undefined) => void,
   indexActivity: () => Int32Array | undefined,
   spec: SqliteMirrorStoreSpec,
@@ -228,7 +227,6 @@ function revisionPublishingStore(
       },
       async commit(lease, state, records, tombstones) {
         if ((records?.length ?? 0) + (tombstones?.length ?? 0) > 0) {
-          onRowWrite();
           (await store.raw()).exec(MARK_STATISTICS_STALE);
         }
         const held = await syncLease.commit(lease, state, records, tombstones);
@@ -471,10 +469,7 @@ export class FaostatMirror {
     const ingesters = this.ingesters;
     return defineMirror({
       name: `faostat-${upper}`,
-      // A sync's rows void what this process knew of the statistics; the build that
-      // ends the sync, or the next data read, finds out afresh (#60).
       store: revisionPublishingStore(
-        () => this.analyzed.delete(upper),
         (lease) => {
           if (lease) this.syncLeases.set(upper, lease);
           else this.syncLeases.delete(upper);
@@ -702,6 +697,8 @@ export class FaostatMirror {
     if ((this.analyzeFailures.get(code) ?? 0) >= ANALYZE_MAX_ATTEMPTS) return;
     if (syncLeaseHeld(handle)) return;
     if (this.hasStatistics(handle, table)) {
+      // A worker may already have opened the cube through a read that does not use statistics.
+      if (previous === undefined) this.reads.invalidate(this.domainFile(code));
       this.analyzed.set(code, generation);
       return;
     }
@@ -1367,8 +1364,7 @@ export class FaostatMirror {
       // A page that applied rows marked the statistics stale, so this one check covers it.
       const { generation } = statisticsState(handle);
       if (!this.hasStatistics(handle, cubeTable(upper))) {
-        // Another process can have outdated them since this one memoized them.
-        this.analyzed.delete(upper);
+        // Retain the last known generation so a subsequent read can detect an external build.
         args.signal.throwIfAborted();
         await unlessAborted(this.buildStatistics(upper, handle, generation, true), args.signal);
       }

@@ -243,7 +243,7 @@ A refresh removes the rows its rebuilt domain file does not carry and prints `<N
 
 `mirror:refresh` retries a contended domain with backoff for up to two minutes before starting another attempt. An SQLite operation already in progress can finish its lock wait. If contention persists, the command reports which domains it skipped, refreshes later domains, and exits nonzero.
 
-`mirror:refresh` also builds query-planner statistics (`ANALYZE`) for any selected domain whose statistics are missing, stale because rows changed since the last build committed, or do not cover one of its indexes, even when its data is unchanged upstream — a mirror synced by an older release, one a refresh has just given a new index, or one whose last build failed or was stopped. Otherwise the server builds them itself, in the background on a worker thread, the first time a data read touches that domain, and keeps answering meanwhile. No read triggers a build while another process's sync holds the domain store's lease; that sync ends with its own.
+`mirror:refresh` also builds query-planner statistics (`ANALYZE`) when they are missing, stale after a data change, or incomplete for the current indexes. The server checks the persisted state on data reads and can schedule a background build while continuing to answer queries. Reads defer maintenance while a sync or closing statistics build holds the domain lease. If another process publishes fresh statistics, the server reopens its worker connections to pick up the new query plans.
 
 ### Docker
 

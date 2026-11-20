@@ -1237,6 +1237,28 @@ describe('FaostatMirror query-planner statistics (#3, #24)', () => {
     return handle.prepare('SELECT stale FROM planner_statistics').all();
   }
 
+  it('reopens warmed read handles when another process wins the closing build (#72)', async () => {
+    await readCube(mirror);
+    const external = openMirror();
+    const invalidate = vi.spyOn(mirror.reads, 'invalidate');
+    const analyze = mirror.reads.analyze.bind(mirror.reads);
+    vi.spyOn(mirror.reads, 'analyze').mockImplementation(async (file, table, areaYear, state) => {
+      if (state?.closing) await external.reads.analyze(file, table, areaYear, state);
+      return analyze(file, table, areaYear, state);
+    });
+
+    try {
+      expect((await syncInto(mirror, REBUILT)).recordsApplied).toBeGreaterThan(0);
+      expect(await staleFlag(mirror)).toEqual([{ stale: 0 }]);
+      invalidate.mockClear();
+      await readCube(mirror);
+      expect(invalidate).toHaveBeenCalledOnce();
+      expect(invalidate).toHaveBeenCalledWith(join(dir, `domain-${FIXTURE_DOMAIN}.db`));
+    } finally {
+      await external.close();
+    }
+  }, 30_000);
+
   it('builds on the next data read after a rebuilding refresh whose build failed, within the retry budget (#60)', async () => {
     // The refresh replaced every row, but the statistics from before it still cover
     // every index, so only the record that rows changed can bring a rebuild.
