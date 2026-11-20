@@ -17,7 +17,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, timeout } from '@cyanheads/mcp-ts-core/errors';
 import { openSqliteHandle } from '@cyanheads/mcp-ts-core/mirror';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -62,6 +62,35 @@ describe('FaostatMirror end-to-end', () => {
     await mirror.close();
     vi.unstubAllGlobals();
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns the declared timeout for an area search after the deadline', async () => {
+    const ceiling = AbortSignal.abort(
+      timeout('Mirror reads for this call ran past the ceiling.', {
+        reason: 'query_timeout',
+        retryable: true,
+      }),
+    );
+    const readSignal = vi.spyOn(mirror, 'readSignal').mockReturnValueOnce(ceiling);
+    try {
+      const result = await runToolContract(resolveCodesTool, {
+        domain: FIXTURE_DOMAIN,
+        dimension: 'area',
+        query: 'Afghanistan',
+      });
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.Timeout,
+          data: { reason: 'query_timeout', retryable: true },
+        },
+      });
+      expect(result.content).toContainEqual({
+        type: 'text',
+        text: expect.stringContaining('Mirror reads for this call ran past the ceiling.'),
+      });
+    } finally {
+      readSignal.mockRestore();
+    }
   });
 
   it('reports the domain ready with the expected row count after init', async () => {
@@ -931,6 +960,33 @@ describe('item vocabulary from the data rows (#64)', () => {
 
   const listing = (domain: string) => mirror.resolve(domain, 'item', { limit: 50 });
 
+  it('classifies a verified FBS group on both tool response surfaces', async () => {
+    await syncDomains([
+      [
+        'FBS',
+        {
+          ...FBS_HEADER_ONLY,
+          items: [
+            ...FBS_HEADER_ONLY.items,
+            { code: 2905, name: 'Cereals - Excluding Beer', listed: false },
+          ],
+        },
+      ],
+    ]);
+    const result = await runToolContract(resolveCodesTool, {
+      domain: 'FBS',
+      dimension: 'item',
+      query: 'Cereals',
+    });
+    expect(result.structuredContent).toMatchObject({
+      matches: [{ code: 2905, kind: 'aggregate' }],
+    });
+    expect(result.content).toContainEqual({
+      type: 'text',
+      text: expect.stringContaining('**2905** — Cereals - Excluding Beer [aggregate]'),
+    });
+  });
+
   it('keeps a full list’s labels and CPC codes, never its rows’ labels', async () => {
     await syncDomains([['QCL', QCL_FULL]]);
     expect(await listing('QCL')).toEqual({
@@ -949,9 +1005,9 @@ describe('item vocabulary from the data rows (#64)', () => {
     await checkItemFts();
   });
 
-  it('resolves every item of a header-only list by listing, code, and query, unclassified', async () => {
+  it('resolves data-derived labels by listing, code and query and classifies the verified total', async () => {
     await syncDomains([['FBS', FBS_HEADER_ONLY]]);
-    const grandTotal = { code: 2901, code_text: null, name: 'Grand Total', kind: null };
+    const grandTotal = { code: 2901, code_text: null, name: 'Grand Total', kind: 'aggregate' };
     expect(await listing('FBS')).toEqual({
       matches: [
         { code: 2511, code_text: null, name: 'Wheat and products', kind: null },
@@ -969,7 +1025,7 @@ describe('item vocabulary from the data rows (#64)', () => {
     });
     expect(queried.isError).toBeFalsy();
     expect(queried.structuredContent).toMatchObject({ matches: [grandTotal] });
-    expect(text(queried)).toContain('**2901** — Grand Total');
+    expect(text(queried)).toContain('**2901** — Grand Total [aggregate]');
     const listed = await runToolContract(resolveCodesTool, { domain: 'FBS', dimension: 'item' });
     expect(listed.structuredContent).toMatchObject({ matches: [{ code: 2511 }, grandTotal] });
     expect(text(listed)).toContain('**2511** — Wheat and products');
@@ -1046,7 +1102,7 @@ describe('item vocabulary from the data rows (#64)', () => {
     expect((await listing('FBS')).matches).toEqual([
       cassava,
       { code: 2511, code_text: null, name: 'Wheat and products', kind: null },
-      { code: 2901, code_text: null, name: 'Grand Total', kind: null },
+      { code: 2901, code_text: null, name: 'Grand Total', kind: 'aggregate' },
     ]);
     expect((await mirror.resolve('FBS', 'item', { query: 'fresh', limit: 5 })).matches).toEqual([
       cassava,
@@ -1056,8 +1112,14 @@ describe('item vocabulary from the data rows (#64)', () => {
 
   it('repairs a store synced without its rows’ items on a refresh of an unchanged upstream', async () => {
     await syncDomains([['FBS', FBS_HEADER_ONLY]]);
+    await expect(
+      mirror.resolve('FBS', 'item', { query: 'grand total', limit: 5 }),
+    ).resolves.toMatchObject({ matches: [{ code: 2901, kind: 'aggregate' }], total: 1 });
     await dropItems([2511, 2901]);
     expect(await listing('FBS')).toEqual({ matches: [], total: 0 });
+    await expect(
+      mirror.resolve('FBS', 'item', { query: 'grand total', limit: 5 }),
+    ).resolves.toEqual({ matches: [], total: 0 });
 
     expect((await refreshUnchanged('FBS')).recordsApplied).toBe(0);
     expect((await listing('FBS')).matches.map((m) => [m.code, m.name])).toEqual([
@@ -1066,7 +1128,7 @@ describe('item vocabulary from the data rows (#64)', () => {
     ]);
     expect(
       (await mirror.resolve('FBS', 'item', { query: 'grand total', limit: 5 })).matches,
-    ).toEqual([{ code: 2901, code_text: null, name: 'Grand Total', kind: null }]);
+    ).toEqual([{ code: 2901, code_text: null, name: 'Grand Total', kind: 'aggregate' }]);
     await checkItemFts();
   });
 
@@ -1151,7 +1213,12 @@ describe('item vocabulary from the data rows (#64)', () => {
         },
       ],
     ]);
-    const cereals = { code: 2905, code_text: null, name: 'Cereals - Excluding Beer', kind: null };
+    const cereals = {
+      code: 2905,
+      code_text: null,
+      name: 'Cereals - Excluding Beer',
+      kind: 'aggregate',
+    };
     expect(await listing('FBS')).toEqual({ matches: [cereals], total: 1 });
 
     await dropItems([2905]);

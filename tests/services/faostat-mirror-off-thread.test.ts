@@ -512,6 +512,28 @@ describe('ReadPool', () => {
     main.close();
   });
 
+  it('skips an obsolete build after another pool publishes a newer generation (#72)', async () => {
+    const file = await analyzable('superseded.db');
+    const main = await openSqliteHandle(file);
+    try {
+      main.exec('ALTER TABLE planner_statistics ADD COLUMN generation INTEGER NOT NULL DEFAULT 0');
+      const closing = track(new ReadPool());
+      const reader = track(new ReadPool());
+      const observed = { generation: 0, closing: false };
+      await expect(
+        closing.analyze(file, 't', false, { ...observed, closing: true }),
+      ).resolves.toBeGreaterThanOrEqual(0);
+      expect(main.prepare('SELECT owner FROM mirror_sync_lease').get()).toEqual({ owner: null });
+      await expect(reader.analyze(file, 't', false, observed)).resolves.toBeUndefined();
+      expect(main.prepare('SELECT stale, generation FROM planner_statistics').get()).toEqual({
+        stale: 0,
+        generation: 1,
+      });
+    } finally {
+      main.close();
+    }
+  });
+
   it("opens a file behind another connection's lock once the lock is released", async () => {
     const file = await analyzable('locked.db');
     // An exclusive-mode connection keeps its lock after the transaction ends, so the

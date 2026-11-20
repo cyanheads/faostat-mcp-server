@@ -36,6 +36,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 - **Secrets in env vars only** — never hardcoded. (This server is keyless; there are no secrets to manage.)
 - **Carry the data-quality flag through.** Every FAOSTAT observation has a flag (`A`/`E`/`I`/`B`/`X`). Never drop it from output or `format()` — it's load-bearing for downstream rigor.
 - **Area aggregate exclusion is the default.** `faostat_query_observations` excludes area codes ≥ 5000 and curated rollups unless `include_aggregates: true` or explicit `area_codes` are supplied. This prevents area overlap; item groups, units, periods, and source estimates still require separate analytical choices.
+- **Item-group classification is a positive set.** `faostat_resolve_codes` marks verified groups `aggregate` by domain, including 24 Food Balances (`FBS`) groups and totals. `kind: null` leaves membership unknown.
 - **Close the loop on issues.** When implementing work tracked by a GitHub issue, comment on the issue with what landed and close it. Do both — a comment without a close leaves stale issues open; a close without a comment leaves no record of what shipped. The comment is for future readers — state the concrete changes, not the conversation that produced them.
 
 ---
@@ -201,7 +202,9 @@ await createApp({
 });
 ```
 
-`sessionMode` declares the HTTP session posture in `src/` rather than leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). `stateless` is correct here because no handler calls `ctx.requestInput` — add `require: 'stateful'` only if one ever does, so startup fails loudly instead of serving a mode where a 2025-era client can never answer the prompt. `teardown(core)` is the `setup()` counterpart: it closes the mirror's per-domain SQLite handles and the shared dimension database, which nothing else releases. It runs after the transport stops and before the logger closes, on every shutdown path. It first awaits `refresh?.stop()`, which aborts a scheduled refresh in flight and waits for it to settle — `schedulerService.destroyAll()` runs only after the hook and stops future ticks, not a running one — and a run stopped mid-build stops waiting at once, so shutdown reaches `mirror.close()` well inside the framework's 10 s backstop. A statistics build the close ends stops when its running statement returns and commits no statistics, so the next process builds again: under Node that wait is one statement — an index's `ANALYZE`, the area/year `CREATE INDEX`, or a lock wait of up to the 5 s `busy_timeout` — never the whole build; under Bun the process exits at once.
+`sessionMode` declares the HTTP session posture in `src/` rather than leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). `stateless` is correct here because no handler calls `ctx.requestInput` — add `require: 'stateful'` only if one ever does, so startup fails loudly instead of serving a mode where a 2025-era client can never answer the prompt.
+
+`teardown(core)` first awaits `refresh?.stop()` to cancel a scheduled refresh and let it settle, then closes the mirror and its read pool. A refresh stops waiting for a statistics build when cancelled. Closing the pool ends a running build after its current SQLite statement. An interrupted transaction leaves its statistics unpublished. Under Node, process exit can wait for that statement.
 
 `instructions` is optional server-level orientation, sent on every `initialize` as session-level context — here it carries the discover → resolve → query workflow, the aggregate-exclusion default, the paging and canvas staging path, and the data-quality-flag reminder, so the guidance isn't duplicated across every tool description. The canonical in-code identity block is `name` + `title` only — never duplicate `description` into `createApp()` (it derives from `package.json`).
 
@@ -282,12 +285,13 @@ src/
     faostat-mirror/
       index.ts                          # initFaostatMirror() / getFaostatMirror() accessor + barrel
       faostat-mirror.ts                 # FaostatMirror — per-domain MirrorService + dimension store
-      read-pool.ts                      # ReadPool — cube reads + statistics builds on 2 worker threads, per-call query_timeout ceiling
-      read-worker.ts                    # Worker entry — runs a read or a statistics build (one ANALYZE per index, one transaction, refused while a sync holds the lease); self-contained (package + node: imports only)
+      read-pool.ts                      # ReadPool — cube reads, text search, and maintenance on 2 workers
+      read-worker.ts                    # Worker jobs — queries, lease-fenced index prep, per-index ANALYZE
       scheduled-refresh.ts              # ScheduledRefresh — the HTTP refresh cron's job: per-domain deadline + shutdown stop, skips sync_locked
       ingester.ts                       # Streaming bulk-ZIP → SQLite ingester — stamps rows with their file's DateUpdate, adds item identities the item list lacks, removes rows the file drops
       manifest.ts                       # Bulk manifest fetch/parse (datasets_E.json)
-      dimensions-store.ts               # Shared area/item/element vocabularies, FTS5 search (the one query rule), M49 lookup
+      dimensions-store.ts               # Shared area/item/element vocabularies, exact and substring lookup
+      dimension-search.ts               # Read-worker text search, exact-label preference and FTS5
       csv.ts, http.ts, types.ts
   mcp-server/
     tools/
@@ -389,7 +393,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run start:stdio` | Production mode (stdio) |
 | `bun run start:http` | Production mode (HTTP) |
 | `bun run mirror:init` | One-time bootstrap — download and index the `FAOSTAT_DOMAINS` set into the local mirror. Idempotent, resumable per domain. Required before the data tools answer queries. |
-| `bun run mirror:refresh` | Re-sync domains whose upstream `DateUpdate` has advanced (skips unchanged, except that the first refresh of a mirror an older release wrote re-syncs every domain once to stamp its rows), removing the rows its rebuilt file does not carry and printing `<N> records applied, <M> removed` per domain, and build query-planner statistics (`ANALYZE`) for any domain whose statistics are missing, stale (rows changed since the last build committed), or do not cover one of its indexes, unchanged ones included. A read triggers no build while another process's sync holds the store's lease. Run out-of-band on stdio; HTTP transport schedules it via `FAOSTAT_REFRESH_CRON`. |
+| `bun run mirror:refresh` | Re-sync updated domains, remove rows missing from the replacement file, and build missing or stale planner statistics. Retry refused leases and pre-claim SQLite contention for two minutes per domain, then continue with other domains and exit nonzero with the skipped codes. Run out-of-band on stdio. HTTP can schedule its own refresh via `FAOSTAT_REFRESH_CRON`. |
 | `bun run mirror:verify` | Report per-domain sync status, local row counts, checkpoints, and shared dimension population. |
 | `bun run lint:mcp` | Validate MCP tool definitions against the spec (format-parity, schema shape, naming). Rule catalog: `api-linter` skill. |
 | `bun run lint:packaging` | Packaging surface checks — registry/bundle env parity, npm launch shape, bundle exclusions, plugin manifests, and published `skills/` (run by devcheck). |
@@ -405,7 +409,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`bun run bundle` produces a `.mcpb` extension bundle for Claude Desktop. Root development paths need root-anchored `.mcpbignore` lines; root `skills/` ships. The cleaner prunes dev dependencies and strips dependency-root agent docs, platform-specific DuckDB bindings, node-gyp generator/intermediate files, and build-only framework/SQLite package files. Nested SDK runtime `dist/ext/skills/` modules and compiled `*.node` addons stay. `manifest.json` disables canvas in the portable bundle; npm and Docker retain DuckDB. MCPB uses stdio.
+`bun run bundle` produces a `.mcpb` extension bundle for Claude Desktop. Root development paths need root-anchored `.mcpbignore` lines; root `skills/` ships. The cleaner prunes dev dependencies and strips dependency-root agent docs, platform-specific DuckDB bindings, node-gyp generator/intermediate files, and build-only framework/SQLite package files. Nested SDK runtime `dist/ext/skills/` modules and compiled `*.node` addons stay. The `manifest.json` installer description covers the SQLite mirror and stdio transport. The portable bundle disables DataCanvas because the cleaner strips platform-specific DuckDB bindings. npm and Docker retain DuckDB.
 
 **Adding an env var:** list it in `server.json` (registry discovery, `environmentVariables[]`); add it to `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`) only when the bundle should surface it, since `lint:packaging` (run by `devcheck`) passes with a variable in `server.json` alone. It requires every `user_config` option to be wired into `mcp_config.env` as `"X": "${user_config.X}"` and listed in `server.json`, an optional string option to carry `"default": ""`, and every required `server.json` variable (no default) to be a key in `mcp_config.env`.
 

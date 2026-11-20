@@ -396,9 +396,9 @@ describe('FaostatMirror query-planner statistics (#3, #24)', () => {
     const analyze = target.reads.analyze.bind(target.reads);
     let attempts = 0;
     let obstructed = true;
-    vi.spyOn(target.reads, 'analyze').mockImplementation((file, table, areaYearIndex) => {
+    vi.spyOn(target.reads, 'analyze').mockImplementation((file, table, areaYearIndex, state) => {
       attempts += 1;
-      return obstructed ? Promise.reject(error) : analyze(file, table, areaYearIndex);
+      return obstructed ? Promise.reject(error) : analyze(file, table, areaYearIndex, state);
     });
     return {
       attempts: () => attempts,
@@ -528,7 +528,10 @@ describe('FaostatMirror query-planner statistics (#3, #24)', () => {
     try {
       expect((await readCube(mirror)).rows.length).toBeGreaterThan(0);
       expect(outcomes).toEqual([]);
-      expect(analyze).toHaveBeenCalledWith(join(dir, `domain-${FIXTURE_DOMAIN}.db`), TABLE, true);
+      expect(analyze).toHaveBeenCalledWith(join(dir, `domain-${FIXTURE_DOMAIN}.db`), TABLE, true, {
+        generation: expect.any(Number),
+        closing: false,
+      });
       expect(mirror.reads.stats().building).toBe(1);
       expect(beat.stop()).toBeLessThan(500);
     } finally {
@@ -844,13 +847,15 @@ describe('FaostatMirror query-planner statistics (#3, #24)', () => {
     const gate = new Promise<void>((resolve) => {
       open = resolve;
     });
-    vi.spyOn(reopened.reads, 'analyze').mockImplementation(async (file, table, areaYearIndex) => {
-      events.push('build start');
-      await gate;
-      const durationMs = await analyze(file, table, areaYearIndex);
-      events.push('build end');
-      return durationMs;
-    });
+    vi.spyOn(reopened.reads, 'analyze').mockImplementation(
+      async (file, table, areaYearIndex, state) => {
+        events.push('build start');
+        await gate;
+        const durationMs = await analyze(file, table, areaYearIndex, state);
+        events.push('build end');
+        return durationMs;
+      },
+    );
     traceSync(reopened, events);
 
     await readCube(reopened);
@@ -945,6 +950,61 @@ describe('FaostatMirror query-planner statistics (#3, #24)', () => {
       idx: UNIT_ELEMENT_INDEX,
       stat: expect.stringMatching(/^128 /),
     });
+  }, 30_000);
+
+  it('installs missing indexes without executing their DDL on the sync handle (#70)', async () => {
+    const handle = await mirror.getMirror(FIXTURE_DOMAIN)!.raw();
+    handle.exec(`DROP INDEX ${UNIT_ELEMENT_INDEX}`);
+    handle.exec('UPDATE ingest_revision SET revision = 1');
+    const exec = vi.spyOn(handle, 'exec');
+
+    await syncInto(mirror, UNCHANGED);
+
+    expect(exec.mock.calls.flat().filter((sql) => sql.startsWith('CREATE INDEX'))).toEqual([]);
+    expect(await statRows(mirror)).toContainEqual({
+      idx: UNIT_ELEMENT_INDEX,
+      stat: expect.stringMatching(/^128 /),
+    });
+  }, 30_000);
+
+  it('rechecks stale statistics after another connection writes them out of date (#72)', async () => {
+    await readCube(mirror);
+    const analyze = vi.spyOn(mirror.reads, 'analyze');
+    const other = await openSqliteHandle(join(dir, `domain-${FIXTURE_DOMAIN}.db`));
+    try {
+      other.exec('UPDATE planner_statistics SET stale = 1');
+    } finally {
+      other.close();
+    }
+
+    expect((await readCube(mirror)).rows.length).toBeGreaterThan(0);
+    expect(analyze).toHaveBeenCalledTimes(1);
+    await statisticsLand(mirror);
+    expect(await staleFlag(mirror)).toEqual([{ stale: 0 }]);
+  }, 30_000);
+
+  it('does not promote a revision when cancellation lands during index installation (#70)', async () => {
+    const handle = await mirror.getMirror(FIXTURE_DOMAIN)!.raw();
+    handle.exec(`DROP INDEX ${UNIT_ELEMENT_INDEX}`);
+    handle.exec('UPDATE ingest_revision SET revision = 1');
+    const controller = new AbortController();
+    const stopped = new Error('Stopped during index preparation');
+    const prepare = mirror.reads.prepareIndexes.bind(mirror.reads);
+    const spy = vi.spyOn(mirror.reads, 'prepareIndexes').mockImplementation(async (...args) => {
+      await prepare(...args);
+      controller.abort(stopped);
+    });
+
+    await expect(
+      mirror.runDomainSync(FIXTURE_DOMAIN, 'refresh', {
+        dataset: fixtureDataset(),
+        signal: controller.signal,
+      }),
+    ).rejects.toBe(stopped);
+    expect(handle.prepare('SELECT revision FROM ingest_revision').get()).toEqual({ revision: 1 });
+    spy.mockRestore();
+    await syncInto(mirror, UNCHANGED);
+    expect(handle.prepare('SELECT revision FROM ingest_revision').get()).toEqual({ revision: 2 });
   }, 30_000);
 
   it('builds statistics on the first data read when an index has none', async () => {

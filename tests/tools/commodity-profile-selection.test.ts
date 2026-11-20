@@ -10,12 +10,14 @@ import { type AnyToolDefinition, z } from '@cyanheads/mcp-ts-core';
 import { createCanvasService } from '@cyanheads/mcp-ts-core/canvas';
 import { parseConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { openSqliteHandle } from '@cyanheads/mcp-ts-core/mirror';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { withStrictCountInputs } from '@/mcp-server/tools/count-input.js';
 import { commodityProfileTool } from '@/mcp-server/tools/definitions/commodity-profile.tool.js';
 import { setCanvas } from '@/services/canvas-accessor.js';
-import { DimensionsStore } from '@/services/faostat-mirror/dimensions-store.js';
+import { searchDimension } from '@/services/faostat-mirror/dimension-search.js';
+import { DIMENSIONS_DB_FILE } from '@/services/faostat-mirror/dimensions-store.js';
 import { type FaostatMirror, initFaostatMirror } from '@/services/faostat-mirror/index.js';
 import {
   buildExplicitDomainZip,
@@ -507,7 +509,7 @@ describe('single-item selection (#41)', () => {
   });
 
   it('bounds normalization CPU across a 64-fold input span', async () => {
-    const store = new DimensionsStore(dir);
+    const handle = await openSqliteHandle(join(dir, DIMENSIONS_DB_FILE));
     try {
       for (const shape of [
         (n: number) => '1'.repeat(n),
@@ -517,11 +519,11 @@ describe('single-item selection (#41)', () => {
         const samples: number[] = [];
         for (let size = 5000; size <= 320000; size *= 2) {
           const query = shape(size);
-          await store.upsertItems([
+          await mirror.dimensions.upsertItems([
             { item_code: 999, item_code_text: null, item: query, cpc_code: null },
           ]);
           const start = process.threadCpuUsage();
-          const resolved = await store.resolve('item', {
+          const resolved = searchDimension(handle, 'item', {
             query,
             preferExact: true,
             domainCodes: [999],
@@ -529,14 +531,14 @@ describe('single-item selection (#41)', () => {
           });
           const cpu = process.threadCpuUsage(start);
           const micros = cpu.user + cpu.system;
-          expect(resolved.matches[0]?.code).toBe(999);
+          expect(resolved.rows[0]?.item_code).toBe(999);
           expect(micros).toBeLessThan(250000);
           samples.push(micros);
         }
         expect(samples.at(-1)! / samples[0]!).toBeLessThan(256);
       }
     } finally {
-      await store.close();
+      handle.close();
     }
   });
 });

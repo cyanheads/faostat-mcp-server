@@ -23,8 +23,10 @@ import {
   type MirrorStore,
   type SqliteHandle,
   type SqliteMirrorStoreSpec,
+  type SqliteStatement,
   type SqlValue,
   type SyncGenerator,
+  type SyncLease,
   type SyncMode,
   type SyncProgress,
   type SyncResult,
@@ -92,6 +94,18 @@ const CUBE_COLUMNS: Record<string, string> = { ...RECORD_COLUMNS, [FILE_STAMP_CO
 const AGGREGATE_ITEMS: ReadonlyMap<string, ReadonlySet<number>> = new Map([
   ['QCL', new Set([1717, 1720, 1723, 1730, 1735, 1738, 1780])],
   ['TCL', new Set([1723])],
+  /**
+   * FAO's FBS methodology, CBDstep2.lst (commodity groups) and CBDstep3.lst (totals).
+   * https://github.com/SWS-Methodology/faoswsFBSdocumentation/tree/9d83013652a6915d9eecae25837f9d002e916a8e/documentation/Old_code_and_documentation/MACAGF/LST/ITMAG
+   * Each code occurs in the FBS data CSV dated 2025-10-28. Methodology code 2900 does not.
+   */
+  [
+    'FBS',
+    new Set([
+      2901, 2903, 2905, 2907, 2908, 2909, 2911, 2912, 2913, 2914, 2918, 2919, 2922, 2923, 2924,
+      2928, 2941, 2943, 2945, 2946, 2948, 2949, 2960, 2961,
+    ]),
+  ],
 ]);
 
 /** SQLite filename for a domain mirror table. */
@@ -105,20 +119,14 @@ function cubeTable(code: string): string {
 }
 
 /** Install on empty new stores or during sync, never scan an old cube on its first read. */
-function createObservationIndexes(handle: SqliteHandle, table: string): void {
-  handle.exec(
+function observationIndexStatements(table: string): string[] {
+  return [
     `CREATE INDEX IF NOT EXISTS ${table}_item_code_text_idx ON ${table}(item_code_text) WHERE item_code_text IS NOT NULL`,
-  );
-  handle.exec(
     `CREATE INDEX IF NOT EXISTS ${table}_item_code_text_element_code_year_idx ON ${table}(item_code_text, element_code, year) WHERE item_code_text IS NOT NULL`,
-  );
-  handle.exec(
     `CREATE INDEX IF NOT EXISTS ${table}_source_code_idx ON ${table}(source_code) WHERE source_code IS NOT NULL`,
-  );
-  // Lead with unit so this discovery index does not compete with element/year observation reads.
-  handle.exec(
+    // Lead with unit so discovery does not compete with element/year observation reads.
     `CREATE INDEX IF NOT EXISTS ${table}_unit_element_idx ON ${table}(unit, element_code)`,
-  );
+  ];
 }
 
 /** Revision 1 is a compatible numeric-only cube awaiting index preparation; 2 has current indexes. */
@@ -135,8 +143,23 @@ function ingestRevision(handle: SqliteHandle): number | undefined {
  */
 const MARK_STATISTICS_STALE = 'UPDATE planner_statistics SET stale = 1 WHERE stale = 0';
 
+type StatisticsState = { stale: number; generation: number };
+const statisticsStatements = new WeakMap<SqliteHandle, SqliteStatement<StatisticsState>>();
+
+/** Cheap persistent freshness check, including builds committed by another process. */
+function statisticsState(handle: SqliteHandle): StatisticsState {
+  let statement = statisticsStatements.get(handle);
+  if (!statement) {
+    statement = handle.prepare<StatisticsState>('SELECT stale, generation FROM planner_statistics');
+    statisticsStatements.set(handle, statement);
+  }
+  const state = statement.get();
+  if (!state) throw new Error('The mirror store has no planner statistics state.');
+  return state;
+}
+
 /**
- * True while a sync holds the store's lease — the framework store's
+ * True while a sync or its closing build holds the store's lease — the framework store's
  * `mirror_sync_lease`, read as its own claim reads it: an owner whose expiry has not
  * passed. The read worker checks the same row under its write lock before a build writes.
  */
@@ -168,7 +191,12 @@ function syncLeaseHeld(handle: SqliteHandle): boolean {
  * process killed between them leaves a completed store without a revision, which its
  * next sync replaces.
  */
-function revisionPublishingStore(onRowWrite: () => void, spec: SqliteMirrorStoreSpec): MirrorStore {
+function revisionPublishingStore(
+  onRowWrite: () => void,
+  setLease: (lease: SyncLease | undefined) => void,
+  indexActivity: () => Int32Array | undefined,
+  spec: SqliteMirrorStoreSpec,
+): MirrorStore {
   const store = sqliteMirrorStore(spec);
   const { syncLease } = store;
   if (!syncLease) throw new Error(`The mirror store for ${spec.table} provides no sync lease.`);
@@ -176,6 +204,28 @@ function revisionPublishingStore(onRowWrite: () => void, spec: SqliteMirrorStore
     ...store,
     syncLease: {
       ...syncLease,
+      async claim(owner, ttlMs) {
+        const lease = await syncLease.claim(owner, ttlMs);
+        setLease(lease);
+        return lease;
+      },
+      async release(lease) {
+        setLease(undefined);
+        await syncLease.release(lease);
+      },
+      async renew(lease) {
+        const activity = indexActivity();
+        if (!activity) return syncLease.renew(lease);
+        // The index transaction fences and renews under its writer lock. The
+        // worker waits for a renewal already in flight before it starts that transaction.
+        if (Atomics.compareExchange(activity, 0, 0, 2) === 1) return true;
+        try {
+          return await syncLease.renew(lease);
+        } finally {
+          Atomics.store(activity, 0, 0);
+          Atomics.notify(activity, 0);
+        }
+      },
       async commit(lease, state, records, tombstones) {
         if ((records?.length ?? 0) + (tombstones?.length ?? 0) > 0) {
           onRowWrite();
@@ -368,7 +418,9 @@ export class FaostatMirror {
    * Domains whose query-planner statistics are in place in this process — found
    * already present, or built successfully — see {@link ensureQueryStatistics}.
    */
-  private readonly analyzed = new Set<string>();
+  private readonly analyzed = new Map<string, number>();
+  private readonly syncLeases = new Map<string, SyncLease>();
+  private readonly installingIndexes = new Map<string, Int32Array>();
   /** The statistics build in flight per domain — at most one, see {@link buildStatistics}. */
   private readonly builds = new Map<string, Promise<void>>();
   /** Domains with an in-process sync running; a read schedules no build for them meanwhile. */
@@ -390,7 +442,7 @@ export class FaostatMirror {
     this.domains = opts.domains.map((d) => d.toUpperCase());
     this.log = opts.log;
     this.queryCeilingMs = opts.queryCeilingMs ?? QUERY_CEILING_MS;
-    this.dimensions = new DimensionsStore(opts.dir);
+    this.dimensions = new DimensionsStore(opts.dir, this.reads);
     for (const code of this.domains) this.mirrors.set(code, this.buildMirror(code));
   }
 
@@ -421,84 +473,105 @@ export class FaostatMirror {
       name: `faostat-${upper}`,
       // A sync's rows void what this process knew of the statistics; the build that
       // ends the sync, or the next data read, finds out afresh (#60).
-      store: revisionPublishingStore(() => this.analyzed.delete(upper), {
-        path: this.domainFile(upper),
-        table: cubeTable(upper),
-        primaryKey: 'id',
-        columns: CUBE_COLUMNS,
-        version: 4,
-        migrations: [
-          {
-            version: 2,
-            up(handle) {
-              const columns = new Set(
-                handle
-                  .prepare<{ name: string }>(`PRAGMA table_info(${cubeTable(upper)})`)
-                  .all()
-                  .map((c) => c.name),
-              );
-              const legacy = !columns.has('item_code_text');
-              // The record columns only: migration 4 adds the file stamp, which tells
-              // it the store's rows carry none.
-              for (const [name, type] of Object.entries(RECORD_COLUMNS)) {
-                if (!columns.has(name))
-                  handle.exec(`ALTER TABLE ${cubeTable(upper)} ADD COLUMN ${name} ${type}`);
-              }
-              handle.exec('CREATE TABLE IF NOT EXISTS ingest_revision (revision INTEGER NOT NULL)');
-              if (upper === 'FS' || upper === 'GLE') {
-                handle.exec(
-                  "UPDATE mirror_sync_state SET status = 'pending', completed_at = NULL, checkpoint = NULL, cursor = NULL, total = NULL",
+      store: revisionPublishingStore(
+        () => this.analyzed.delete(upper),
+        (lease) => {
+          if (lease) this.syncLeases.set(upper, lease);
+          else this.syncLeases.delete(upper);
+        },
+        () => this.installingIndexes.get(upper),
+        {
+          path: this.domainFile(upper),
+          table: cubeTable(upper),
+          primaryKey: 'id',
+          columns: CUBE_COLUMNS,
+          version: 5,
+          migrations: [
+            {
+              version: 2,
+              up(handle) {
+                const columns = new Set(
+                  handle
+                    .prepare<{ name: string }>(`PRAGMA table_info(${cubeTable(upper)})`)
+                    .all()
+                    .map((c) => c.name),
                 );
-              } else
-                handle
-                  .prepare('INSERT INTO ingest_revision(revision) VALUES (?)')
-                  .run(legacy ? 1 : 2);
-              if (!legacy) createObservationIndexes(handle, cubeTable(upper));
+                const legacy = !columns.has('item_code_text');
+                // The record columns only: migration 4 adds the file stamp, which tells
+                // it the store's rows carry none.
+                for (const [name, type] of Object.entries(RECORD_COLUMNS)) {
+                  if (!columns.has(name))
+                    handle.exec(`ALTER TABLE ${cubeTable(upper)} ADD COLUMN ${name} ${type}`);
+                }
+                handle.exec(
+                  'CREATE TABLE IF NOT EXISTS ingest_revision (revision INTEGER NOT NULL)',
+                );
+                if (upper === 'FS' || upper === 'GLE') {
+                  handle.exec(
+                    "UPDATE mirror_sync_state SET status = 'pending', completed_at = NULL, checkpoint = NULL, cursor = NULL, total = NULL",
+                  );
+                } else
+                  handle
+                    .prepare('INSERT INTO ingest_revision(revision) VALUES (?)')
+                    .run(legacy ? 1 : 2);
+                if (!legacy)
+                  for (const statement of observationIndexStatements(cubeTable(upper))) {
+                    handle.exec(statement);
+                  }
+              },
             },
-          },
-          {
-            version: 3,
-            up(handle) {
-              // The statistics stale flag (#60), clear: a store from before it keeps
-              // the statistics it has, so an upgrade schedules no build.
-              handle.exec('CREATE TABLE planner_statistics (stale INTEGER NOT NULL)');
-              handle.exec('INSERT INTO planner_statistics(stale) VALUES (0)');
+            {
+              version: 3,
+              up(handle) {
+                // The statistics stale flag (#60), clear: a store from before it keeps
+                // the statistics it has, so an upgrade schedules no build.
+                handle.exec('CREATE TABLE planner_statistics (stale INTEGER NOT NULL)');
+                handle.exec('INSERT INTO planner_statistics(stale) VALUES (0)');
+              },
             },
-          },
-          {
-            version: 4,
-            up(handle) {
-              // The file stamp (#63). A cube without it holds rows no stamp tells current
-              // from withdrawn, so its checkpoint goes: its next refresh streams the file
-              // once, stamping every row the file carries and removing the rest. Status,
-              // completion, and total stay, so the domain stays ready meanwhile. A cube
-              // created with the column has stamped every row it holds.
-              const table = cubeTable(upper);
-              const stamped = handle
-                .prepare(`SELECT 1 AS ok FROM pragma_table_info('${table}') WHERE name = ?`)
-                .get(FILE_STAMP_COLUMN);
-              if (stamped) return;
-              handle.exec(`ALTER TABLE ${table} ADD COLUMN ${FILE_STAMP_COLUMN} INTEGER`);
-              handle.exec('UPDATE mirror_sync_state SET checkpoint = NULL');
+            {
+              version: 4,
+              up(handle) {
+                // The file stamp (#63). A cube without it holds rows no stamp tells current
+                // from withdrawn, so its checkpoint goes: its next refresh streams the file
+                // once, stamping every row the file carries and removing the rest. Status,
+                // completion, and total stay, so the domain stays ready meanwhile. A cube
+                // created with the column has stamped every row it holds.
+                const table = cubeTable(upper);
+                const stamped = handle
+                  .prepare(`SELECT 1 AS ok FROM pragma_table_info('${table}') WHERE name = ?`)
+                  .get(FILE_STAMP_COLUMN);
+                if (stamped) return;
+                handle.exec(`ALTER TABLE ${table} ADD COLUMN ${FILE_STAMP_COLUMN} INTEGER`);
+                handle.exec('UPDATE mirror_sync_state SET checkpoint = NULL');
+              },
             },
-          },
-        ],
-        indexes: [
-          { columns: ['area_code'] },
-          { columns: ['item_code'] },
-          { columns: ['element_code'] },
-          { columns: ['year'] },
-          // Composite indexes matching the common filter shapes: `(element_code,
-          // year)` serves an element/year-filtered read in year order, so its LIMIT
-          // bounds the scan; `(item_code, element_code, year)` is the seek for an
-          // item-filtered read, which sorts its bounded match (see
-          // buildObservationSql, #33). `CREATE INDEX IF NOT EXISTS` runs on every
-          // open(), so these apply to already-synced .db files on the next startup —
-          // no re-sync. (issue #3)
-          { columns: ['element_code', 'year'] },
-          { columns: ['item_code', 'element_code', 'year'] },
-        ],
-      }),
+            {
+              version: 5,
+              up(handle) {
+                handle.exec(
+                  'ALTER TABLE planner_statistics ADD COLUMN generation INTEGER NOT NULL DEFAULT 0',
+                );
+              },
+            },
+          ],
+          indexes: [
+            { columns: ['area_code'] },
+            { columns: ['item_code'] },
+            { columns: ['element_code'] },
+            { columns: ['year'] },
+            // Composite indexes matching the common filter shapes: `(element_code,
+            // year)` serves an element/year-filtered read in year order, so its LIMIT
+            // bounds the scan; `(item_code, element_code, year)` is the seek for an
+            // item-filtered read, which sorts its bounded match (see
+            // buildObservationSql, #33). `CREATE INDEX IF NOT EXISTS` runs on every
+            // open(), so these apply to already-synced .db files on the next startup —
+            // no re-sync. (issue #3)
+            { columns: ['element_code', 'year'] },
+            { columns: ['item_code', 'element_code', 'year'] },
+          ],
+        },
+      ),
       // Delegates to the per-domain ingester slot bound by runDomainSync. The
       // read path never calls sync, so the slot is empty then — guard loudly.
       async *sync(ctx) {
@@ -590,7 +663,8 @@ export class FaostatMirror {
    *
    * The `sqlite_stat1` probe is the guard ({@link hasStatistics}): statistics
    * persist inside the `.db` file, so an already-analyzed mirror with its area/year
-   * index (the steady state) pays one sub-millisecond lookup per domain per process.
+   * index (the steady state) uses a prepared read of the stale flag and generation.
+   * It rechecks index coverage only when the memo does not match that state (#72).
    * A domain without them, with an index they do not cover — synced before
    * statistics shipped and unchanged upstream since, or given a new index by a
    * refresh that applied no rows — or with rows changed since its last build
@@ -602,7 +676,7 @@ export class FaostatMirror {
    * measured and rejected: at every limit tried it produced uniform per-key
    * estimates that left the wrong index selected.
    *
-   * While a sync in another process holds the store's lease, a read schedules no
+   * While a sync or its closing build holds the store's lease, a read schedules no
    * build and memoizes nothing (#60). A build holds the write lock past that sync's
    * `busy_timeout`, so it would fail the sync's next page commit, and the sync ends
    * with its own build; the first data read after the lease is released builds if
@@ -617,14 +691,21 @@ export class FaostatMirror {
    */
   private ensureQueryStatistics(code: string, handle: SqliteHandle, table: string): void {
     // A running sync ends with its own pass (see runDomainSync).
-    if (this.analyzed.has(code) || this.builds.has(code) || this.syncing.has(code)) return;
+    if (this.builds.has(code) || this.syncing.has(code)) return;
+    const { stale, generation } = statisticsState(handle);
+    const previous = this.analyzed.get(code);
+    if (!stale && previous === generation) return;
+    if (previous !== undefined && previous !== generation) {
+      this.analyzeFailures.delete(code);
+      this.reads.invalidate(this.domainFile(code));
+    }
     if ((this.analyzeFailures.get(code) ?? 0) >= ANALYZE_MAX_ATTEMPTS) return;
     if (syncLeaseHeld(handle)) return;
     if (this.hasStatistics(handle, table)) {
-      this.analyzed.add(code);
+      this.analyzed.set(code, generation);
       return;
     }
-    void this.buildStatistics(code);
+    void this.buildStatistics(code, handle, generation);
   }
 
   /**
@@ -634,9 +715,9 @@ export class FaostatMirror {
    * retry, and logs once when the budget runs out — otherwise the degraded plan
    * persists with nothing in the record saying so.
    */
-  private recordAnalyzeOutcome(code: string, succeeded: boolean): void {
+  private recordAnalyzeOutcome(code: string, handle: SqliteHandle, succeeded: boolean): void {
     if (succeeded) {
-      this.analyzed.add(code);
+      this.analyzed.set(code, statisticsState(handle).generation);
       this.analyzeFailures.delete(code);
       this.reads.invalidate(this.domainFile(code));
       return;
@@ -698,27 +779,35 @@ export class FaostatMirror {
    * process builds again (#62). It bypasses the read-path memo and budget, which
    * {@link ensureQueryStatistics} applies before calling.
    */
-  private buildStatistics(code: string): Promise<void> {
+  private buildStatistics(
+    code: string,
+    handle: SqliteHandle,
+    generation: number,
+    closing = false,
+  ): Promise<void> {
     const inFlight = this.builds.get(code);
     if (inFlight) return inFlight;
     const table = cubeTable(code);
-    const build = this.reads.analyze(this.domainFile(code), table, true).then(
-      (durationMs) => {
-        this.builds.delete(code);
-        this.log?.info?.(`Query-planner statistics updated for ${table}`, { durationMs });
-        this.recordAnalyzeOutcome(code, true);
-      },
-      (err: unknown) => {
-        this.builds.delete(code);
-        // Shutdown, or a sync's lease, says nothing of the planner: no warning, no attempt spent.
-        if (isPoolClosed(err) || isSyncLeaseHeld(err)) return;
-        this.log?.warning?.(
-          `Could not ANALYZE ${table} — queries keep planning from the statistics already in place, or without any`,
-          { error: err instanceof Error ? err.message : String(err) },
-        );
-        this.recordAnalyzeOutcome(code, false);
-      },
-    );
+    const build = this.reads
+      .analyze(this.domainFile(code), table, true, { generation, closing })
+      .then(
+        (durationMs) => {
+          this.builds.delete(code);
+          if (durationMs === undefined) return;
+          this.log?.info?.(`Query-planner statistics updated for ${table}`, { durationMs });
+          this.recordAnalyzeOutcome(code, handle, true);
+        },
+        (err: unknown) => {
+          this.builds.delete(code);
+          // Shutdown, or a sync's lease, says nothing of the planner: no warning, no attempt spent.
+          if (isPoolClosed(err) || isSyncLeaseHeld(err)) return;
+          this.log?.warning?.(
+            `Could not ANALYZE ${table} — queries keep planning from the statistics already in place, or without any`,
+            { error: err instanceof Error ? err.message : String(err) },
+          );
+          this.recordAnalyzeOutcome(code, handle, false);
+        },
+      );
     this.builds.set(code, build);
     return build;
   }
@@ -1077,10 +1166,11 @@ export class FaostatMirror {
     } else if (dimension === 'item') {
       domainCodes = await this.domainItemCodes(domain, signal);
     }
-    const result = await this.dimensions.resolve(dimension, {
-      ...lookup,
-      ...(domainCodes ? { domainCodes } : {}),
-    });
+    const result = await this.dimensions.resolve(
+      dimension,
+      { ...lookup, ...(domainCodes ? { domainCodes } : {}) },
+      signal,
+    );
     return {
       ...result,
       matches: result.matches.map((match) => {
@@ -1154,14 +1244,15 @@ export class FaostatMirror {
    * indexes to an unchanged upstream ends with them analyzed. A sync that applied
    * nothing to a domain whose statistics are current and cover it skips the pass, so
    * the nightly no-op refresh stays a no-op. The runner releases the store's lease
-   * before it returns, so this build never meets the sync's own; a sync another
-   * process claimed in between ends with its build instead (#60). The sync awaits its
+   * before it returns. The closing worker claims it for the build and yields if
+   * another sync took it or another worker has already updated statistics (#72). The sync awaits its
    * build only while its signal is live: a run stopped before the build would start
    * starts none, and one stopped while it waits stops waiting, leaving the build to
    * the pool, which {@link close} ends without recording an outcome (#46). Either way
    * it rejects with the abort reason, as a run stopped mid-sync does, so a shutdown
    * never waits out a statistics build; a later sync or data read builds instead, as
-   * after a build that failed.
+   * after a build that failed. If the worker could not release its lease before
+   * exit, a later process waits for expiry before maintaining the store.
    *
    * `ANALYZE` holds the file's write lock for its whole run, so a sync and a build
    * of the same domain never overlap (#24): the sync waits out a build already in
@@ -1171,7 +1262,9 @@ export class FaostatMirror {
    *
    * Every write that prepares the store ({@link prepareCube}) runs as the first step
    * of the sync generator, which the runner calls only once it holds the store's sync
-   * lease. The item-vocabulary repair ({@link repairItemVocabulary}) follows it there,
+   * lease. Its index job runs on the read pool; a canceled sync waits for the job
+   * before releasing the lease but does not advance the ingest revision. The
+   * item-vocabulary repair ({@link repairItemVocabulary}) follows preparation,
    * before the ingester's first page, so a refresh that fetches no ZIP still runs it.
    * The ingester's removal of the rows its file no longer carries (#63) reads the cube
    * through the binding's `cube`, in bounded rowid slices on the read pool.
@@ -1198,7 +1291,24 @@ export class FaostatMirror {
       const inFlight = this.builds.get(upper);
       if (inFlight) await unlessAborted(inFlight, args.signal);
       const dataset = args.dataset ?? (await this.resolveDataset(upper, args.signal));
-      const handle = await mirror.raw();
+      const handle = await mirror.raw().catch((error: unknown) => {
+        args.signal.throwIfAborted();
+        // The first open can run schema writes before the runner claims its lease.
+        const cause = error instanceof Error ? error.cause : undefined;
+        if (
+          cause instanceof Error &&
+          'code' in cause &&
+          typeof cause.code === 'string' &&
+          cause.code.startsWith('SQLITE_BUSY')
+        ) {
+          throw conflict(
+            `Domain ${upper} store is busy opening for sync.`,
+            { reason: 'sync_store_busy' },
+            { cause: error },
+          );
+        }
+        throw error;
+      });
       const file = this.domainFile(upper);
       const table = cubeTable(upper);
       // A stop cuts a pool read off as RequestCancelled; a stopped run rejects with the
@@ -1234,13 +1344,13 @@ export class FaostatMirror {
         },
         ...(this.log ? { log: this.log } : {}),
       });
-      const prepare = () => this.prepareCube(upper, handle);
+      const prepare = (signal: AbortSignal) => this.prepareCube(upper, handle, signal);
       const repair = (signal: AbortSignal) => this.repairItemVocabulary(upper, handle, signal);
       // Bind the manifest-bound ingester onto the per-domain slot the read-path
       // mirror's `sync` delegates to, run, then clear the slot. One Mirror instance
       // owns both paths against one open store handle.
       this.ingesters.set(upper, async function* (ctx) {
-        prepare();
+        await prepare(ctx.signal);
         // A stop cuts the repair's pool reads off as RequestCancelled; a stopped run
         // rejects with the stop's own reason, as one stopped in the ingester does.
         await repair(ctx.signal).catch((error: unknown) => {
@@ -1255,11 +1365,12 @@ export class FaostatMirror {
         ...(args.onProgress ? { onProgress: args.onProgress } : {}),
       });
       // A page that applied rows marked the statistics stale, so this one check covers it.
-      if (!this.hasStatistics(await mirror.raw(), cubeTable(upper))) {
+      const { generation } = statisticsState(handle);
+      if (!this.hasStatistics(handle, cubeTable(upper))) {
         // Another process can have outdated them since this one memoized them.
         this.analyzed.delete(upper);
         args.signal.throwIfAborted();
-        await unlessAborted(this.buildStatistics(upper), args.signal);
+        await unlessAborted(this.buildStatistics(upper, handle, generation, true), args.signal);
       }
       return result;
     } finally {
@@ -1280,7 +1391,12 @@ export class FaostatMirror {
    *   (revision 1), text membership — so a refresh that stops after partial writes
    *   leaves them readable.
    */
-  private prepareCube(code: string, handle: SqliteHandle): void {
+  private async prepareCube(
+    code: string,
+    handle: SqliteHandle,
+    signal: AbortSignal,
+  ): Promise<void> {
+    signal.throwIfAborted();
     const revision = ingestRevision(handle);
     if (revision === undefined) {
       handle.transaction(() => {
@@ -1291,7 +1407,21 @@ export class FaostatMirror {
       this.reads.invalidate(this.domainFile(code));
     }
     if (revision !== 2) {
-      createObservationIndexes(handle, cubeTable(code));
+      const lease = this.syncLeases.get(code);
+      if (!lease) throw new Error(`Missing sync lease for ${code} cube preparation.`);
+      const activity = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+      this.installingIndexes.set(code, activity);
+      try {
+        await this.reads.prepareIndexes(
+          this.domainFile(code),
+          observationIndexStatements(cubeTable(code)),
+          lease,
+          activity,
+        );
+      } finally {
+        this.installingIndexes.delete(code);
+      }
+      signal.throwIfAborted();
       if (revision === 1) handle.exec('UPDATE ingest_revision SET revision = 2');
       this.reads.invalidate(this.domainFile(code));
     }

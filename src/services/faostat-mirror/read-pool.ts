@@ -44,15 +44,10 @@ import {
   serviceUnavailable,
   timeout,
 } from '@cyanheads/mcp-ts-core/errors';
-import type { SqlValue } from '@cyanheads/mcp-ts-core/mirror';
-import type {
-  AnalyzeRequest,
-  JobRequest,
-  ReadRequest,
-  WorkerFailure,
-  WorkerReply,
-  WorkerRequest,
-} from './read-worker.js';
+import type { SqlValue, SyncLease } from '@cyanheads/mcp-ts-core/mirror';
+import type { DimensionSearchOptions, DimensionSearchResult } from './dimension-search.js';
+import type { JobRequest, WorkerFailure, WorkerReply, WorkerRequest } from './read-worker.js';
+import type { DimensionKind } from './types.js';
 
 /**
  * Per-tool-call ceiling on mirror reads, queue wait included — under the MCP SDK's
@@ -99,7 +94,9 @@ export interface ReadPoolStats {
 }
 
 /** What a queued job asks its worker to do, minus the `id` and `epoch` added at dispatch. */
-type JobSpec = Omit<ReadRequest, 'id' | 'epoch'> | Omit<AnalyzeRequest, 'id' | 'epoch'>;
+type JobSpec<T extends JobRequest = JobRequest> = T extends JobRequest
+  ? Omit<T, 'id' | 'epoch'>
+  : never;
 
 interface PendingJob {
   /** Removes the abort listener once the job settles. */
@@ -217,10 +214,22 @@ export class ReadPool {
    * or already running.
    */
   all<TRow>(job: ReadJob, signal?: AbortSignal): Promise<TRow[]> {
+    return this.read({ op: 'all', ...job }, signal);
+  }
+
+  /** Resolve and count dimension matches on a worker, using the same cancellation as cube reads. */
+  resolveDimension(
+    job: { file: string; dimension: DimensionKind; options: DimensionSearchOptions },
+    signal?: AbortSignal,
+  ): Promise<DimensionSearchResult> {
+    return this.read({ op: 'resolveDimension', ...job }, signal);
+  }
+
+  private read<T>(job: JobSpec, signal?: AbortSignal): Promise<T> {
     if (this.closed) return Promise.reject(poolClosed('The mirror read pool is closed.'));
     if (signal?.aborted) return Promise.reject(abortError(signal));
-    return new Promise<TRow[]>((resolve, reject) => {
-      const read = this.enqueue({ op: 'all', ...job }, resolve as (rows: unknown) => void, reject);
+    return new Promise<T>((resolve, reject) => {
+      const read = this.enqueue(job, resolve as (value: unknown) => void, reject);
       if (signal) {
         const onAbort = () => this.cutOff(read, abortError(signal));
         signal.addEventListener('abort', onAbort, { once: true });
@@ -232,7 +241,9 @@ export class ReadPool {
 
   /**
    * Build `table`'s planner statistics in `file` on a worker, and resolve with how
-   * long the build ran, in ms. Its per-index `ANALYZE` statements and the clear of
+   * long the build ran, in ms. When a generation is supplied and another worker
+   * publishes fresher statistics first, resolves with undefined. Its per-index
+   * `ANALYZE` statements and the clear of
    * the store's stale flag commit in one transaction, so a build that does not finish
    * leaves the flag set and the previous statistics in place. Takes no signal, so it
    * is never cut off: it rejects only with the driver's error (a writer
@@ -245,12 +256,42 @@ export class ReadPool {
    * true, installs the cube's `(area_code, year)` index first in the same job, in its
    * own transaction, under the same single-build scheduling limit.
    */
-  analyze(file: string, table: string, areaYearIndex = false): Promise<number> {
+  analyze(file: string, table: string, areaYearIndex?: boolean): Promise<number>;
+  analyze(
+    file: string,
+    table: string,
+    areaYearIndex: boolean,
+    state: { generation: number; closing: boolean } | undefined,
+  ): Promise<number | undefined>;
+  analyze(
+    file: string,
+    table: string,
+    areaYearIndex = false,
+    state?: { generation: number; closing: boolean },
+  ): Promise<number | undefined> {
     if (this.closed) return Promise.reject(poolClosed('The mirror read pool is closed.'));
-    return new Promise<number>((resolve, reject) => {
+    return new Promise<number | undefined>((resolve, reject) => {
       this.enqueue(
-        { op: 'analyze', file, table, areaYearIndex },
+        { op: 'analyze', file, table, areaYearIndex, ...(state ? { state } : {}) },
         resolve as (ms: unknown) => void,
+        reject,
+      );
+      this.pump();
+    });
+  }
+
+  /** Install missing cube indexes under the caller's sync lease. */
+  prepareIndexes(
+    file: string,
+    statements: string[],
+    lease: SyncLease,
+    activity: Int32Array,
+  ): Promise<void> {
+    if (this.closed) return Promise.reject(poolClosed('The mirror read pool is closed.'));
+    return new Promise<void>((resolve, reject) => {
+      this.enqueue(
+        { op: 'prepareIndexes', file, statements, lease, activity },
+        resolve as (value: unknown) => void,
         reject,
       );
       this.pump();
@@ -324,7 +365,10 @@ export class ReadPool {
 
   /** Workers running a statistics build. */
   private building(): number {
-    return this.slots.filter((slot) => slot.job?.spec.op === 'analyze').length;
+    return this.slots.filter((slot) => {
+      const op = slot.job?.spec.op;
+      return op === 'analyze' || op === 'prepareIndexes';
+    }).length;
   }
 
   /**
@@ -336,7 +380,9 @@ export class ReadPool {
     for (const slot of this.slots) {
       if (slot.job) continue;
       const buildRunning = this.building() > 0;
-      const next = this.queue.findIndex((job) => job.spec.op === 'all' || !buildRunning);
+      const next = this.queue.findIndex(
+        (job) => job.spec.op === 'all' || job.spec.op === 'resolveDimension' || !buildRunning,
+      );
       if (next === -1) return;
       if (!slot.worker) {
         if (this.stats().threads >= MAX_THREADS) continue;
@@ -368,8 +414,17 @@ export class ReadPool {
       worker.unref();
       job.detach();
       if ('error' in reply) job.reject(fromFailure(reply.error));
-      else if ('leaseHeld' in reply) job.reject(syncLeaseHeld());
-      else job.resolve('rows' in reply ? reply.rows : reply.durationMs);
+      else if ('leaseLost' in reply) {
+        job.reject(
+          conflict('The mirror sync lost its lease before preparing the cube indexes.', {
+            reason: 'sync_lease_lost',
+          }),
+        );
+      } else if ('leaseHeld' in reply) job.reject(syncLeaseHeld());
+      else if ('matches' in reply) job.resolve(reply.matches);
+      else if ('rows' in reply) job.resolve(reply.rows);
+      else if ('durationMs' in reply) job.resolve(reply.durationMs);
+      else job.resolve(undefined);
       this.pump();
     });
     worker.on('exit', (code) => {

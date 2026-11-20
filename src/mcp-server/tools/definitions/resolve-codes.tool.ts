@@ -113,7 +113,7 @@ export const resolveCodesTool = tool('faostat_resolve_codes', {
       code: JsonRpcErrorCode.Timeout,
       thrownBy: 'service',
       retryable: true,
-      when: "The item or element lookup's mirror read — time queued behind other calls' reads plus execution — ran past the 45-second per-call ceiling.",
+      when: "The lookup's mirror read — time queued behind other calls' reads plus execution — ran past the 45-second per-call ceiling.",
       recovery:
         'For element lookup, pass item_codes or item_codes_text to narrow unit discovery, or use an exact code; retry after other reads finish.',
     },

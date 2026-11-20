@@ -13,14 +13,17 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { openSqliteHandle, type SqliteHandle } from '@cyanheads/mcp-ts-core/mirror';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { searchDimension } from '@/services/faostat-mirror/dimension-search.js';
 import {
   classifySearchQuery,
   DIMENSIONS_DB_FILE,
   DimensionsStore,
   quoteSearchText,
 } from '@/services/faostat-mirror/dimensions-store.js';
+import { ReadPool } from '@/services/faostat-mirror/read-pool.js';
 
 /** Real QCL and FS item labels; the codes are only identities for the assertions. */
 const ITEMS = [
@@ -54,12 +57,13 @@ const AREAS = [
 
 let dir: string;
 let store: DimensionsStore;
+const reads = new ReadPool();
 /** A second connection to the store's database, for the single-statement answer. */
 let raw: SqliteHandle;
 
 beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), 'faostat-fts-query-'));
-  store = new DimensionsStore(dir);
+  store = new DimensionsStore(dir, reads);
   await store.upsertItems(
     ITEMS.map(([code, item]) => ({ item_code: code, item_code_text: null, item, cpc_code: null })),
   );
@@ -71,8 +75,45 @@ beforeAll(async () => {
 
 afterAll(async () => {
   raw.close();
+  await reads.close();
   await store.close();
   rmSync(dir, { recursive: true, force: true });
+});
+
+it('dispatches text searches off-thread and cancels queued and running jobs', async () => {
+  const file = join(dir, DIMENSIONS_DB_FILE);
+  const exact = new AbortController();
+  const fallback = new AbortController();
+  const queued = new AbortController();
+  const jobs = [
+    reads.resolveDimension(
+      { file, dimension: 'item', options: { query: 'Wheat', preferExact: true, limit: 1 } },
+      exact.signal,
+    ),
+    reads.resolveDimension(
+      { file, dimension: 'item', options: { query: 'whe', preferExact: true, limit: 1 } },
+      fallback.signal,
+    ),
+    reads.resolveDimension(
+      { file, dimension: 'area', options: { query: 'turk', limit: 1 } },
+      queued.signal,
+    ),
+  ];
+  const settled = Promise.allSettled(jobs);
+  await Promise.resolve();
+  expect(reads.stats()).toMatchObject({ busy: 2, queued: 1 });
+  queued.abort();
+  exact.abort();
+  fallback.abort();
+  for (const outcome of await settled) {
+    expect(outcome).toMatchObject({
+      status: 'rejected',
+      reason: { code: JsonRpcErrorCode.RequestCancelled },
+    });
+  }
+  await expect(
+    store.resolve('item', { query: 'Wheat', preferExact: true, limit: 1 }),
+  ).resolves.toMatchObject({ matches: [{ code: 15 }], total: 1 });
 });
 
 /** The codes a full-text query returns in one dimension, sorted. */
@@ -423,7 +464,7 @@ describe('search time is linear in the query length', () => {
     'resolve, case %i',
     async (_case, shape) => {
       await expectLinearCpu(
-        (query) => store.resolve('item', { query, limit: 50 }),
+        (query) => searchDimension(raw, 'item', { query, limit: 50 }),
         shape,
         RESOLVE_MICROS_PER_CHAR,
       );
@@ -435,7 +476,7 @@ describe('search time is linear in the query length', () => {
     'resolve preferring an exact label, case %i',
     async (_case, shape) => {
       await expectLinearCpu(
-        (query) => store.resolve('item', { query, preferExact: true, limit: 5 }),
+        (query) => searchDimension(raw, 'item', { query, preferExact: true, limit: 5 }),
         shape,
         RESOLVE_MICROS_PER_CHAR,
       );

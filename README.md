@@ -58,7 +58,7 @@ Global food and agriculture statistics from the UN's FAOSTAT: production, trade,
 - Item/element matches are scoped to codes present in the given `domain`'s cube; area codes are shared across domains
 - Element matches include observed `units`; `item_codes` or `item_codes_text` restrict element discovery and units to selected items. Item/element lookups require that domain to be ready
 - Every area match is flagged `country` or `aggregate` (codes ≥ 5000, plus curated sub-threshold roll-ups such as China=351) and carries `m49_code`, a string with its leading zeros (`840`, `001`); the excluding-intra-trade aggregates carry dotted FAO extensions such as `002.03`, so the codes are FAO's, not ISO numeric codes
-- Verified item groups are marked `aggregate` by domain. Classification is incomplete: `kind: null` does not mean items can safely be summed together
+- Verified item groups are marked `aggregate` by domain, including 24 Food Balances (`FBS`) groups and totals. `kind: null` leaves group membership unknown
 - `limit` (at most 200 per call, default 50; a larger value is served at 200 with a notice) + `offset` page the match set
 - Typed errors: `unknown_domain`, `index_not_ready`, `invalid_text_selector`, `invalid_m49_selector`, `invalid_item_scope`, `invalid_query`, `query_timeout`, `pool_closed`
 
@@ -169,6 +169,8 @@ For other clients, add this to the MCP config file:
 
 The bulk-download service is public and keyless. For Docker or a source build, see [Running the server](#running-the-server).
 
+The Claude Desktop extension bundle runs over stdio with DataCanvas disabled. Use the npm package or container for DataCanvas SQL or Streamable HTTP.
+
 ## Configuration
 
 | Variable | Description | Default |
@@ -239,6 +241,8 @@ After upgrading an older mirror, run `mirror:refresh`. Each row records the upda
 
 A refresh removes the rows its rebuilt domain file does not carry and prints `<N> records applied, <M> removed` per domain.
 
+`mirror:refresh` retries a contended domain with backoff for up to two minutes before starting another attempt. An SQLite operation already in progress can finish its lock wait. If contention persists, the command reports which domains it skipped, refreshes later domains, and exits nonzero.
+
 `mirror:refresh` also builds query-planner statistics (`ANALYZE`) for any selected domain whose statistics are missing, stale because rows changed since the last build committed, or do not cover one of its indexes, even when its data is unchanged upstream — a mirror synced by an older release, one a refresh has just given a new index, or one whose last build failed or was stopped. Otherwise the server builds them itself, in the background on a worker thread, the first time a data read touches that domain, and keeps answering meanwhile. No read triggers a build while another process's sync holds the domain store's lease; that sync ends with its own.
 
 ### Docker
@@ -263,7 +267,7 @@ docker exec <container> bun run mirror:refresh   # re-sync updated domains; buil
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `skills/faostat-guide` | Published agent guide, also served as an MCP skill resource. |
 | `src/mcp-server/tools/definitions` | Tool definitions (`*.tool.ts`). |
-| `src/services/faostat-mirror` | The bulk-download mirror service — manifest discovery, streaming ZIP ingester, CSV parsing, dimension store, SQLite-backed `MirrorService` wiring, and the two-worker read pool (`read-pool.ts`, `read-worker.ts`) that runs cube reads and statistics builds off the main thread. |
+| `src/services/faostat-mirror` | Bulk-download mirror, streaming ZIP ingester, and shared dimension store. The two-worker read pool runs cube reads, text search, index preparation on populated cubes, and statistics builds off the main thread. |
 | `src/services/canvas-accessor.ts`, `canvas-staging.ts` | DataCanvas accessor and the spill/query/describe/drop staging layer. |
 | `scripts/faostat-mirror-*.ts` | `mirror:init` / `mirror:refresh` / `mirror:verify` CLIs. |
 | `tests/` | Unit and integration tests mirroring `src/`. |

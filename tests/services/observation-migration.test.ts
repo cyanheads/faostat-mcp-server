@@ -580,6 +580,7 @@ describe('file stamp upgrade (#63)', () => {
   it('keeps the checkpoint of a store whose rows already carry the stamp', async () => {
     const handle = await openSqliteHandle(await syncedStore());
     const before = state(handle);
+    handle.exec('ALTER TABLE planner_statistics DROP COLUMN generation');
     handle.exec('UPDATE schema_version SET version = 3');
     handle.close();
     mirror = new FaostatMirror({ dir, domains: [DOMAIN] });
