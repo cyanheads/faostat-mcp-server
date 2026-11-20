@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.2](changelog/0.7.x/0.7.2.md) — 2026-11-20
+
+FAOSTAT searches can be cancelled during mirror maintenance, and Food Balances item lookups identify 24 aggregate groups and totals.
+
 ## [0.7.1](changelog/0.7.x/0.7.1.md) — 2026-11-19 · 🛡️ Security
 
 Area M49 codes on faostat_resolve_codes and faostat_query_observations, a trade_item_code input on faostat_commodity_profile, and a refresh that removes the rows FAO dropped from a domain file. Fixes FBS item resolution, stale planner statistics, and lowercase text item codes; full-text search time now grows linearly with query length.
